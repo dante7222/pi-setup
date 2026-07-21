@@ -1,5 +1,4 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -22,15 +21,6 @@ const THINKING_COLORS: Record<string, ThemeColor> = {
   xhigh: "thinkingXhigh",
   max: "thinkingMax",
 };
-
-interface UsageTotals {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  cost: number;
-  latestCacheHitRate?: number;
-}
 
 function sanitizeSingleLine(text: string): string {
   return text
@@ -112,34 +102,6 @@ function formatCwd(cwd: string, home: string | undefined): string {
   return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`;
 }
 
-function collectUsage(ctx: ExtensionContext): UsageTotals {
-  const totals: UsageTotals = {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    cost: 0,
-  };
-
-  for (const entry of ctx.sessionManager.getEntries()) {
-    if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-
-    const message = entry.message as AssistantMessage;
-    totals.input += message.usage.input;
-    totals.output += message.usage.output;
-    totals.cacheRead += message.usage.cacheRead;
-    totals.cacheWrite += message.usage.cacheWrite;
-    totals.cost += message.usage.cost.total;
-
-    const promptTokens =
-      message.usage.input + message.usage.cacheRead + message.usage.cacheWrite;
-    totals.latestCacheHitRate =
-      promptTokens > 0 ? (message.usage.cacheRead / promptTokens) * 100 : undefined;
-  }
-
-  return totals;
-}
-
 function topLine(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -185,35 +147,14 @@ function statsLine(
   width: number,
   latestTps: number | undefined,
 ): string {
-  const totals = collectUsage(ctx);
   const parts: string[] = [];
 
-  if (totals.input) parts.push(theme.fg("accent", `↑${formatTokens(totals.input)}`));
-  if (totals.output) parts.push(theme.fg("borderAccent", `↓${formatTokens(totals.output)}`));
   if (latestTps !== undefined) {
     parts.push(theme.fg("borderAccent", tpsStatus(latestTps)));
   }
-  if (totals.cacheRead) {
-    parts.push(theme.fg("customMessageLabel", `R${formatTokens(totals.cacheRead)}`));
-  }
-  if (totals.cacheWrite) {
-    parts.push(theme.fg("syntaxNumber", `W${formatTokens(totals.cacheWrite)}`));
-  }
-  if (
-    (totals.cacheRead > 0 || totals.cacheWrite > 0) &&
-    totals.latestCacheHitRate !== undefined
-  ) {
-    parts.push(theme.fg("success", `CH${totals.latestCacheHitRate.toFixed(1)}%`));
-  }
+  parts.push(contextPart(ctx, theme));
 
   const model = ctx.model;
-  const usingSubscription = model ? ctx.modelRegistry.isUsingOAuth(model) : false;
-  if (totals.cost || usingSubscription) {
-    const subscription = usingSubscription ? theme.fg("dim", " (sub)") : "";
-    parts.push(theme.fg("warning", `$${totals.cost.toFixed(3)}`) + subscription);
-  }
-
-  parts.push(contextPart(ctx, theme));
   const left = parts.join(theme.fg("dim", " "));
 
   const modelName = model?.id ?? "no-model";

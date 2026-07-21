@@ -29,10 +29,7 @@
       ],
       "right": [
         "context_pct",
-        "cache_read",
-        "custom:tps",
-        "token_out",
-        "cost"
+        "custom:tps"
       ]
     },
     "path": {
@@ -40,9 +37,6 @@
     },
     "model": {
       "display": "name"
-    },
-    "cost": {
-      "subscriptionDisplay": "both"
     }
   }
 }
