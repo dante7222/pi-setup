@@ -12,7 +12,14 @@ Personal [Pi](https://pi.dev) extensions, skills, prompt templates, and themes, 
 Included now:
 
 - **Tokyo Night** theme (`themes/tokyo-night.json`)
+- **Tokyo Night Footer** extension (`extensions/tokyo-night-footer/index.ts`)
 - **Supacode Subagents** extension (`extensions/supacode-subagents/index.ts`)
+
+## Tokyo Night footer
+
+The custom footer puts the Pi session name first and renders it in bold Tokyo Night cyan so named main sessions and delegated workers are immediately recognizable. The working directory and Git branch remain on the first line at lower contrast. A second, palette-colored line preserves cumulative input/output, cache, cost, context, model, provider, subscription, and thinking-level information. Extension statuses appear on an optional third line.
+
+The footer is enabled automatically in interactive sessions and follows semantic theme colors, with the included **tokyo-night** theme providing its intended palette. Use `/name` to set or change the prominent session name; unnamed sessions begin with the working directory instead.
 
 ## Supacode subagents
 
