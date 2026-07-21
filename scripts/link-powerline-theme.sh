@@ -6,6 +6,7 @@ repo_dir=$(dirname -- "$script_dir")
 integration_dir="$repo_dir/integrations/pi-powerline-footer"
 source_theme="$integration_dir/theme.json"
 source_patch="$integration_dir/right-aligned-layout.patch"
+source_bash_patch="$integration_dir/disable-bash-commands.patch"
 agent_dir=${PI_CODING_AGENT_DIR:-"$HOME/.pi/agent"}
 powerline_dir="$agent_dir/npm/node_modules/pi-powerline-footer"
 target_theme="$powerline_dir/theme.json"
@@ -27,6 +28,11 @@ if [ ! -f "$source_patch" ]; then
   exit 1
 fi
 
+if [ ! -f "$source_bash_patch" ]; then
+  printf 'Powerline bash-command patch not found at %s\n' "$source_bash_patch" >&2
+  exit 1
+fi
+
 if rg -q 'independently right-aligned primary group' "$installed_index"; then
   printf 'Powerline right-alignment patch already applied.\n'
 elif patch --dry-run --silent -d "$powerline_dir" -p1 < "$source_patch"; then
@@ -35,6 +41,17 @@ elif patch --dry-run --silent -d "$powerline_dir" -p1 < "$source_patch"; then
 else
   printf 'The tracked right-alignment patch does not match the installed pi-powerline-footer.\n' >&2
   printf 'Update integrations/pi-powerline-footer/right-aligned-layout.patch for this package version.\n' >&2
+  exit 1
+fi
+
+if rg -q 'Bash mode commands are disabled by the local integration' "$installed_index"; then
+  printf 'Powerline bash commands already disabled.\n'
+elif patch --dry-run --silent -d "$powerline_dir" -p1 < "$source_bash_patch"; then
+  patch --silent -d "$powerline_dir" -p1 < "$source_bash_patch"
+  printf 'Disabled powerline bash commands.\n'
+else
+  printf 'The tracked bash-command patch does not match the installed pi-powerline-footer.\n' >&2
+  printf 'Update integrations/pi-powerline-footer/disable-bash-commands.patch for this package version.\n' >&2
   exit 1
 fi
 
