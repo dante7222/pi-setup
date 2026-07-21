@@ -13,6 +13,8 @@ Included now:
 
 - **Tokyo Night** theme (`themes/tokyo-night.json`)
 - **Tokyo Night Footer** extension (`extensions/tokyo-night-footer/index.ts`)
+- **Yellow File Headers** extension (`extensions/yellow-file-headers/index.ts`)
+- **rg Only** extension (`extensions/rg-only/index.ts`)
 - **Permissions** extension (`extensions/permissions/index.ts`)
 - **Supacode Subagents** extension (`extensions/supacode-subagents/index.ts`)
 
@@ -31,6 +33,14 @@ The matching palette lives at `integrations/pi-powerline-footer/theme.json`. Pow
 ```
 
 The npm edits are runtime integration only; this repository remains the source of truth for the settings, patch, and colors. Rerun the script after updating `pi-powerline-footer`, then run `/reload`.
+
+## Yellow file headers
+
+The extension preserves Pi's built-in `edit` and `write` behavior and rendering, changing only each tool name and path to Tokyo Night pale yellow (`#e0af68`).
+
+## rg only
+
+The extension exposes Pi's ripgrep-backed content-search tool as `rg` instead of `grep`, adds an explicit search policy to the agent prompt, and blocks assistant bash commands that invoke `grep`, `git grep`, or common wrapped forms. Commands that merely search for the word `grep` with `rg` remain allowed.
 
 ## Permissions
 
@@ -79,7 +89,7 @@ Batch tabs use the parent Pi session name (or project directory) plus a short ba
 
 Each task supports two modes:
 
-- `research` (default) — works in the current project with only `read`, `grep`, `find`, and `ls`.
+- `research` (default) — works in the current project with only `read`, `rg`, `find`, and `ls`.
 - `coding` — creates a separate Supacode Git worktree and branch, allows coding tools, and asks the worker to test and commit without pushing or merging.
 
 Example requests:

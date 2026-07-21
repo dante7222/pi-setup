@@ -17,8 +17,8 @@ const MAX_PARALLEL = 3;
 const DEFAULT_TIMEOUT_SECONDS = 15 * 60;
 const POLL_INTERVAL_MS = 250;
 const RESULT_BUDGET_BYTES = DEFAULT_MAX_BYTES - 2048;
-const RESEARCH_TOOLS = "read,grep,find,ls";
-const CODING_TOOLS = "read,bash,edit,write,grep,find,ls";
+const RESEARCH_TOOLS = "read,rg,find,ls";
+const CODING_TOOLS = "read,bash,edit,write,rg,find,ls";
 
 type WorkerMode = "research" | "coding";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -315,7 +315,7 @@ printf '\\n[supacode-subagent %s] %s\\n\\n' ${shellQuote(job.batchId.slice(0, 4)
 set +e
 ${command} 2> >(tee -a "$STDERR_PATH" >&2)
 EXIT_CODE=$?
-if ! grep -Eq '"state":"(completed|failed)"' "$STATUS_PATH" 2>/dev/null; then
+if ! rg -q '"state":"(completed|failed)"' "$STATUS_PATH" 2>/dev/null; then
   printf '{"state":"failed","completedAt":"%s","errorMessage":"Worker exited before reporting a result.","exitCode":%d}\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EXIT_CODE" > "$STATUS_PATH.tmp"
   mv "$STATUS_PATH.tmp" "$STATUS_PATH"
 fi

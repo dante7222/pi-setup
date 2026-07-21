@@ -27,7 +27,7 @@ if [ ! -f "$source_patch" ]; then
   exit 1
 fi
 
-if grep -q 'independently right-aligned primary group' "$installed_index"; then
+if rg -q 'independently right-aligned primary group' "$installed_index"; then
   printf 'Powerline right-alignment patch already applied.\n'
 elif patch --dry-run --silent -d "$powerline_dir" -p1 < "$source_patch"; then
   patch --silent -d "$powerline_dir" -p1 < "$source_patch"

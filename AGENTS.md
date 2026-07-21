@@ -21,6 +21,29 @@ This repository is the source of truth for Ventris's personal Pi setup. It is a 
 - Preserve compatibility with the Pi version currently installed unless a change explicitly targets a newer version.
 - Use Pi terminology: extensions, skills, prompt templates, themes, and packages.
 
+## Conversational Style
+
+- Keep answers short and concise.
+- No emojis in commits, issues, PR comments, or code.
+- No fluff or cheerful filler text (e.g., "Thanks @user" not "Thanks so much @user!").
+- Technical prose only; be direct.
+- When the user asks a question, answer it first before making edits or running implementation commands.
+- When responding to user feedback or an analysis, explicitly say whether you agree or disagree before saying what you changed.
+
+## Code Quality
+
+- Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when asked to investigate or audit. Do not rely on search snippets for broad changes.
+- No `any` unless absolutely necessary.
+- Inline single-line helpers that have only one call site.
+- Check `node_modules` for external API types; don't guess.
+- No inline imports (`await import()`, `import("pkg").Type`, dynamic type imports). Top-level imports only.
+- Never remove or downgrade code to fix type errors from outdated dependencies; upgrade the dependency instead.
+- Use only erasable TypeScript syntax (Node strip-only mode) in code checked by the root config (`packages/*/src`, `packages/*/test`, `packages/coding-agent/examples`): no parameter properties, `enum`, `namespace`/`module`, `import =`, `export =`, or other constructs needing JavaScript emit. Use explicit fields with constructor assignments.
+- Always ask before removing functionality or code that appears intentional.
+- Do not preserve backward compatibility unless the user asks for it.
+- Never hardcode key checks (e.g., `matchesKey(keyData, "ctrl+x")`). Add defaults to `DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS` so they stay configurable.
+- Never modify `packages/ai/src/models.generated.ts` directly; update `packages/ai/scripts/generate-models.ts` instead, then regenerate. Including the resulting `models.generated.ts` diff is always OK, even if regeneration includes unrelated upstream model metadata changes.
+
 ## Resource conventions
 
 - Extensions should export a default Pi extension factory and keep runtime packages in `dependencies`. Pi core packages belong in `peerDependencies` with a `"*"` range.
