@@ -12,7 +12,7 @@
       {
         "id": "tps",
         "statusKey": "ventris-tps",
-        "position": "left",
+        "position": "right",
         "color": "#73daca",
         "hideWhenMissing": true,
         "excludeFromExtensionStatuses": true
@@ -23,12 +23,15 @@
         "custom:session-name",
         "model",
         "thinking",
-        "custom:tps",
         "shell_mode",
         "path",
         "git",
         "context_pct",
-        "cache_read",
+        "cache_read"
+      ],
+      "right": [
+        "custom:tps",
+        "token_out",
         "cost"
       ]
     },
