@@ -244,14 +244,12 @@ function statsLine(
 
 export default function (pi: ExtensionAPI): void {
   let requestRender: (() => void) | undefined;
-  let responseStartedAt: number | undefined;
   let firstTokenAt: number | undefined;
   let latestTps: number | undefined;
 
   pi.on("session_start", (_event, ctx) => {
     if (ctx.mode !== "tui") return;
 
-    responseStartedAt = undefined;
     firstTokenAt = undefined;
     latestTps = undefined;
     publishSessionName(ctx, pi.getSessionName());
@@ -306,45 +304,36 @@ export default function (pi: ExtensionAPI): void {
     publishSessionName(ctx, event.name);
     requestRender?.();
   });
-  pi.on("message_update", (event, ctx) => {
+  pi.on("message_start", (event) => {
+    if (event.message.role === "assistant") firstTokenAt = undefined;
+  });
+
+  pi.on("message_update", (event) => {
     const update = event.assistantMessageEvent;
-    const now = performance.now();
-
-    if (update.type === "start") {
-      responseStartedAt = now;
-      firstTokenAt = undefined;
-      return;
-    }
-
     if (
       firstTokenAt === undefined &&
       (update.type === "text_delta" ||
         update.type === "thinking_delta" ||
         update.type === "toolcall_delta")
     ) {
-      firstTokenAt = now;
-      return;
+      firstTokenAt = performance.now();
     }
+  });
 
-    if (update.type === "done") {
-      const startedAt = firstTokenAt ?? responseStartedAt;
-      const elapsedMs = startedAt === undefined ? 0 : now - startedAt;
-      const outputTokens = update.message.usage.output;
+  pi.on("message_end", (event, ctx) => {
+    if (event.message.role !== "assistant") return;
 
-      if (outputTokens > 0 && elapsedMs > 0) {
-        latestTps = outputTokens / (elapsedMs / 1_000);
-        publishTps(ctx, latestTps);
-        requestRender?.();
-      }
-      responseStartedAt = undefined;
-      firstTokenAt = undefined;
-      return;
+    const elapsedMs = firstTokenAt === undefined ? 0 : performance.now() - firstTokenAt;
+    const outputTokens = event.message.usage.output;
+    const completed =
+      event.message.stopReason !== "error" && event.message.stopReason !== "aborted";
+
+    if (completed && outputTokens > 0 && elapsedMs > 0) {
+      latestTps = outputTokens / (elapsedMs / 1_000);
+      publishTps(ctx, latestTps);
+      requestRender?.();
     }
-
-    if (update.type === "error") {
-      responseStartedAt = undefined;
-      firstTokenAt = undefined;
-    }
+    firstTokenAt = undefined;
   });
 
   pi.on("model_select", () => requestRender?.());
