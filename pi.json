@@ -1,0 +1,25 @@
+{
+  "$schema": "./extensions/permissions/pi.schema.json",
+  "permission": {
+    "*": "ask",
+    "read": {
+      "*": "allow",
+      "*.env": "ask",
+      "*.env.*": "ask",
+      "*.env.example": "allow"
+    },
+    "grep": "allow",
+    "glob": "allow",
+    "list": "allow",
+    "edit": "ask",
+    "bash": "ask",
+    "task": {
+      "*": "ask",
+      "research": "allow"
+    },
+    "webfetch": "allow",
+    "websearch": "allow",
+    "get_search_content": "allow",
+    "external_directory": "ask"
+  }
+}

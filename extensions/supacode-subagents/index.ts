@@ -12,6 +12,7 @@ import {
 import { Type } from "typebox";
 
 const WORKER_JOB_ENV = "PI_SUPACODE_SUBAGENT_JOB_DIR";
+const PERMISSION_YOLO_ENV = "VENTRIS_PI_PERMISSION_YOLO";
 const MAX_PARALLEL = 3;
 const DEFAULT_TIMEOUT_SECONDS = 15 * 60;
 const POLL_INTERVAL_MS = 250;
@@ -51,6 +52,7 @@ interface WorkerJob {
   mode: WorkerMode;
   model?: string;
   thinking: ThinkingLevel;
+  yolo: boolean;
   originalCwd: string;
   workerCwd: string;
   jobDir: string;
@@ -297,6 +299,7 @@ function buildRunner(job: PreparedWorkerJob): string {
     job.mode === "research" ? RESEARCH_TOOLS : CODING_TOOLS,
   ];
   if (job.model) args.push("--model", job.model);
+  if (job.yolo) args.push("--yolo");
   args.push(`@${job.promptPath}`, "Complete the delegated task described in the attached prompt.");
 
   const command = args.map(shellQuote).join(" ");
@@ -444,6 +447,7 @@ async function prepareWorker(
   parent: ParentSurface,
   batchId: string,
   batchTitle: string,
+  yolo: boolean,
   signal: AbortSignal | undefined,
 ): Promise<PreparedWorkerJob> {
   const id = randomUUID();
@@ -481,6 +485,7 @@ async function prepareWorker(
     mode: spec.mode,
     model: spec.model,
     thinking,
+    yolo,
     originalCwd: ctxCwd,
     workerCwd,
     jobDir,
@@ -516,6 +521,7 @@ async function writeJobMetadata(job: WorkerJob): Promise<void> {
           mode: job.mode,
           model: job.model,
           thinking: job.thinking,
+          yolo: job.yolo,
           originalCwd: job.originalCwd,
           workerCwd: job.workerCwd,
           tabWorktreeId: job.tabWorktreeId,
@@ -784,6 +790,7 @@ async function runWorkers(
   parentLabel: string,
   timeoutSeconds: number,
   keepOpen: boolean,
+  yolo: boolean,
   signal: AbortSignal | undefined,
   onUpdate: ((partial: any) => void) | undefined,
 ): Promise<WorkerResult[]> {
@@ -801,7 +808,7 @@ async function runWorkers(
         details: { batchId, batchTitle, prepared: prepared.length, total: specs.length },
       });
       try {
-        const job = await prepareWorker(pi, specs[index], ctxCwd, parent, batchId, batchTitle, signal);
+        const job = await prepareWorker(pi, specs[index], ctxCwd, parent, batchId, batchTitle, yolo, signal);
         prepared.push({ index, job });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1009,6 +1016,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
         parentLabel(ctx),
         params.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS,
         params.keepOpen ?? true,
+        process.env[PERMISSION_YOLO_ENV] === "1",
         signal,
         onUpdate,
       );
@@ -1044,6 +1052,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
         parentLabel(ctx),
         params.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS,
         params.keepOpen ?? true,
+        process.env[PERMISSION_YOLO_ENV] === "1",
         signal,
         onUpdate,
       );

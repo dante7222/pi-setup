@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ventris.local/pi-permissions.schema.json",
+  "title": "Pi permission gate configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "permission"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "permission": {
+      "$ref": "#/$defs/permissionConfig"
+    }
+  },
+  "$defs": {
+    "action": {
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "granularRule": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/action"
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "maxLength": 16384
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/action"
+          }
+        }
+      ]
+    },
+    "permissionConfig": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/action"
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/granularRule"
+          }
+        }
+      ]
+    }
+  }
+}

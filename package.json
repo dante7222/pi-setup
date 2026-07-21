@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "description": "Personal Pi extensions, skills, prompts, and themes.",
+  "scripts": {
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types --test test/*.test.mjs"
+  },
   "keywords": [
     "pi-package"
   ],
