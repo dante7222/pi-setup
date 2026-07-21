@@ -1,4 +1,7 @@
 {
+  "bashMode": {
+    "toggleShortcut": null
+  },
   "powerline": {
     "preset": "default",
     "customItems": [
