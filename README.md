@@ -16,12 +16,14 @@ Included now:
 
 ## Supacode subagents
 
-The extension lets the main Pi delegate work to independent Pi sessions running in visible Supacode tabs. Results return to the main agent automatically through job files under `~/.pi/agent/subagents/`.
+The extension lets the main Pi delegate work to independent Pi sessions running in a visible Supacode batch tab. Parallel workers are tiled as split surfaces in that one tab, while results return to the main agent automatically through job files under `~/.pi/agent/subagents/`.
 
 Available tools:
 
-- `delegate` — run one independent worker.
-- `delegate_parallel` — run up to three workers concurrently.
+- `delegate` — run one independent worker in a batch tab.
+- `delegate_parallel` — run up to three workers concurrently as tiled panes in one batch tab.
+
+Batch tabs use the parent Pi session name (or project directory) plus a short batch ID, for example `agents: auth-review [a7f3]`. Each pane runs a separately named Pi session. Two workers are placed side-by-side; a third splits the first column to produce a compact tiled layout.
 
 Each task supports two modes:
 
@@ -36,9 +38,9 @@ Use three parallel workers to review security, correctness, and test coverage.
 Delegate this implementation in coding mode, then review the returned commit.
 ```
 
-Workers inherit the parent model and thinking level unless overridden. They do not inherit the parent conversation, so delegated tasks must be self-contained. Supacode tabs stay open by default for inspection; coding worktrees are always preserved for manual review. Each worker defaults to a 15-minute timeout.
+Workers inherit the parent model and thinking level unless overridden. They do not inherit the parent conversation, so delegated tasks must be self-contained. The batch tab stays open by default for inspection; `keepOpen: false` closes the whole tab after every result is captured. Coding workers still use separate preserved worktrees—their panes simply start in their assigned worktree—so visual grouping does not sacrifice Git isolation. Each worker defaults to a 15-minute timeout.
 
-The extension requires the parent Pi session to run inside a Supacode terminal. Runtime output and errors are stored in each job directory as `result.md`, `status.json`, and `stderr.log`.
+The extension requires the parent Pi session to run inside a Supacode terminal. Runtime output and errors are grouped by batch under `~/.pi/agent/subagents/<batch-id>/<worker-id>/` as `result.md`, `status.json`, and `stderr.log`.
 
 ## Local development
 
