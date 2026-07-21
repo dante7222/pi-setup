@@ -8,6 +8,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
+const SESSION_NAME_STATUS_KEY = "ventris-session-name";
+
 const THINKING_COLORS: Record<string, ThemeColor> = {
   off: "thinkingOff",
   minimal: "thinkingMinimal",
@@ -38,6 +40,24 @@ function sanitizeSingleLine(text: string): string {
 function sanitizeStatusText(text: string): string {
   // Preserve ANSI styling supplied by extensions while preventing multiline status output.
   return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
+}
+
+function publishSessionName(ctx: ExtensionContext, name: string | undefined): void {
+  if (ctx.mode !== "tui") return;
+
+  const sessionName = sanitizeSingleLine(name ?? "");
+  if (!sessionName) {
+    ctx.ui.setStatus(SESSION_NAME_STATUS_KEY, undefined);
+    return;
+  }
+
+  // pi-powerline-footer can promote extension statuses into dedicated segments.
+  // Publish the same prominent styling used by this extension's standalone footer.
+  const tokyoNight = ctx.ui.getTheme("tokyo-night");
+  const status = tokyoNight
+    ? `${tokyoNight.bold(tokyoNight.fg("accent", "◆"))} ${tokyoNight.bold(tokyoNight.fg("borderAccent", sessionName))}`
+    : `◆ ${sessionName}`;
+  ctx.ui.setStatus(SESSION_NAME_STATUS_KEY, status);
 }
 
 function formatTokens(count: number): string {
@@ -196,6 +216,8 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     if (ctx.mode !== "tui") return;
 
+    publishSessionName(ctx, pi.getSessionName());
+
     ctx.ui.setFooter((tui, theme, footerData) => {
       const render = () => tui.requestRender();
       requestRender = render;
@@ -216,6 +238,7 @@ export default function (pi: ExtensionAPI): void {
           ];
 
           const statuses = Array.from(footerData.getExtensionStatuses().entries())
+            .filter(([key]) => key !== SESSION_NAME_STATUS_KEY)
             .sort(([a], [b]) => a.localeCompare(b))
             .map(([, text]) => sanitizeStatusText(text))
             .filter(Boolean);
@@ -231,7 +254,10 @@ export default function (pi: ExtensionAPI): void {
     });
   });
 
-  pi.on("session_info_changed", () => requestRender?.());
+  pi.on("session_info_changed", (event, ctx) => {
+    publishSessionName(ctx, event.name);
+    requestRender?.();
+  });
   pi.on("model_select", () => requestRender?.());
   pi.on("thinking_level_select", () => requestRender?.());
   pi.on("session_compact", () => requestRender?.());

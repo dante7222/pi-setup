@@ -21,6 +21,16 @@ The custom footer puts the Pi session name first and renders it in bold Tokyo Ni
 
 The footer is enabled automatically in interactive sessions and follows semantic theme colors, with the included **tokyo-night** theme providing its intended palette. Use `/name` to set or change the prominent session name; unnamed sessions begin with the working directory instead.
 
+When [`pi-powerline-footer`](https://github.com/nicobailon/pi-powerline-footer) is installed, it owns Pi's footer component. This extension also publishes the styled session name under the `ventris-session-name` status key so powerline can promote it into a first-class `custom:session-name` segment. The tracked `integrations/pi-powerline-footer/settings.json` fragment configures that item and puts it first in `powerline.layout.left`; merge its `powerline` object into the agent settings when setting up a new machine. The global settings in this environment already match it.
+
+The matching powerline palette lives at `integrations/pi-powerline-footer/theme.json`. The upstream extension only reads `theme.json` beside its installed module, so link the tracked palette into the npm package after installation or an update:
+
+```bash
+./scripts/link-powerline-theme.sh
+```
+
+The npm path is only a runtime link; this repository remains the source of truth for the color configuration. Run `/reload` after changing the layout, extension, or link.
+
 ## Supacode subagents
 
 The extension lets the main Pi delegate work to independent Pi sessions running in a visible Supacode batch tab. Parallel workers are tiled as split surfaces in that one tab, while results return to the main agent automatically through job files under `~/.pi/agent/subagents/`.

@@ -1,0 +1,36 @@
+{
+  "powerline": {
+    "preset": "default",
+    "customItems": [
+      {
+        "id": "session-name",
+        "statusKey": "ventris-session-name",
+        "position": "left",
+        "hideWhenMissing": true,
+        "excludeFromExtensionStatuses": true
+      }
+    ],
+    "layout": {
+      "left": [
+        "custom:session-name",
+        "model",
+        "thinking",
+        "shell_mode",
+        "path",
+        "git",
+        "context_pct",
+        "cache_read",
+        "cost"
+      ]
+    },
+    "path": {
+      "mode": "full"
+    },
+    "model": {
+      "display": "name"
+    },
+    "cost": {
+      "subscriptionDisplay": "both"
+    }
+  }
+}
