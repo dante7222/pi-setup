@@ -8,6 +8,14 @@
         "position": "left",
         "hideWhenMissing": true,
         "excludeFromExtensionStatuses": true
+      },
+      {
+        "id": "tps",
+        "statusKey": "ventris-tps",
+        "position": "left",
+        "color": "#73daca",
+        "hideWhenMissing": true,
+        "excludeFromExtensionStatuses": true
       }
     ],
     "layout": {
@@ -15,6 +23,7 @@
         "custom:session-name",
         "model",
         "thinking",
+        "custom:tps",
         "shell_mode",
         "path",
         "git",

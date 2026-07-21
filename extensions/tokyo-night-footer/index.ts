@@ -9,6 +9,9 @@ import type {
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const SESSION_NAME_STATUS_KEY = "ventris-session-name";
+const TPS_STATUS_KEY = "ventris-tps";
+const TPS_ICON_NERD = "󰓅";
+const TPS_ICON_FALLBACK = "⚡";
 
 const THINKING_COLORS: Record<string, ThemeColor> = {
   off: "thinkingOff",
@@ -58,6 +61,31 @@ function publishSessionName(ctx: ExtensionContext, name: string | undefined): vo
     ? `${tokyoNight.bold(tokyoNight.fg("accent", "◆"))} ${tokyoNight.bold(tokyoNight.fg("borderAccent", sessionName))}`
     : `◆ ${sessionName}`;
   ctx.ui.setStatus(SESSION_NAME_STATUS_KEY, status);
+}
+
+function supportsNerdIcons(): boolean {
+  if (process.env.POWERLINE_NERD_FONTS === "1") return true;
+  if (process.env.POWERLINE_NERD_FONTS === "0") return false;
+  if (process.env.GHOSTTY_RESOURCES_DIR) return true;
+
+  const terminal = (process.env.TERM_PROGRAM ?? "").toLowerCase();
+  return ["iterm", "wezterm", "kitty", "ghostty", "alacritty"].some((name) =>
+    terminal.includes(name),
+  );
+}
+
+function formatTps(tps: number): string {
+  return `${tps.toFixed(1)} t/s`;
+}
+
+function tpsStatus(tps: number): string {
+  const icon = supportsNerdIcons() ? TPS_ICON_NERD : TPS_ICON_FALLBACK;
+  return `${icon} ${formatTps(tps)}`;
+}
+
+function publishTps(ctx: ExtensionContext, tps: number | undefined): void {
+  if (ctx.mode !== "tui") return;
+  ctx.ui.setStatus(TPS_STATUS_KEY, tps === undefined ? undefined : tpsStatus(tps));
 }
 
 function formatTokens(count: number): string {
@@ -155,12 +183,16 @@ function statsLine(
   theme: Theme,
   availableProviderCount: number,
   width: number,
+  latestTps: number | undefined,
 ): string {
   const totals = collectUsage(ctx);
   const parts: string[] = [];
 
   if (totals.input) parts.push(theme.fg("accent", `↑${formatTokens(totals.input)}`));
   if (totals.output) parts.push(theme.fg("borderAccent", `↓${formatTokens(totals.output)}`));
+  if (latestTps !== undefined) {
+    parts.push(theme.fg("borderAccent", tpsStatus(latestTps)));
+  }
   if (totals.cacheRead) {
     parts.push(theme.fg("customMessageLabel", `R${formatTokens(totals.cacheRead)}`));
   }
@@ -212,11 +244,18 @@ function statsLine(
 
 export default function (pi: ExtensionAPI): void {
   let requestRender: (() => void) | undefined;
+  let responseStartedAt: number | undefined;
+  let firstTokenAt: number | undefined;
+  let latestTps: number | undefined;
 
   pi.on("session_start", (_event, ctx) => {
     if (ctx.mode !== "tui") return;
 
+    responseStartedAt = undefined;
+    firstTokenAt = undefined;
+    latestTps = undefined;
     publishSessionName(ctx, pi.getSessionName());
+    publishTps(ctx, undefined);
 
     ctx.ui.setFooter((tui, theme, footerData) => {
       const render = () => tui.requestRender();
@@ -234,11 +273,20 @@ export default function (pi: ExtensionAPI): void {
 
           const lines = [
             topLine(pi, ctx, theme, footerData.getGitBranch(), width),
-            statsLine(pi, ctx, theme, footerData.getAvailableProviderCount(), width),
+            statsLine(
+              pi,
+              ctx,
+              theme,
+              footerData.getAvailableProviderCount(),
+              width,
+              latestTps,
+            ),
           ];
 
           const statuses = Array.from(footerData.getExtensionStatuses().entries())
-            .filter(([key]) => key !== SESSION_NAME_STATUS_KEY)
+            .filter(
+              ([key]) => key !== SESSION_NAME_STATUS_KEY && key !== TPS_STATUS_KEY,
+            )
             .sort(([a], [b]) => a.localeCompare(b))
             .map(([, text]) => sanitizeStatusText(text))
             .filter(Boolean);
@@ -258,6 +306,47 @@ export default function (pi: ExtensionAPI): void {
     publishSessionName(ctx, event.name);
     requestRender?.();
   });
+  pi.on("message_update", (event, ctx) => {
+    const update = event.assistantMessageEvent;
+    const now = performance.now();
+
+    if (update.type === "start") {
+      responseStartedAt = now;
+      firstTokenAt = undefined;
+      return;
+    }
+
+    if (
+      firstTokenAt === undefined &&
+      (update.type === "text_delta" ||
+        update.type === "thinking_delta" ||
+        update.type === "toolcall_delta")
+    ) {
+      firstTokenAt = now;
+      return;
+    }
+
+    if (update.type === "done") {
+      const startedAt = firstTokenAt ?? responseStartedAt;
+      const elapsedMs = startedAt === undefined ? 0 : now - startedAt;
+      const outputTokens = update.message.usage.output;
+
+      if (outputTokens > 0 && elapsedMs > 0) {
+        latestTps = outputTokens / (elapsedMs / 1_000);
+        publishTps(ctx, latestTps);
+        requestRender?.();
+      }
+      responseStartedAt = undefined;
+      firstTokenAt = undefined;
+      return;
+    }
+
+    if (update.type === "error") {
+      responseStartedAt = undefined;
+      firstTokenAt = undefined;
+    }
+  });
+
   pi.on("model_select", () => requestRender?.());
   pi.on("thinking_level_select", () => requestRender?.());
   pi.on("session_compact", () => requestRender?.());
