@@ -1,0 +1,24 @@
+{
+  "name": "ventris-pi-setup",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal Pi extensions, skills, prompts, and themes.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ],
+    "themes": [
+      "./themes"
+    ]
+  }
+}
