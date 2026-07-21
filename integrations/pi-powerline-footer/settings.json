@@ -25,11 +25,11 @@
         "thinking",
         "shell_mode",
         "path",
-        "git",
-        "context_pct",
-        "cache_read"
+        "git"
       ],
       "right": [
+        "context_pct",
+        "cache_read",
         "custom:tps",
         "token_out",
         "cost"
