@@ -12,6 +12,33 @@ Personal [Pi](https://pi.dev) extensions, skills, prompt templates, and themes, 
 Included now:
 
 - **Tokyo Night** theme (`themes/tokyo-night.json`)
+- **Supacode Subagents** extension (`extensions/supacode-subagents/index.ts`)
+
+## Supacode subagents
+
+The extension lets the main Pi delegate work to independent Pi sessions running in visible Supacode tabs. Results return to the main agent automatically through job files under `~/.pi/agent/subagents/`.
+
+Available tools:
+
+- `delegate` — run one independent worker.
+- `delegate_parallel` — run up to three workers concurrently.
+
+Each task supports two modes:
+
+- `research` (default) — works in the current project with only `read`, `grep`, `find`, and `ls`.
+- `coding` — creates a separate Supacode Git worktree and branch, allows coding tools, and asks the worker to test and commit without pushing or merging.
+
+Example requests:
+
+```text
+Delegate a research task to find the authentication flow.
+Use three parallel workers to review security, correctness, and test coverage.
+Delegate this implementation in coding mode, then review the returned commit.
+```
+
+Workers inherit the parent model and thinking level unless overridden. They do not inherit the parent conversation, so delegated tasks must be self-contained. Supacode tabs stay open by default for inspection; coding worktrees are always preserved for manual review. Each worker defaults to a 15-minute timeout.
+
+The extension requires the parent Pi session to run inside a Supacode terminal. Runtime output and errors are stored in each job directory as `result.md`, `status.json`, and `stderr.log`.
 
 ## Local development
 
