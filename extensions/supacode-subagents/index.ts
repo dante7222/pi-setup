@@ -10,12 +10,25 @@ import {
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { resolvePermissionConfigPath } from "./permission-config.ts";
+import {
+  decodeSupacodeResourceId,
+  findSupacodePathId,
+  sameSupacodeUuid,
+} from "./resource-id.ts";
+import { codingWorktreeName } from "./worktree-name.ts";
 
 const WORKER_JOB_ENV = "PI_SUPACODE_SUBAGENT_JOB_DIR";
+const PERMISSION_CONFIG_ENV = "PI_PERMISSION_CONFIG";
 const PERMISSION_YOLO_ENV = "VENTRIS_PI_PERMISSION_YOLO";
-const MAX_PARALLEL = 3;
+const MAX_PARALLEL = 8;
 const DEFAULT_TIMEOUT_SECONDS = 15 * 60;
 const POLL_INTERVAL_MS = 250;
+const TAB_MONITOR_INTERVAL_MS = 1000;
+const TAB_MISSING_CONFIRMATIONS = 2;
+const TAB_LIST_TIMEOUT_MS = 2000;
+const REPOSITORY_REGISTRATION_TIMEOUT_MS = 30_000;
+const CLEANUP_TIMEOUT_MS = 5000;
 const RESULT_BUDGET_BYTES = DEFAULT_MAX_BYTES - 2048;
 const RESEARCH_TOOLS = "read,rg,find,ls";
 const CODING_TOOLS = "read,bash,edit,write,rg,find,ls";
@@ -53,6 +66,7 @@ interface WorkerJob {
   model?: string;
   thinking: ThinkingLevel;
   yolo: boolean;
+  permissionConfigPath?: string;
   originalCwd: string;
   workerCwd: string;
   jobDir: string;
@@ -140,14 +154,6 @@ function lastNonEmptyLine(value: string): string {
     .map((line) => line.trim())
     .filter(Boolean)
     .at(-1) ?? "";
-}
-
-function decodeResourceId(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
 }
 
 function isFinalState(status: WorkerStatus | undefined): status is WorkerStatus & { state: "completed" | "failed" } {
@@ -310,6 +316,7 @@ STATUS_PATH=${shellQuote(job.statusPath)}
 STDERR_PATH=${shellQuote(job.stderrPath)}
 cd -- ${shellQuote(job.workerCwd)} || exit 72
 export ${WORKER_JOB_ENV}="$JOB_DIR"
+${job.permissionConfigPath ? `export ${PERMISSION_CONFIG_ENV}=${shellQuote(job.permissionConfigPath)}` : ""}
 touch "$STDERR_PATH"
 printf '\\n[supacode-subagent %s] %s\\n\\n' ${shellQuote(job.batchId.slice(0, 4))} ${shellQuote(job.title)}
 set +e
@@ -363,25 +370,38 @@ async function gitOutput(
   return (await execChecked(pi, "git", ["-C", cwd, ...args], { signal, timeout: 30_000 })).trim();
 }
 
+async function listedRepositoryId(
+  pi: ExtensionAPI,
+  repoRoot: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const listed = await execChecked(pi, "supacode", ["repo", "list"], { signal, timeout: 30_000 });
+  return findSupacodePathId(listed, repoRoot);
+}
+
 async function ensureRepositoryKnown(
   pi: ExtensionAPI,
   repoRoot: string,
   signal?: AbortSignal,
 ): Promise<string> {
-  const listed = await execChecked(pi, "supacode", ["repo", "list"], { signal, timeout: 30_000 });
-  const knownId = listed
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((id) => id && path.resolve(decodeResourceId(id)) === path.resolve(repoRoot));
+  const knownId = await listedRepositoryId(pi, repoRoot, signal);
   if (knownId) return knownId;
 
   await execChecked(pi, "supacode", ["repo", "open", repoRoot], { signal, timeout: 60_000 });
-  return encodeURIComponent(repoRoot);
+  const deadline = Date.now() + REPOSITORY_REGISTRATION_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const openedId = await listedRepositoryId(pi, repoRoot, signal);
+    if (openedId) return openedId;
+    await delay(POLL_INTERVAL_MS, signal);
+  }
+
+  throw new Error(`Supacode opened ${repoRoot} but did not publish its repository ID.`);
 }
 
 async function createCodingWorktree(
   pi: ExtensionAPI,
   originalCwd: string,
+  title: string,
   batchId: string,
   jobId: string,
   signal?: AbortSignal,
@@ -392,7 +412,7 @@ async function createCodingWorktree(
   const batchShortId = batchId.slice(0, 6);
   const workerShortId = jobId.slice(0, 6);
   const branch = `pi-agent/${batchShortId}/${workerShortId}`;
-  const folderName = `pi-agent-${batchShortId}-${workerShortId}`;
+  const folderName = codingWorktreeName(title, jobId);
   const stdout = await execChecked(
     pi,
     "supacode",
@@ -412,7 +432,7 @@ async function createCodingWorktree(
   );
   const id = lastNonEmptyLine(stdout);
   if (!id) throw new Error("Supacode created a worktree but returned no worktree ID.");
-  const worktreePath = decodeResourceId(id);
+  const worktreePath = decodeSupacodeResourceId(id);
   if (!path.isAbsolute(worktreePath)) throw new Error(`Unexpected Supacode worktree ID: ${id}`);
   return { id, worktreePath, branch, baseSha };
 }
@@ -463,7 +483,7 @@ async function prepareWorker(
   let baseSha: string | undefined;
 
   if (spec.mode === "coding") {
-    const worktree = await createCodingWorktree(pi, ctxCwd, batchId, id, signal);
+    const worktree = await createCodingWorktree(pi, ctxCwd, title, batchId, id, signal);
     codeWorktreeId = worktree.id;
     workerCwd = worktree.worktreePath;
     worktreePath = worktree.worktreePath;
@@ -471,6 +491,10 @@ async function prepareWorker(
     baseSha = worktree.baseSha;
   }
 
+  const permissionConfigPath = resolvePermissionConfigPath(
+    process.env[PERMISSION_CONFIG_ENV],
+    ctxCwd,
+  );
   const promptPath = path.join(jobDir, "prompt.md");
   const resultPath = path.join(jobDir, "result.md");
   const stderrPath = path.join(jobDir, "stderr.log");
@@ -486,6 +510,7 @@ async function prepareWorker(
     model: spec.model,
     thinking,
     yolo,
+    permissionConfigPath,
     originalCwd: ctxCwd,
     workerCwd,
     jobDir,
@@ -522,6 +547,7 @@ async function writeJobMetadata(job: WorkerJob): Promise<void> {
           model: job.model,
           thinking: job.thinking,
           yolo: job.yolo,
+          permissionConfigPath: job.permissionConfigPath,
           originalCwd: job.originalCwd,
           workerCwd: job.workerCwd,
           tabWorktreeId: job.tabWorktreeId,
@@ -550,15 +576,36 @@ async function createBatchTab(
   first: PreparedWorkerJob,
   signal?: AbortSignal,
 ): Promise<{ batch: WorkerBatch; job: WorkerJob }> {
-  const stdout = await execChecked(
-    pi,
-    "supacode",
-    ["tab", "new", "-w", parent.worktreeId, "--title", batchTitle, "-i", `zsh ${shellQuote(first.runnerPath)}`],
-    { signal, timeout: 60_000 },
-  );
-  const tabId = lastNonEmptyLine(stdout);
-  if (!/^[0-9a-f-]{36}$/i.test(tabId)) throw new Error(`Unexpected Supacode tab ID: ${tabId || "(empty)"}`);
+  const tabId = randomUUID();
   const batch: WorkerBatch = { id: batchId, title: batchTitle, worktreeId: parent.worktreeId, tabId };
+  let stdout: string;
+  try {
+    stdout = await execChecked(
+      pi,
+      "supacode",
+      [
+        "tab",
+        "new",
+        "-w",
+        parent.worktreeId,
+        "--title",
+        batchTitle,
+        "-i",
+        `zsh ${shellQuote(first.runnerPath)}`,
+        "-n",
+        tabId,
+      ],
+      { signal, timeout: 60_000 },
+    );
+  } catch (error) {
+    await closeBatchTab(pi, batch);
+    throw error;
+  }
+  const returnedTabId = lastNonEmptyLine(stdout);
+  if (!sameSupacodeUuid(returnedTabId, tabId)) {
+    await closeBatchTab(pi, batch);
+    throw new Error(`Unexpected Supacode tab ID: ${returnedTabId || "(empty)"}`);
+  }
   const job: WorkerJob = { ...first, tabId, surfaceId: tabId };
   try {
     await atomicWrite(
@@ -587,30 +634,40 @@ async function createWorkerSurface(
   signal?: AbortSignal,
 ): Promise<WorkerJob> {
   const placement = splitPlacement(workerIndex, launched);
-  const stdout = await execChecked(
-    pi,
-    "supacode",
-    [
-      "surface",
-      "split",
-      "-w",
-      batch.worktreeId,
-      "-t",
-      batch.tabId,
-      "-s",
-      placement.target,
-      "-d",
-      placement.direction,
-      "-i",
-      `zsh ${shellQuote(prepared.runnerPath)}`,
-    ],
-    { signal, timeout: 60_000 },
-  );
-  const surfaceId = lastNonEmptyLine(stdout);
-  if (!/^[0-9a-f-]{36}$/i.test(surfaceId)) {
-    throw new Error(`Unexpected Supacode surface ID: ${surfaceId || "(empty)"}`);
-  }
+  const surfaceId = randomUUID();
   const job: WorkerJob = { ...prepared, tabId: batch.tabId, surfaceId };
+  let stdout: string;
+  try {
+    stdout = await execChecked(
+      pi,
+      "supacode",
+      [
+        "surface",
+        "split",
+        "-w",
+        batch.worktreeId,
+        "-t",
+        batch.tabId,
+        "-s",
+        placement.target,
+        "-d",
+        placement.direction,
+        "-i",
+        `zsh ${shellQuote(prepared.runnerPath)}`,
+        "-n",
+        surfaceId,
+      ],
+      { signal, timeout: 60_000 },
+    );
+  } catch (error) {
+    if (!signal?.aborted) await closeWorkerSurface(pi, job);
+    throw error;
+  }
+  const returnedSurfaceId = lastNonEmptyLine(stdout);
+  if (!sameSupacodeUuid(returnedSurfaceId, surfaceId)) {
+    await closeWorkerSurface(pi, job);
+    throw new Error(`Unexpected Supacode surface ID: ${returnedSurfaceId || "(empty)"}`);
+  }
   await writeJobMetadata(job);
   return job;
 }
@@ -630,7 +687,7 @@ async function closeWorkerSurface(pi: ExtensionAPI, job: WorkerJob): Promise<voi
         "-s",
         job.surfaceId,
       ],
-      { timeout: 30_000 },
+      { timeout: CLEANUP_TIMEOUT_MS },
     );
   } catch {
     // Cleanup is best effort; IDs and logs remain in the job directory.
@@ -643,18 +700,73 @@ async function closeBatchTab(pi: ExtensionAPI, batch: WorkerBatch): Promise<void
       pi,
       "supacode",
       ["tab", "close", "-w", batch.worktreeId, "-t", batch.tabId],
-      { timeout: 30_000 },
+      { timeout: CLEANUP_TIMEOUT_MS },
     );
   } catch {
     // Cleanup is best effort; coding worktrees and job files are preserved.
   }
 }
 
-async function collectGitSummary(pi: ExtensionAPI, job: WorkerJob): Promise<GitSummary | undefined> {
+async function batchTabExists(
+  pi: ExtensionAPI,
+  batch: WorkerBatch,
+  signal: AbortSignal,
+): Promise<boolean | undefined> {
+  try {
+    const listed = await execChecked(
+      pi,
+      "supacode",
+      ["tab", "list", "-w", batch.worktreeId],
+      { signal, timeout: TAB_LIST_TIMEOUT_MS },
+    );
+    return listed
+      .split(/\r?\n/)
+      .some((listedTabId) => sameSupacodeUuid(listedTabId, batch.tabId));
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return undefined;
+  }
+}
+
+async function monitorBatchTab(
+  pi: ExtensionAPI,
+  batch: WorkerBatch,
+  signal: AbortSignal,
+  onClosed: () => void,
+): Promise<void> {
+  let observed = false;
+  let consecutiveMissingChecks = 0;
+  try {
+    while (!signal.aborted) {
+      await delay(TAB_MONITOR_INTERVAL_MS, signal);
+      const exists = await batchTabExists(pi, batch, signal);
+      if (exists === true) {
+        observed = true;
+        consecutiveMissingChecks = 0;
+      } else if (exists === false && observed) {
+        consecutiveMissingChecks++;
+        if (consecutiveMissingChecks >= TAB_MISSING_CONFIRMATIONS) {
+          onClosed();
+          return;
+        }
+      } else {
+        consecutiveMissingChecks = 0;
+      }
+    }
+  } catch (error) {
+    if (!signal.aborted) throw error;
+  }
+}
+
+async function collectGitSummary(
+  pi: ExtensionAPI,
+  job: WorkerJob,
+  signal?: AbortSignal,
+): Promise<GitSummary | undefined> {
   if (job.mode !== "coding" || !job.worktreePath) return undefined;
   try {
-    const head = await gitOutput(pi, job.worktreePath, ["rev-parse", "HEAD"]);
-    const status = await gitOutput(pi, job.worktreePath, ["status", "--short"]);
+    const head = await gitOutput(pi, job.worktreePath, ["rev-parse", "HEAD"], signal);
+    const status = await gitOutput(pi, job.worktreePath, ["status", "--short"], signal);
     return { head, commit: job.baseSha && head !== job.baseSha ? head : undefined, status };
   } catch {
     return undefined;
@@ -665,7 +777,8 @@ async function waitForWorker(
   pi: ExtensionAPI,
   job: WorkerJob,
   timeoutSeconds: number,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  closeSurface: () => Promise<void>,
 ): Promise<WorkerResult> {
   const deadline = Date.now() + timeoutSeconds * 1000;
   try {
@@ -675,7 +788,7 @@ async function waitForWorker(
       if (isFinalState(status)) {
         const output = (await readText(job.resultPath)).trim();
         const stderr = (await readText(job.stderrPath)).trim();
-        const git = await collectGitSummary(pi, job);
+        const git = await collectGitSummary(pi, job, signal);
         return {
           id: job.id,
           batchId: job.batchId,
@@ -701,7 +814,7 @@ async function waitForWorker(
       await delay(POLL_INTERVAL_MS, signal);
     }
 
-    await closeWorkerSurface(pi, job);
+    await closeSurface();
     return {
       id: job.id,
       batchId: job.batchId,
@@ -722,7 +835,7 @@ async function waitForWorker(
       branch: job.branch,
     };
   } catch (error) {
-    await closeWorkerSurface(pi, job);
+    await closeSurface();
     throw error;
   }
 }
@@ -792,6 +905,7 @@ async function runWorkers(
   keepOpen: boolean,
   yolo: boolean,
   signal: AbortSignal | undefined,
+  onBatchClosed: () => void,
   onUpdate: ((partial: any) => void) | undefined,
 ): Promise<WorkerResult[]> {
   const batchId = randomUUID();
@@ -800,6 +914,8 @@ async function runWorkers(
   const prepared: Array<{ index: number; job: PreparedWorkerJob }> = [];
   const launched: Array<{ index: number; job: WorkerJob }> = [];
   let batch: WorkerBatch | undefined;
+  let batchTabClosed = false;
+  let expectedBatchTabClosure = false;
 
   try {
     for (let index = 0; index < specs.length; index++) {
@@ -854,62 +970,108 @@ async function runWorkers(
     }
 
     if (batch) {
-      for (let preparedIndex = 1; preparedIndex < prepared.length; preparedIndex++) {
-        const item = prepared[preparedIndex];
-        onUpdate?.({
-          content: [{ type: "text", text: `Tiling ${batchTitle}: pane ${preparedIndex + 1}/${prepared.length}...` }],
-          details: { batchId, batchTitle, launched: launched.length, total: specs.length },
-        });
+      const tabMonitorController = new AbortController();
+      const workerSignal = signal
+        ? AbortSignal.any([signal, tabMonitorController.signal])
+        : tabMonitorController.signal;
+      const handleBatchTabClosed = () => {
+        if (batchTabClosed || expectedBatchTabClosure) return;
+        batchTabClosed = true;
+        tabMonitorController.abort();
+        onBatchClosed();
         try {
-          const job = await createWorkerSurface(
-            pi,
-            batch,
-            item.job,
-            launched.length,
-            launched.map((entry) => entry.job),
-            signal,
-          );
-          launched.push({ index: item.index, job });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          ordered[item.index] = {
-            id: item.job.id,
-            batchId,
-            batchTitle,
-            title: item.job.title,
-            mode: item.job.mode,
-            state: "failed",
-            output: message,
-            error: message,
-            jobDir: item.job.jobDir,
-            resultPath: item.job.resultPath,
-            stderrPath: item.job.stderrPath,
-            tabId: batch.tabId,
-            tabWorktreeId: batch.worktreeId,
-            worktreePath: item.job.worktreePath,
-            branch: item.job.branch,
-          };
-        }
-      }
-
-      await refocusParent(pi, parent);
-      let completed = ordered.filter(Boolean).length;
-      await Promise.all(
-        launched.map(async ({ index, job }) => {
-          const result = await waitForWorker(pi, job, timeoutSeconds, signal);
-          ordered[index] = result;
-          completed++;
           onUpdate?.({
-            content: [{ type: "text", text: `${batchTitle}: ${completed}/${specs.length} finished.` }],
-            details: resultDetails(ordered.filter((item): item is WorkerResult => Boolean(item))),
+            content: [{ type: "text", text: `${batchTitle}: batch tab closed; stopping the parent turn.` }],
+            details: { batchId, batchTitle, launched: launched.length, total: specs.length },
           });
-        }),
-      );
+        } catch {
+          // The parent turn is already aborting; progress reporting is best effort.
+        }
+      };
+      const tabMonitor = monitorBatchTab(pi, batch, tabMonitorController.signal, handleBatchTabClosed);
+
+      try {
+        for (let preparedIndex = 1; preparedIndex < prepared.length; preparedIndex++) {
+          const item = prepared[preparedIndex];
+          onUpdate?.({
+            content: [{ type: "text", text: `Tiling ${batchTitle}: pane ${preparedIndex + 1}/${prepared.length}...` }],
+            details: { batchId, batchTitle, launched: launched.length, total: specs.length },
+          });
+          try {
+            const job = await createWorkerSurface(
+              pi,
+              batch,
+              item.job,
+              launched.length,
+              launched.map((entry) => entry.job),
+              workerSignal,
+            );
+            launched.push({ index: item.index, job });
+          } catch (error) {
+            if (workerSignal.aborted) throw error;
+            const message = error instanceof Error ? error.message : String(error);
+            ordered[item.index] = {
+              id: item.job.id,
+              batchId,
+              batchTitle,
+              title: item.job.title,
+              mode: item.job.mode,
+              state: "failed",
+              output: message,
+              error: message,
+              jobDir: item.job.jobDir,
+              resultPath: item.job.resultPath,
+              stderrPath: item.job.stderrPath,
+              tabId: batch.tabId,
+              tabWorktreeId: batch.worktreeId,
+              worktreePath: item.job.worktreePath,
+              branch: item.job.branch,
+            };
+          }
+        }
+
+        await refocusParent(pi, parent);
+        let completed = ordered.filter(Boolean).length;
+        await Promise.all(
+          launched.map(async ({ index, job }) => {
+            const result = await waitForWorker(
+              pi,
+              job,
+              timeoutSeconds,
+              workerSignal,
+              async () => {
+                if (batchTabClosed) return;
+                const mayCloseBatchTab = job.surfaceId === batch.tabId;
+                if (mayCloseBatchTab) expectedBatchTabClosure = true;
+                await closeWorkerSurface(pi, job);
+                if (
+                  mayCloseBatchTab
+                  && await batchTabExists(pi, batch, tabMonitorController.signal) !== false
+                ) {
+                  expectedBatchTabClosure = false;
+                }
+              },
+            );
+            ordered[index] = result;
+            completed++;
+            onUpdate?.({
+              content: [{ type: "text", text: `${batchTitle}: ${completed}/${specs.length} finished.` }],
+              details: resultDetails(ordered.filter((item): item is WorkerResult => Boolean(item))),
+            });
+          }),
+        );
+      } catch (error) {
+        if (batchTabClosed) throw new Error("Supacode batch tab closed; parent turn aborted.");
+        throw error;
+      } finally {
+        tabMonitorController.abort();
+        await tabMonitor;
+      }
 
       if (!keepOpen) await closeBatchTab(pi, batch);
     }
   } catch (error) {
-    if (batch) await closeBatchTab(pi, batch);
+    if (batch && !batchTabClosed) await closeBatchTab(pi, batch);
     throw error;
   } finally {
     await refocusParent(pi, parent);
@@ -994,7 +1156,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
     name: "delegate",
     label: "Delegate",
     description:
-      "Run one independent Pi worker in a visible Supacode batch tab and return its final answer. Research mode is read-only. Coding mode creates and preserves an isolated Git worktree; it never merges or pushes. Worker output is capped for model context and the full result path is returned.",
+      "Run one independent Pi worker in a visible Supacode batch tab and return its final answer. Research mode is read-only. Coding mode creates and preserves an isolated Git worktree; it never merges or pushes. Closing the batch tab aborts the active parent turn. Worker output is capped for model context and the full result path is returned.",
     promptSnippet: "Delegate one independent research or coding task to a visible Pi worker in Supacode",
     promptGuidelines: [
       "Use delegate when one independent task can be completed in an isolated context; include all necessary requirements because workers do not inherit the parent conversation.",
@@ -1018,6 +1180,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
         params.keepOpen ?? true,
         process.env[PERMISSION_YOLO_ENV] === "1",
         signal,
+        () => ctx.abort(),
         onUpdate,
       );
       return { content: [{ type: "text", text: formatResults(results) }], details: resultDetails(results) };
@@ -1028,10 +1191,10 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
     name: "delegate_parallel",
     label: "Delegate Parallel",
     description:
-      `Run up to ${MAX_PARALLEL} independent Pi workers concurrently as tiled panes in one visible Supacode batch tab and return all final answers. Research workers are read-only; each coding worker gets a separate preserved Git worktree while still running in the shared batch tab. Output is capped for model context and full result paths are returned.`,
-    promptSnippet: "Delegate up to three independent tasks to tiled Pi workers in one Supacode batch tab",
+      `Run up to ${MAX_PARALLEL} independent Pi workers concurrently as tiled panes in one visible Supacode batch tab and return all final answers. Research workers are read-only; each coding worker gets a separate preserved Git worktree while still running in the shared batch tab. Closing the batch tab aborts the active parent turn. Output is capped for model context and full result paths are returned.`,
+    promptSnippet: `Delegate up to ${MAX_PARALLEL} independent tasks to tiled Pi workers in one Supacode batch tab`,
     promptGuidelines: [
-      "Use delegate_parallel only for independent tasks that benefit from concurrent investigation or isolated implementations, and make every task self-contained.",
+      `Use delegate_parallel only for independent tasks that benefit from concurrent investigation or isolated implementations; use only as many workers as the task needs, up to ${MAX_PARALLEL}, and make every task self-contained.`,
     ],
     parameters: ParallelParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -1054,6 +1217,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
         params.keepOpen ?? true,
         process.env[PERMISSION_YOLO_ENV] === "1",
         signal,
+        () => ctx.abort(),
         onUpdate,
       );
       return { content: [{ type: "text", text: formatResults(results) }], details: resultDetails(results) };

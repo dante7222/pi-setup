@@ -117,6 +117,91 @@ function deduplicate(requests: PermissionRequest[]): PermissionRequest[] {
   });
 }
 
+// OpenCode evaluates parsed shell commands individually. Split common shell chains so
+// an allowed first command cannot approve an unlisted or denied suffix command.
+function bashPermissionResources(command: string): string[] {
+  const resources: string[] = [];
+  let start = 0;
+  let quote: "single" | "double" | undefined;
+  let dynamic = false;
+
+  const append = (end: number): void => {
+    const resource = command.slice(start, end).trim();
+    if (resource) resources.push(resource);
+  };
+
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index];
+
+    if (quote === "single") {
+      if (character === "'") quote = undefined;
+      continue;
+    }
+
+    if (quote === "double") {
+      if (character === "\\") {
+        index++;
+        continue;
+      }
+      if (character === '"') {
+        quote = undefined;
+        continue;
+      }
+      if (character === "`" || (character === "$" && command[index + 1] === "(")) {
+        dynamic = true;
+      }
+      continue;
+    }
+
+    if (character === "\\") {
+      index++;
+      continue;
+    }
+    if (character === "'") {
+      quote = "single";
+      continue;
+    }
+    if (character === '"') {
+      quote = "double";
+      continue;
+    }
+    if (
+      character === "`" ||
+      character === "(" ||
+      character === ")" ||
+      ((character === "$" || character === "<" || character === ">") &&
+        command[index + 1] === "(")
+    ) {
+      dynamic = true;
+    }
+
+    if (
+      character !== ";" &&
+      character !== "\n" &&
+      character !== "\r" &&
+      character !== "&" &&
+      character !== "|"
+    ) {
+      continue;
+    }
+    if (
+      (character === "&" &&
+        (command[index - 1] === ">" || command[index - 1] === "<" || command[index + 1] === ">")) ||
+      (character === "|" && command[index - 1] === ">")
+    ) {
+      continue;
+    }
+
+    append(index);
+    while (command[index + 1] === "&" || command[index + 1] === "|") index++;
+    start = index + 1;
+  }
+
+  append(command.length);
+  if (dynamic) resources.push(`<dynamic shell syntax> ${command}`);
+  return [...new Set(resources.length > 0 ? resources : [command])];
+}
+
 function adapterName(toolName: string): string {
   return toolName.split(".").at(-1) ?? toolName;
 }
@@ -178,10 +263,9 @@ export function permissionRequestsForTool(
   }
 
   if (name === "bash") {
-    return [{
-      permission: "bash",
-      resource: requiredString(input, "command", name),
-    }];
+    return bashPermissionResources(requiredString(input, "command", name)).map(
+      (resource) => ({ permission: "bash", resource }),
+    );
   }
 
   if (name === "delegate") {

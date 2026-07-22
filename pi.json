@@ -11,15 +11,42 @@
     "grep": "allow",
     "glob": "allow",
     "list": "allow",
-    "edit": "ask",
-    "bash": "ask",
-    "task": {
+    "edit": "deny",
+    "todowrite": "allow",
+    "bash": {
       "*": "ask",
-      "research": "allow"
+      "git diff *": "allow",
+      "git log *": "allow",
+      "git show *": "allow",
+      "git status *": "allow",
+      "git branch *": "allow",
+      "grep *": "allow",
+      "find *": "allow",
+      "ls *": "allow",
+      "cat *": "allow",
+      "head *": "allow",
+      "wc *": "allow",
+      "sort *": "allow",
+      "uniq *": "allow",
+      "file *": "allow",
+      "which *": "allow",
+      "sed *": "allow",
+      "gradle *": "allow",
+      "gradlew *": "allow",
+      "./gradlew *": "allow"
     },
+    "task": "allow",
     "webfetch": "allow",
     "websearch": "allow",
     "get_search_content": "allow",
-    "external_directory": "ask"
+    "skill": {
+      "*": "allow"
+    },
+    "external_directory": {
+      "*": "ask",
+      "~/projects/**": "allow",
+      "~/.agents/**": "allow",
+      "~/.config/opencode/**": "allow"
+    }
   }
 }

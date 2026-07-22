@@ -56,11 +56,21 @@ The approval gate reads the tracked [`pi.json`](pi.json) and applies OpenCode-st
       "*.env": "ask",
       "*.env.example": "allow"
     },
-    "edit": "ask",
-    "bash": "ask",
-    "task": {
+    "edit": "deny",
+    "todowrite": "allow",
+    "bash": {
       "*": "ask",
-      "research": "allow"
+      "git status *": "allow",
+      "./gradlew *": "allow"
+    },
+    "task": "allow",
+    "skill": {
+      "*": "allow"
+    },
+    "external_directory": {
+      "*": "ask",
+      "~/projects/**": "allow",
+      "~/.agents/**": "allow"
     }
   }
 }
@@ -68,13 +78,13 @@ The approval gate reads the tracked [`pi.json`](pi.json) and applies OpenCode-st
 
 Patterns use the same simple matching as OpenCode: `*` matches any number of characters, `?` matches one, and all other characters are literal. A trailing ` *` is optional, so `git status *` matches both `git status` and `git status --short`. `~` and `$HOME` expand at the start of granular patterns.
 
-Pi tools map to OpenCode permission names: `write` joins `edit`; `rg` joins `grep`; `find` becomes `glob`; `ls` becomes `list`; and `delegate`/`delegate_parallel` become `task` with `research` or `coding` resources. Unknown extension tools use their exact tool name and `*` as the resource. Known path-bearing file and search tools that target paths outside the session working directory also require `external_directory` approval.
+Pi tools map to OpenCode permission names: `write` joins `edit`; `rg` joins `grep`; `find` becomes `glob`; `ls` becomes `list`; and `delegate`/`delegate_parallel` become `task` with `research` or `coding` resources. Unknown extension tools use their exact tool name and `*` as the resource. Known path-bearing file and search tools that target paths outside the session working directory also require `external_directory` approval. Paths inside the launch directory never need that extra approval; an allowed external-directory pattern removes only the extra path-boundary prompt and does not override a separate action rule such as `edit: "deny"`.
 
 An `ask` prompt offers deny, allow once, or allow for the current Pi session. Session grants are exact action/resource pairs stored as hashes in session state, and configured denies always override them. Use `/permissions` to inspect status and `/permissions clear` to revoke session grants. Configuration is snapshotted at session start; run `/reload` after editing `pi.json`. A missing or invalid file blocks all agent tool calls. Set `PI_PERMISSION_CONFIG` to use another absolute or working-directory-relative JSON file.
 
-Use `/yolo` to toggle the bypass for the current session; the choice persists across `/reload`. Start Pi with `pi --yolo` to force YOLO from startup—`/yolo` cannot disable it until Pi is restarted without the flag. YOLO bypasses every permission check, including configured denies, prompts, config loading, and known-tool input classification. The footer stays silent during normal permission enforcement and shows a colored `YOLO mode` warning only while the bypass is active; `/permissions` reports full status. Supacode delegated workers inherit changes from the parent session.
+Use `/yolo` to toggle the bypass for the current session; the choice persists across `/reload`. Start Pi with `pi --yolo` to force YOLO from startup—`/yolo` cannot disable it until Pi is restarted without the flag. YOLO bypasses every permission check, including configured denies, prompts, config loading, and known-tool input classification. The footer stays silent during normal permission enforcement and shows a colored `YOLO mode` warning only while the bypass is active; `/permissions` reports full status. Supacode delegated workers inherit the parent policy path, including a working-directory-relative `PI_PERMISSION_CONFIG`, and the parent YOLO state.
 
-This extension is an approval gate, not a security sandbox. It does not mediate user `!`/`!!` commands, direct RPC bash commands, extension filesystem/process access, or operations hidden inside a custom tool. Bash rules match the complete raw command without shell parsing, and path checks are lexical rather than symlink-safe. A disabled gate provides no protection, and later-loaded extensions can mutate already approved tool input. Delegated workers are separate Pi processes with independent permission prompts and session grants when YOLO is not active. Use a container or OS sandbox when enforcement against untrusted code is required.
+This extension is an approval gate, not a security sandbox. It does not mediate user `!`/`!!` commands, direct RPC bash commands, extension filesystem/process access, native skill/template expansion, or operations hidden inside a custom tool. A `skill` rule gates a registered tool named `skill`, not Pi's native `/skill:name` expansion. Bash checks split unquoted `&&`, `||`, pipes, semicolons, background operators, and newlines so every command in a chain must resolve; dynamic substitutions and grouping require approval. This is conservative classification, not a complete shell parser. Path checks are lexical rather than symlink-safe. The separate **rg Only** extension still blocks assistant Bash invocations of `grep` even if the permission policy allows `grep *`. A disabled gate provides no protection, and later-loaded extensions can mutate already approved tool input. Delegated workers are separate Pi processes with independent permission prompts and session grants when YOLO is not active. Use a container or OS sandbox when enforcement against untrusted code is required.
 
 ## Supacode subagents
 
@@ -83,24 +93,26 @@ The extension lets the main Pi delegate work to independent Pi sessions running 
 Available tools:
 
 - `delegate` — run one independent worker in a batch tab.
-- `delegate_parallel` — run up to three workers concurrently as tiled panes in one batch tab.
+- `delegate_parallel` — run up to eight workers concurrently as tiled panes in one batch tab.
 
-Batch tabs use the parent Pi session name (or project directory) plus a short batch ID, for example `agents: auth-review [a7f3]`. Each pane runs a separately named Pi session. Two workers are placed side-by-side; a third splits the first column to produce a compact tiled layout.
+Batch tabs use the parent Pi session name (or project directory) plus a short batch ID, for example `agents: auth-review [a7f3]`. Each pane runs a separately named Pi session. Two workers are placed side-by-side; additional workers split existing panes vertically to produce a compact tiled layout.
 
 Each task supports two modes:
 
 - `research` (default) — works in the current project with only `read`, `rg`, `find`, and `ls`.
 - `coding` — creates a separate Supacode Git worktree and branch, allows coding tools, and asks the worker to test and commit without pushing or merging.
 
+Coding worktree folders combine a readable task slug with the first 12 hexadecimal characters of the worker UUID, for example `tree-sitter-bash-permissions-4e9a04efc879`. Git branches retain the stable `pi-agent/<batch>/<worker>` structure.
+
 Example requests:
 
 ```text
 Delegate a research task to find the authentication flow.
-Use three parallel workers to review security, correctness, and test coverage.
+Use as many parallel workers as needed, up to eight, to review security, correctness, and test coverage.
 Delegate this implementation in coding mode, then review the returned commit.
 ```
 
-Workers inherit the parent model and thinking level unless overridden, and they also inherit the parent's YOLO mode. They do not inherit the parent conversation, so delegated tasks must be self-contained. The batch tab stays open by default for inspection; `keepOpen: false` closes the whole tab after every result is captured. Coding workers still use separate preserved worktrees—their panes simply start in their assigned worktree—so visual grouping does not sacrifice Git isolation. Each worker defaults to a 15-minute timeout.
+Workers inherit the parent model and thinking level unless overridden, and they also inherit the parent's YOLO mode. They do not inherit the parent conversation, so delegated tasks must be self-contained. The batch tab stays open by default for inspection; `keepOpen: false` closes the whole tab after every result is captured. Manually closing an active batch tab promptly aborts the parent Pi turn, while leaving the parent Supacode tab and Pi session open. A worker timeout closes its pane and returns a failed result without misclassifying that cleanup as a manual tab close. Coding workers still use separate preserved worktrees—their panes simply start in their assigned worktree—so visual grouping does not sacrifice Git isolation. Each worker defaults to a 15-minute timeout.
 
 The extension requires the parent Pi session to run inside a Supacode terminal. Runtime output and errors are grouped by batch under `~/.pi/agent/subagents/<batch-id>/<worker-id>/` as `result.md`, `status.json`, and `stderr.log`.
 
