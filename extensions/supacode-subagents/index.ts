@@ -28,6 +28,7 @@ import {
 import { decideTabClose } from "./tab-close.ts";
 import {
   groupWorkersByPlacement,
+  researchWorkerSplitPlacement,
   workerTabWorktreeId,
 } from "./worker-placement.ts";
 import { codingWorktreeName } from "./worktree-name.ts";
@@ -658,21 +659,14 @@ async function createBatchTab(
   return { batch, job };
 }
 
-function splitPlacement(workerIndex: number, launched: WorkerJob[]): { target: string; direction: "h" | "v" } {
-  if (workerIndex === 1) return { target: launched[0].surfaceId, direction: "h" };
-  if (workerIndex === 2) return { target: launched[0].surfaceId, direction: "v" };
-  return { target: launched[(workerIndex - 1) % launched.length].surfaceId, direction: "v" };
-}
-
 async function createWorkerSurface(
   pi: ExtensionAPI,
   batch: WorkerBatch,
   prepared: PreparedWorkerJob,
-  workerIndex: number,
   launched: WorkerJob[],
   signal?: AbortSignal,
 ): Promise<WorkerJob> {
-  const placement = splitPlacement(workerIndex, launched);
+  const placement = researchWorkerSplitPlacement(launched);
   const surfaceId = randomUUID();
   const job: WorkerJob = { ...prepared, tabId: batch.tabId, surfaceId };
   let stdout: string;
@@ -1136,7 +1130,6 @@ async function runWorkerBatch(
               pi,
               batch,
               item.job,
-              launched.length,
               launched.map((entry) => entry.job),
               workerSignal,
             );

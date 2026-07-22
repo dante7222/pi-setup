@@ -18,7 +18,11 @@
   },
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/compaction-transcript/index.ts",
+      "./extensions/rg-only/index.ts",
+      "./extensions/supacode-subagents/index.ts",
+      "./extensions/tokyo-night-footer/index.ts",
+      "./extensions/yellow-file-headers/index.ts"
     ],
     "skills": [
       "./skills"

@@ -10,6 +10,22 @@ export function workerTabWorktreeId(
   return codeWorktreeId;
 }
 
+export function researchWorkerSplitPlacement(
+  launched: ReadonlyArray<{ surfaceId: string }>,
+): { target: string; direction: "h" | "v" } {
+  const workerIndex = launched.length;
+  if (workerIndex === 0) throw new Error("A research split requires an existing worker surface.");
+  if (workerIndex === 1) return { target: launched[0].surfaceId, direction: "h" };
+
+  // Split breadth-first across both columns so 2–8 panes grow as
+  // 1/1, 2/1, 2/2, 3/2, 3/3, 4/3, 4/4 instead of nesting in one column.
+  const levelStart = 2 ** Math.floor(Math.log2(workerIndex));
+  return {
+    target: launched[workerIndex - levelStart].surfaceId,
+    direction: "v",
+  };
+}
+
 export function groupWorkersByPlacement<T extends { mode: WorkerPlacementMode }>(
   workers: T[],
 ): T[][] {

@@ -11,12 +11,28 @@ Personal [Pi](https://pi.dev) extensions, skills, prompt templates, and themes, 
 
 Included now:
 
+- **Compaction Transcript** extension (`extensions/compaction-transcript/index.ts`)
 - **Tokyo Night** theme (`themes/tokyo-night.json`)
 - **Tokyo Night Footer** extension (`extensions/tokyo-night-footer/index.ts`)
 - **Yellow File Headers** extension (`extensions/yellow-file-headers/index.ts`)
 - **rg Only** extension (`extensions/rg-only/index.ts`)
-- **Permissions** extension (`extensions/permissions/index.ts`)
+- **Permissions** extension (`extensions/permissions/index.ts`) — retained but disabled
 - **Supacode Subagents** extension (`extensions/supacode-subagents/index.ts`)
+
+## Compaction transcripts
+
+After every successful compaction, the extension rebuilds the complete active branch from Pi's append-only session data and writes private files under the session's adjacent `transcripts/` directory:
+
+- `<session-title>--<session-key>.md` — a clean Obsidian-friendly reading view containing a linked table of contents, numbered user questions, model thinking in collapsed callouts, and model text responses. Stored text is never trimmed or summarized.
+- `<session-title>--<session-key>.<sha256>.active-branch.jsonl` — a content-addressed snapshot containing the complete session header and active-branch entries for lossless machine use.
+
+The readable title and filename come from Pi's session name; unnamed sessions fall back to a short version of the first user message. A short stable session hash prevents collisions between equally named sessions. Renaming a Pi session updates the reader filename on the next export and removes the superseded Markdown file, while older raw snapshots remain available.
+
+The Markdown intentionally excludes tool calls, tool results, shell executions, images, custom extension data, model/settings events, compaction summaries, IDs, timestamps, and raw JSON. Its compact contents section uses Obsidian heading links with short question previews. A hidden HTML comment records the matching sidecar filename without cluttering Obsidian's reading view. Assistant messages from one user turn are collected into one thinking section and one response section, while repeated compactions keep each original question and response only once.
+
+Each export safely writes its immutable sidecar before atomically refreshing the stable Markdown file; older sidecars remain as branch and compaction snapshots. Alternate branches remain in Pi's original session JSONL, while each transcript snapshot follows the active branch at export time.
+
+Use `/transcript` to refresh the files without compacting. Pi's `--no-session` mode is intentionally not exported because it explicitly disables persistence. Tool output truncated before Pi stores it cannot be recovered. Both reader transcripts and raw snapshots may contain private material; review them before sharing.
 
 ## Tokyo Night footer
 
@@ -26,7 +42,7 @@ The footer is enabled automatically in interactive sessions and follows semantic
 
 When [`pi-powerline-footer`](https://github.com/nicobailon/pi-powerline-footer) is installed, it owns Pi's footer component. This extension publishes the styled session name under `ventris-session-name` and the latest output-token throughput under `ventris-tps`, allowing powerline to promote both into dedicated custom segments. The tracked `integrations/pi-powerline-footer/settings.json` fragment puts the name first and pins only context usage and TPS to a separately aligned group at the right edge; cache, cumulative token, and cost/subscription segments are omitted. Merge its `powerline` object into the agent settings when setting up a new machine. The global settings in this environment already match it.
 
-The matching palette lives at `integrations/pi-powerline-footer/theme.json`. Powerline 0.7.0 preserves `layout.right` as a group but concatenates it after the left group, so `integrations/pi-powerline-footer/right-aligned-layout.patch` adds true right alignment while retaining responsive overflow. The tracked settings disable the Bash-mode shortcut, and `integrations/pi-powerline-footer/disable-bash-commands.patch` removes `/bash-mode` and `/bash-reset` from slash-command discovery. The setup script applies both patches and links the tracked theme beside the installed module:
+The matching palette lives at `integrations/pi-powerline-footer/theme.json`. The tracked settings promote `pi-permission-system`'s active `yolo` status after Git using the theme's `error` color and hide it from the aggregate extension-status segment. Powerline 0.7.0 preserves `layout.right` as a group but concatenates it after the left group, so `integrations/pi-powerline-footer/right-aligned-layout.patch` adds true right alignment while retaining responsive overflow. The tracked settings disable the Bash-mode shortcut, and `integrations/pi-powerline-footer/disable-bash-commands.patch` removes `/bash-mode` and `/bash-reset` from slash-command discovery. The setup script applies both patches and links the tracked theme beside the installed module:
 
 ```bash
 ./scripts/link-powerline-theme.sh
@@ -42,7 +58,9 @@ The extension preserves Pi's built-in `edit` and `write` behavior and rendering,
 
 The extension exposes Pi's ripgrep-backed content-search tool as `rg` instead of `grep`, adds an explicit search policy to the agent prompt, and blocks assistant bash commands that invoke `grep`, `git grep`, or common wrapped forms. Commands that merely search for the word `grep` with `rg` remain allowed.
 
-## Permissions
+## Permissions (disabled)
+
+The implementation and policy remain tracked for reference and testing, but the package manifest does not currently load this extension.
 
 The approval gate reads the tracked [`pi.json`](pi.json) and applies OpenCode-style `allow`, `ask`, and `deny` rules to every agent tool call. A scalar applies to all resources for an action; object rules match resources in insertion order, with the last matching rule winning:
 
@@ -97,7 +115,7 @@ Available tools and commands:
 - `delegate_apply` — queue the confirmed apply flow for a returned coding worker after the user explicitly requests it.
 - `/delegate-apply [worker-id]` — preview and apply a coding worker directly; omitting the ID opens a recent-worker selector.
 
-Worker tabs use the parent Pi session name (or project directory) plus a short batch ID, for example `agents: auth-review [a7f3]`. Each pane runs a separately named Pi session. Two research workers are placed side-by-side; additional research workers split existing panes vertically to produce a compact tiled layout. Coding workers are not tiled together because each tab belongs to its assigned worktree.
+Worker tabs use the parent Pi session name (or project directory) plus a short batch ID, for example `agents: auth-review [a7f3]`. Each pane runs a separately named Pi session. Two research workers are placed side-by-side; additional research workers split breadth-first across both columns, growing through `1/1`, `2/1`, `2/2`, `3/2`, `3/3`, `4/3`, and `4/4` layouts. Coding workers are not tiled together because each tab belongs to its assigned worktree.
 
 Each task supports two modes:
 

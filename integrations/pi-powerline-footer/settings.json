@@ -13,6 +13,14 @@
         "excludeFromExtensionStatuses": true
       },
       {
+        "id": "permission-yolo",
+        "statusKey": "pi-permission-system",
+        "position": "left",
+        "color": "error",
+        "hideWhenMissing": true,
+        "excludeFromExtensionStatuses": true
+      },
+      {
         "id": "tps",
         "statusKey": "ventris-tps",
         "position": "right",
@@ -28,7 +36,8 @@
         "thinking",
         "shell_mode",
         "path",
-        "git"
+        "git",
+        "custom:permission-yolo"
       ],
       "right": [
         "context_pct",
