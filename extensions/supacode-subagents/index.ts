@@ -26,6 +26,10 @@ import {
   sameSupacodeUuid,
 } from "./resource-id.ts";
 import { decideTabClose } from "./tab-close.ts";
+import {
+  groupWorkersByPlacement,
+  workerTabWorktreeId,
+} from "./worker-placement.ts";
 import { codingWorktreeName } from "./worktree-name.ts";
 
 const WORKER_JOB_ENV = "PI_SUPACODE_SUBAGENT_JOB_DIR";
@@ -555,7 +559,7 @@ async function prepareWorker(
     stderrPath,
     statusPath,
     runnerPath,
-    tabWorktreeId: parent.worktreeId,
+    tabWorktreeId: workerTabWorktreeId(spec.mode, parent.worktreeId, codeWorktreeId),
     codeWorktreeId,
     worktreePath,
     branch,
@@ -606,14 +610,13 @@ async function writeJobMetadata(job: WorkerJob): Promise<void> {
 
 async function createBatchTab(
   pi: ExtensionAPI,
-  parent: ParentSurface,
   batchId: string,
   batchTitle: string,
   first: PreparedWorkerJob,
   signal?: AbortSignal,
 ): Promise<{ batch: WorkerBatch; job: WorkerJob }> {
   const tabId = randomUUID();
-  const batch: WorkerBatch = { id: batchId, title: batchTitle, worktreeId: parent.worktreeId, tabId };
+  const batch: WorkerBatch = { id: batchId, title: batchTitle, worktreeId: first.tabWorktreeId, tabId };
   let stdout: string;
   try {
     stdout = await execChecked(
@@ -623,7 +626,7 @@ async function createBatchTab(
         "tab",
         "new",
         "-w",
-        parent.worktreeId,
+        first.tabWorktreeId,
         "--title",
         batchTitle,
         "-i",
@@ -981,8 +984,15 @@ function formatResults(results: WorkerResult[]): string {
       : "";
     return `## ${result.title} — ${result.state}\n\n${metadata.join("\n")}\n\n${truncation.content}${omitted}`;
   });
-  const batch = results.find((result) => result.batchId);
-  const batchLine = batch ? `Batch: ${batch.batchTitle} (${batch.batchId})\n` : "";
+  const batches = new Map<string, string>();
+  for (const result of results) {
+    if (result.batchId && result.batchTitle) batches.set(result.batchId, result.batchTitle);
+  }
+  const batchLine = batches.size === 1
+    ? [...batches].map(([id, title]) => `Batch: ${title} (${id})\n`).join("")
+    : batches.size > 1
+      ? `Batches:\n${[...batches].map(([id, title]) => `- ${title} (${id})`).join("\n")}\n`
+      : "";
   return `${successful}/${results.length} delegated task${results.length === 1 ? "" : "s"} completed successfully.\n${batchLine}\n${sections.join("\n\n---\n\n")}`;
 }
 
@@ -1012,7 +1022,7 @@ function resultDetails(results: WorkerResult[]) {
   };
 }
 
-async function runWorkers(
+async function runWorkerBatch(
   pi: ExtensionAPI,
   specs: WorkerSpec[],
   ctxCwd: string,
@@ -1061,7 +1071,7 @@ async function runWorkers(
     if (prepared.length > 0) {
       try {
         const first = prepared[0];
-        const created = await createBatchTab(pi, parent, batchId, batchTitle, first.job, signal);
+        const created = await createBatchTab(pi, batchId, batchTitle, first.job, signal);
         batch = created.batch;
         launched.push({ index: first.index, job: created.job });
       } catch (error) {
@@ -1157,6 +1167,7 @@ async function runWorkers(
         launchComplete = true;
         await refocusParent(pi, parent);
         let completed = ordered.filter(Boolean).length;
+        const activeBatch = batch;
         await Promise.all(
           launched.map(async ({ index, job }) => {
             const result = await waitForWorker(
@@ -1166,12 +1177,12 @@ async function runWorkers(
               workerSignal,
               async () => {
                 if (batchTabClosed) return;
-                const mayCloseBatchTab = job.surfaceId === batch.tabId;
+                const mayCloseBatchTab = job.surfaceId === activeBatch.tabId;
                 if (mayCloseBatchTab) expectedBatchTabClosure = true;
                 await closeWorkerSurface(pi, job);
                 if (
                   mayCloseBatchTab
-                  && await batchTabExists(pi, batch, tabMonitorController.signal) !== false
+                  && await batchTabExists(pi, activeBatch, tabMonitorController.signal) !== false
                 ) {
                   expectedBatchTabClosure = false;
                 }
@@ -1205,8 +1216,64 @@ async function runWorkers(
   return ordered.filter((item): item is WorkerResult => Boolean(item));
 }
 
+async function runWorkers(
+  pi: ExtensionAPI,
+  specs: WorkerSpec[],
+  ctxCwd: string,
+  parent: ParentSurface,
+  parentLabel: string,
+  timeoutSeconds: number,
+  keepOpen: boolean,
+  yolo: boolean,
+  signal: AbortSignal | undefined,
+  onBatchClosed: () => void,
+  onUpdate: ((partial: any) => void) | undefined,
+): Promise<WorkerResult[]> {
+  const indexed = specs.map((spec, index) => ({ index, spec, mode: spec.mode }));
+  const groups = groupWorkersByPlacement(indexed);
+  const ordered: Array<WorkerResult | undefined> = new Array(specs.length);
+  const groupController = new AbortController();
+  const sharedSignal = signal
+    ? AbortSignal.any([signal, groupController.signal])
+    : groupController.signal;
+  let failed = false;
+  let firstError: unknown;
+
+  await Promise.all(
+    groups.map(async (group) => {
+      try {
+        const results = await runWorkerBatch(
+          pi,
+          group.map((item) => item.spec),
+          ctxCwd,
+          parent,
+          parentLabel,
+          timeoutSeconds,
+          keepOpen,
+          yolo,
+          sharedSignal,
+          onBatchClosed,
+          onUpdate,
+        );
+        for (let index = 0; index < group.length; index++) {
+          ordered[group[index].index] = results[index];
+        }
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          firstError = error;
+        }
+        groupController.abort();
+      }
+    }),
+  );
+
+  if (failed) throw firstError;
+  return ordered.filter((item): item is WorkerResult => Boolean(item));
+}
+
 const ModeSchema = StringEnum(["research", "coding"] as const, {
-  description: "research is read-only in the current project; coding creates an isolated Git worktree.",
+  description: "research is read-only in the current worktree; coding creates an isolated Git worktree and opens its tab there.",
   default: "research",
 });
 
@@ -1224,7 +1291,7 @@ const SingleParams = Type.Object({
     Type.Integer({ minimum: 30, maximum: 3600, default: DEFAULT_TIMEOUT_SECONDS, description: "Worker timeout." }),
   ),
   keepOpen: Type.Optional(
-    Type.Boolean({ default: true, description: "Keep the Supacode batch tab open after its result is captured." }),
+    Type.Boolean({ default: true, description: "Keep the Supacode worker tab open after its result is captured." }),
   ),
 });
 
@@ -1246,7 +1313,7 @@ const ParallelParams = Type.Object({
     Type.Integer({ minimum: 30, maximum: 3600, default: DEFAULT_TIMEOUT_SECONDS, description: "Timeout per worker." }),
   ),
   keepOpen: Type.Optional(
-    Type.Boolean({ default: true, description: "Keep the tiled Supacode batch tab open after results are captured." }),
+    Type.Boolean({ default: true, description: "Keep the Supacode worker tabs open after results are captured." }),
   ),
 });
 
@@ -1370,7 +1437,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
     name: "delegate",
     label: "Delegate",
     description:
-      "Run one independent Pi worker in a visible Supacode batch tab and return its final answer. Research mode is read-only. Coding mode creates and preserves an isolated Git worktree; it never merges or pushes. Closing the batch tab aborts the active parent turn. Worker output is capped for model context and the full result path is returned.",
+      "Run one independent Pi worker in a visible Supacode tab and return its final answer. Research mode is read-only in the current worktree. Coding mode creates a preserved isolated Git worktree and opens the worker tab there; it never merges or pushes. Closing the worker tab aborts the active parent turn. Worker output is capped for model context and the full result path is returned.",
     promptSnippet: "Delegate one independent research or coding task to a visible Pi worker in Supacode",
     promptGuidelines: [
       "Use delegate when one independent task can be completed in an isolated context; include all necessary requirements because workers do not inherit the parent conversation.",
@@ -1405,8 +1472,8 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
     name: "delegate_parallel",
     label: "Delegate Parallel",
     description:
-      `Run up to ${MAX_PARALLEL} independent Pi workers concurrently as tiled panes in one visible Supacode batch tab and return all final answers. Research workers are read-only; each coding worker gets a separate preserved Git worktree while still running in the shared batch tab. Closing the batch tab aborts the active parent turn. Output is capped for model context and full result paths are returned.`,
-    promptSnippet: `Delegate up to ${MAX_PARALLEL} independent tasks to tiled Pi workers in one Supacode batch tab`,
+      `Run up to ${MAX_PARALLEL} independent Pi workers concurrently and return all final answers. Research workers are read-only and tile in one tab in the current worktree. Each coding worker gets a separate preserved Git worktree and runs in a tab inside that worktree. Closing an active worker tab aborts the parent turn. Output is capped for model context and full result paths are returned.`,
+    promptSnippet: `Delegate up to ${MAX_PARALLEL} independent tasks to visible Pi workers in Supacode`,
     promptGuidelines: [
       `Use delegate_parallel only for independent tasks that benefit from concurrent investigation or isolated implementations; use only as many workers as the task needs, up to ${MAX_PARALLEL}, and make every task self-contained.`,
     ],

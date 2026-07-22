@@ -626,8 +626,8 @@ export async function prepareDelegateHandoff(
   if (codeWorktreePath !== sourceRoot) {
     throw new Error("Worker metadata does not map its Supacode worktree ID to the source checkout.");
   }
-  if (tabWorktreePath !== targetRoot) {
-    throw new Error("Worker metadata does not map its parent Supacode worktree ID to the destination checkout.");
+  if (tabWorktreePath !== sourceRoot) {
+    throw new Error("Worker metadata does not map its pane Supacode worktree ID to the source checkout.");
   }
 
   const [sourceCommonDir, targetCommonDir, sourceBranch, listedWorktrees] = await Promise.all([
@@ -655,7 +655,7 @@ export async function prepareDelegateHandoff(
   const verifiedJob: StoredCodingJob = {
     ...job,
     codeWorktreeId: sourceWorktreeId,
-    tabWorktreeId: targetWorktreeId,
+    tabWorktreeId: sourceWorktreeId,
   };
 
   const id = randomUUID();

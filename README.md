@@ -88,16 +88,16 @@ This extension is an approval gate, not a security sandbox. It does not mediate 
 
 ## Supacode subagents
 
-The extension lets the main Pi delegate work to independent Pi sessions running in a visible Supacode batch tab. Parallel workers are tiled as split surfaces in that one tab, while results return to the main agent automatically through job files under `~/.pi/agent/subagents/`.
+The extension lets the main Pi delegate work to independent Pi sessions in visible Supacode tabs. Research workers stay in the current worktree and tile as split surfaces in one batch tab. Each coding worker runs in a tab inside its own isolated Supacode Git worktree. Results return to the main agent automatically through job files under `~/.pi/agent/subagents/`.
 
 Available tools and commands:
 
-- `delegate` — run one independent worker in a batch tab.
-- `delegate_parallel` — run up to eight workers concurrently as tiled panes in one batch tab.
+- `delegate` — run one independent worker in a visible Supacode tab.
+- `delegate_parallel` — run up to eight workers concurrently; research panes tile in the current worktree, while coding workers open in their isolated worktrees.
 - `delegate_apply` — queue the confirmed apply flow for a returned coding worker after the user explicitly requests it.
 - `/delegate-apply [worker-id]` — preview and apply a coding worker directly; omitting the ID opens a recent-worker selector.
 
-Batch tabs use the parent Pi session name (or project directory) plus a short batch ID, for example `agents: auth-review [a7f3]`. Each pane runs a separately named Pi session. Two workers are placed side-by-side; additional workers split existing panes vertically to produce a compact tiled layout.
+Worker tabs use the parent Pi session name (or project directory) plus a short batch ID, for example `agents: auth-review [a7f3]`. Each pane runs a separately named Pi session. Two research workers are placed side-by-side; additional research workers split existing panes vertically to produce a compact tiled layout. Coding workers are not tiled together because each tab belongs to its assigned worktree.
 
 Each task supports two modes:
 
@@ -114,7 +114,7 @@ Use as many parallel workers as needed, up to eight, to review security, correct
 Delegate this implementation in coding mode, then review the returned commit.
 ```
 
-Workers inherit the parent model and thinking level unless overridden, and they also inherit the parent's YOLO mode. They do not inherit the parent conversation, so delegated tasks must be self-contained. The batch tab stays open by default for inspection; `keepOpen: false` closes the whole tab after every result is captured. Manually closing an active batch tab promptly aborts the parent Pi turn, while leaving the parent Supacode tab and Pi session open. Tab-list disappearance is corroborated against unsettled worker processes, so transient Supacode list omissions cannot discard completed results or abort a live worker. A worker timeout closes its pane and returns a failed result without misclassifying that cleanup as a manual tab close. Coding workers still use separate preserved worktrees—their panes simply start in their assigned worktree—so visual grouping does not sacrifice Git isolation. Each worker defaults to a 15-minute timeout.
+Workers inherit the parent model and thinking level unless overridden, and they also inherit the parent's YOLO mode. They do not inherit the parent conversation, so delegated tasks must be self-contained. Worker tabs stay open by default for inspection; `keepOpen: false` closes them after every result is captured. Manually closing an active worker tab promptly aborts the parent Pi turn, while leaving the parent Supacode tab and Pi session open. Tab-list disappearance is corroborated against unsettled worker processes, so transient Supacode list omissions cannot discard completed results or abort a live worker. A worker timeout closes its pane and returns a failed result without misclassifying that cleanup as a manual tab close. Each worker defaults to a 15-minute timeout.
 
 Applying a coding worker constructs an immutable binary Git patch from the delegation base to the worker's final filesystem state. This includes every worker commit plus staged, unstaged, and untracked non-ignored files without modifying the worker's real index during preview or apply. The confirmation preview names both checkout paths and the changed paths. Touched destination changes block the operation, while unrelated destination changes are preserved; destination commit drift uses Git's three-way application. Applied changes remain uncommitted and unstaged. Conflicts retain the pane and worktree for recovery. After a fully successful apply, cleanup closes only that worker's pane, materializes its final non-ignored filesystem state as a recovery commit on the worker branch, removes the now-clean worktree without force, and then removes the Supacode resource. Compare-and-swap refs and a temporary recovery ref prevent cleanup from overwriting concurrent branch changes. Applying the same snapshot twice is refused.
 

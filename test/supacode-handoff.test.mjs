@@ -77,7 +77,7 @@ async function createFixture() {
       mode: "coding",
       originalCwd: parent,
       workerCwd: worker,
-      tabWorktreeId: encodeURIComponent(parent),
+      tabWorktreeId: encodeURIComponent(worker),
       codeWorktreeId: encodeURIComponent(worker),
       worktreePath: worker,
       branch,
@@ -270,6 +270,23 @@ test("handoff rejects persisted worktree identity mismatches", async () => {
     await assert.rejects(
       prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
       /does not map.*source checkout/,
+    );
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
+test("handoff rejects persisted pane worktree identity mismatches", async () => {
+  const fixture = await createFixture();
+  try {
+    const jobPath = join(fixture.jobDir, "job.json");
+    const job = JSON.parse(await readFile(jobPath, "utf8"));
+    job.tabWorktreeId = encodeURIComponent(fixture.parent);
+    await writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`);
+
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /pane Supacode worktree ID.*source checkout/,
     );
   } finally {
     await removeFixture(fixture);
@@ -596,7 +613,9 @@ test("successful cleanup closes the pane, removes the worktree, and restores a d
       0,
     );
     assert.equal(await git(fixture.parent, "for-each-ref", "--format=%(refname)", "refs/pi-agent-handoffs"), "");
-    assert.equal(supacodeCalls.some((call) => call.startsWith("surface close")), true);
+    const closeCall = supacodeCalls.find((call) => call.startsWith("surface close"));
+    assert.ok(closeCall);
+    assert.equal(closeCall.includes(`-w ${encodeURIComponent(fixture.worker)}`), true);
     assert.equal(supacodeCalls.some((call) => call.startsWith("worktree delete")), true);
   } finally {
     await removeFixture(fixture);
