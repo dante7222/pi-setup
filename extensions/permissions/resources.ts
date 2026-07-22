@@ -288,6 +288,10 @@ export function permissionRequestsForTool(
     return deduplicate(requests);
   }
 
+  if (name === "delegate_apply") {
+    return [{ permission: "task", resource: "apply" }];
+  }
+
   if (name === "web_search") {
     const query = optionalString(input, "query", name);
     const queries = stringsFromArray(input.queries, `${name}.queries`);

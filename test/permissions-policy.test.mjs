@@ -150,6 +150,9 @@ test("subagents use task permission with one resource per mode", () => {
       { permission: "task", resource: "coding" },
     ],
   );
+  assert.deepEqual(permissionRequestsForTool("delegate_apply", { jobId: "abcd" }, "/repo"), [
+    { permission: "task", resource: "apply" },
+  ]);
 });
 
 test("web and unknown tools receive stable resources", () => {
@@ -289,6 +292,8 @@ test("tracked pi.json matches the working OpenCode profile", () => {
   assert.equal(evaluatePermission(policy.rules, "bash", "npm test"), "ask");
   assert.equal(evaluatePermission(policy.rules, "task", "research"), "allow");
   assert.equal(evaluatePermission(policy.rules, "task", "coding"), "allow");
+  assert.equal(evaluatePermission(policy.rules, "task", "apply"), "allow");
+  assert.equal(evaluatePermission(policy.rules, "task", "other"), "ask");
   assert.equal(evaluatePermission(policy.rules, "unrecognized_tool", "*"), "ask");
 });
 

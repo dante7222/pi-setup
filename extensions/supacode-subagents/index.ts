@@ -10,12 +10,22 @@ import {
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import {
+  applyPreparedDelegateHandoff,
+  discardPreparedDelegateHandoff,
+  formatDelegateHandoffPreview,
+  formatDelegateHandoffResult,
+  listDelegateCodingJobs,
+  prepareDelegateHandoff,
+  type PreparedDelegateHandoff,
+} from "./handoff.ts";
 import { resolvePermissionConfigPath } from "./permission-config.ts";
 import {
   decodeSupacodeResourceId,
   findSupacodePathId,
   sameSupacodeUuid,
 } from "./resource-id.ts";
+import { decideTabClose } from "./tab-close.ts";
 import { codingWorktreeName } from "./worktree-name.ts";
 
 const WORKER_JOB_ENV = "PI_SUPACODE_SUBAGENT_JOB_DIR";
@@ -93,10 +103,20 @@ interface WorkerBatch {
   tabId: string;
 }
 
+interface GitCommitSummary {
+  sha: string;
+  subject: string;
+}
+
 interface GitSummary {
+  baseSha?: string;
   head?: string;
   commit?: string;
+  commits?: GitCommitSummary[];
+  changedFiles?: string[];
   status?: string;
+  dirty?: boolean;
+  baseIsAncestor?: boolean;
 }
 
 interface WorkerResult {
@@ -205,6 +225,7 @@ function assistantText(message: any): string {
 function registerWorkerCapture(pi: ExtensionAPI, jobDir: string): void {
   const resultPath = path.join(jobDir, "result.md");
   const statusPath = path.join(jobDir, "status.json");
+  const timeoutPath = path.join(jobDir, "timeout.json");
   let finalized = false;
 
   pi.on("agent_start", async () => {
@@ -218,6 +239,12 @@ function registerWorkerCapture(pi: ExtensionAPI, jobDir: string): void {
   pi.on("agent_settled", async (_event, ctx) => {
     if (finalized) return;
     finalized = true;
+
+    const timeoutStatus = await readJson<WorkerStatus>(timeoutPath);
+    if (timeoutStatus?.stopReason === "timeout") {
+      await atomicWrite(statusPath, JSON.stringify(timeoutStatus));
+      return;
+    }
 
     const message = finalAssistantMessage(ctx.sessionManager.getEntries());
     const text = assistantText(message);
@@ -361,13 +388,22 @@ async function execChecked(
   return result.stdout;
 }
 
+async function gitRawOutput(
+  pi: ExtensionAPI,
+  cwd: string,
+  args: string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  return execChecked(pi, "git", ["-C", cwd, ...args], { signal, timeout: 30_000 });
+}
+
 async function gitOutput(
   pi: ExtensionAPI,
   cwd: string,
   args: string[],
   signal?: AbortSignal,
 ): Promise<string> {
-  return (await execChecked(pi, "git", ["-C", cwd, ...args], { signal, timeout: 30_000 })).trim();
+  return (await gitRawOutput(pi, cwd, args, signal)).trim();
 }
 
 async function listedRepositoryId(
@@ -732,6 +768,7 @@ async function monitorBatchTab(
   pi: ExtensionAPI,
   batch: WorkerBatch,
   signal: AbortSignal,
+  getWorkers: () => { jobs: WorkerJob[]; launchComplete: boolean },
   onClosed: () => void,
 ): Promise<void> {
   let observed = false;
@@ -746,8 +783,17 @@ async function monitorBatchTab(
       } else if (exists === false && observed) {
         consecutiveMissingChecks++;
         if (consecutiveMissingChecks >= TAB_MISSING_CONFIRMATIONS) {
-          onClosed();
-          return;
+          const workers = getWorkers();
+          const statuses = await Promise.all(
+            workers.jobs.map((job) => readJson<WorkerStatus>(job.statusPath)),
+          );
+          const decision = decideTabClose(statuses);
+          if (decision === "settled" && workers.launchComplete) return;
+          if (decision === "closed" && workers.launchComplete) {
+            onClosed();
+            return;
+          }
+          consecutiveMissingChecks = 0;
         }
       } else {
         consecutiveMissingChecks = 0;
@@ -767,7 +813,48 @@ async function collectGitSummary(
   try {
     const head = await gitOutput(pi, job.worktreePath, ["rev-parse", "HEAD"], signal);
     const status = await gitOutput(pi, job.worktreePath, ["status", "--short"], signal);
-    return { head, commit: job.baseSha && head !== job.baseSha ? head : undefined, status };
+    if (!job.baseSha) return { head, status, dirty: Boolean(status) };
+
+    const ancestor = await pi.exec(
+      "git",
+      ["-C", job.worktreePath, "merge-base", "--is-ancestor", job.baseSha, head],
+      { signal, timeout: 30_000 },
+    );
+    const commitOutput = await gitRawOutput(
+      pi,
+      job.worktreePath,
+      ["log", "--reverse", "-z", "--format=%H%x00%s", `${job.baseSha}..${head}`],
+      signal,
+    );
+    const commitFields = commitOutput.split("\0").filter(Boolean);
+    const commits: GitCommitSummary[] = [];
+    for (let index = 0; index + 1 < commitFields.length; index += 2) {
+      commits.push({ sha: commitFields[index], subject: commitFields[index + 1] });
+    }
+    const trackedFiles = (await gitRawOutput(
+      pi,
+      job.worktreePath,
+      ["diff", "--name-only", "-z", "--no-renames", job.baseSha, "--"],
+      signal,
+    )).split("\0").filter(Boolean);
+    const untrackedFiles = (await gitRawOutput(
+      pi,
+      job.worktreePath,
+      ["ls-files", "--others", "--exclude-standard", "-z"],
+      signal,
+    )).split("\0").filter(Boolean);
+    const changedFiles = [...new Set([...trackedFiles, ...untrackedFiles])]
+      .sort((left, right) => left.localeCompare(right));
+    return {
+      baseSha: job.baseSha,
+      head,
+      commit: head !== job.baseSha ? head : undefined,
+      commits,
+      changedFiles,
+      status,
+      dirty: Boolean(status),
+      baseIsAncestor: ancestor.code === 0,
+    };
   } catch {
     return undefined;
   }
@@ -814,7 +901,29 @@ async function waitForWorker(
       await delay(POLL_INTERVAL_MS, signal);
     }
 
+    const timeoutMessage = `Timed out after ${timeoutSeconds} seconds.`;
+    const timeoutStatus = {
+      state: "failed",
+      completedAt: isoNow(),
+      stopReason: "timeout",
+      errorMessage: timeoutMessage,
+    } satisfies WorkerStatus;
+    try {
+      await atomicWrite(path.join(job.jobDir, "timeout.json"), JSON.stringify(timeoutStatus));
+    } catch {
+      // The parent still writes status.json after closing the worker surface.
+    }
     await closeSurface();
+    const persistedTimeoutStatus = {
+      ...timeoutStatus,
+      completedAt: isoNow(),
+    } satisfies WorkerStatus;
+    try {
+      await atomicWrite(job.statusPath, JSON.stringify(persistedTimeoutStatus));
+    } catch {
+      // The returned result remains authoritative if timeout status persistence fails.
+    }
+    const git = await collectGitSummary(pi, job, signal);
     return {
       id: job.id,
       batchId: job.batchId,
@@ -822,8 +931,8 @@ async function waitForWorker(
       title: job.title,
       mode: job.mode,
       state: "failed",
-      output: `Timed out after ${timeoutSeconds} seconds.`,
-      error: `Timed out after ${timeoutSeconds} seconds.`,
+      output: timeoutMessage,
+      error: timeoutMessage,
       jobDir: job.jobDir,
       resultPath: job.resultPath,
       stderrPath: job.stderrPath,
@@ -833,6 +942,8 @@ async function waitForWorker(
       codeWorktreeId: job.codeWorktreeId,
       worktreePath: job.worktreePath,
       branch: job.branch,
+      git,
+      status: persistedTimeoutStatus,
     };
   } catch (error) {
     await closeSurface();
@@ -854,8 +965,14 @@ function formatResults(results: WorkerResult[]): string {
       result.surfaceId ? `Supacode surface: ${result.surfaceId}` : undefined,
       result.worktreePath ? `Worktree: ${result.worktreePath}` : undefined,
       result.branch ? `Branch: ${result.branch}` : undefined,
+      result.git?.baseSha ? `Base: ${result.git.baseSha}` : undefined,
       result.git?.commit ? `Commit: ${result.git.commit}` : undefined,
+      result.git?.commits ? `Commits since base: ${result.git.commits.length}` : undefined,
+      result.git?.changedFiles ? `Changed paths: ${result.git.changedFiles.length}` : undefined,
       result.git?.status ? `Uncommitted changes:\n\`\`\`text\n${result.git.status}\n\`\`\`` : undefined,
+      result.mode === "coding" && result.worktreePath
+        ? `Apply changes: \`/delegate-apply ${result.id}\``
+        : undefined,
       result.resultPath ? `Full result: ${result.resultPath}` : undefined,
       result.stderrPath ? `Errors/log: ${result.stderrPath}` : undefined,
     ].filter(Boolean);
@@ -974,6 +1091,7 @@ async function runWorkers(
       const workerSignal = signal
         ? AbortSignal.any([signal, tabMonitorController.signal])
         : tabMonitorController.signal;
+      let launchComplete = false;
       const handleBatchTabClosed = () => {
         if (batchTabClosed || expectedBatchTabClosure) return;
         batchTabClosed = true;
@@ -988,7 +1106,13 @@ async function runWorkers(
           // The parent turn is already aborting; progress reporting is best effort.
         }
       };
-      const tabMonitor = monitorBatchTab(pi, batch, tabMonitorController.signal, handleBatchTabClosed);
+      const tabMonitor = monitorBatchTab(
+        pi,
+        batch,
+        tabMonitorController.signal,
+        () => ({ jobs: launched.map((entry) => entry.job), launchComplete }),
+        handleBatchTabClosed,
+      );
 
       try {
         for (let preparedIndex = 1; preparedIndex < prepared.length; preparedIndex++) {
@@ -1030,6 +1154,7 @@ async function runWorkers(
           }
         }
 
+        launchComplete = true;
         await refocusParent(pi, parent);
         let completed = ordered.filter(Boolean).length;
         await Promise.all(
@@ -1125,6 +1250,14 @@ const ParallelParams = Type.Object({
   ),
 });
 
+const DelegateApplyParams = Type.Object({
+  jobId: Type.String({
+    minLength: 4,
+    pattern: "^[a-fA-F0-9-]+$",
+    description: "Coding worker UUID or unique UUID prefix returned by delegate.",
+  }),
+});
+
 export default function supacodeSubagents(pi: ExtensionAPI) {
   const workerJobDir = process.env[WORKER_JOB_ENV];
   if (workerJobDir) {
@@ -1151,6 +1284,87 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
   function parentLabel(ctx: { cwd: string }): string {
     return (pi.getSessionName() ?? path.basename(ctx.cwd)) || "main";
   }
+
+  pi.registerCommand("delegate-apply", {
+    description: "Apply a coding worker's changes to its parent checkout, then remove its pane and worktree",
+    handler: async (args, ctx) => {
+      let prepared: PreparedDelegateHandoff | undefined;
+      try {
+        await ctx.waitForIdle();
+        if (!ctx.hasUI) {
+          ctx.ui.notify("/delegate-apply requires an interactive confirmation UI.", "error");
+          return;
+        }
+
+        let jobId = args.trim();
+        if (!jobId) {
+          const jobs = (await listDelegateCodingJobs(getAgentDir())).slice(0, 50);
+          if (jobs.length === 0) {
+            ctx.ui.notify("No coding worker jobs are available.", "warning");
+            return;
+          }
+          const choices = jobs.map((job) =>
+            `${job.id}  ${job.title} — ${job.workerState}`);
+          const choice = await ctx.ui.select("Apply delegated changes", choices);
+          if (!choice) return;
+          jobId = jobs[choices.indexOf(choice)].id;
+        }
+
+        ctx.ui.setStatus("delegate-apply", "Preparing delegated changes...");
+        prepared = await prepareDelegateHandoff(pi, jobId, undefined, getAgentDir());
+        if (prepared.blockers.length > 0) {
+          ctx.ui.notify(`Cannot apply delegated changes:\n${prepared.blockers.join("\n")}`, "error");
+          await discardPreparedDelegateHandoff(prepared);
+          prepared = undefined;
+          return;
+        }
+
+        const confirmed = await ctx.ui.confirm(
+          "Apply delegated changes?",
+          `${formatDelegateHandoffPreview(prepared)}\n\nA successful apply closes the worker pane and removes its worktree. The worker branch and commits remain.`,
+        );
+        if (!confirmed) {
+          await discardPreparedDelegateHandoff(prepared);
+          prepared = undefined;
+          ctx.ui.notify("Delegated changes were not applied.", "info");
+          return;
+        }
+
+        ctx.ui.setStatus("delegate-apply", "Applying delegated changes...");
+        const result = await applyPreparedDelegateHandoff(pi, prepared);
+        prepared = undefined;
+        const level = result.state === "applied"
+          ? result.cleanup.errors.length > 0 ? "warning" : "info"
+          : result.state === "conflicted" ? "warning" : "error";
+        ctx.ui.notify(formatDelegateHandoffResult(result), level);
+      } catch (error) {
+        if (prepared) await discardPreparedDelegateHandoff(prepared);
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Could not apply delegated changes: ${message}`, "error");
+      } finally {
+        ctx.ui.setStatus("delegate-apply", undefined);
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_apply",
+    label: "Apply Delegated Changes",
+    description:
+      "Queue the confirmed /delegate-apply flow for a completed coding worker. It transfers the worker's committed and uncommitted changes to the originating parent checkout without creating a commit. A successful apply closes the worker pane and removes its worktree while preserving its branch, commits, and handoff artifacts.",
+    promptSnippet: "Apply a coding worker's changes to its originating checkout after explicit user instruction",
+    promptGuidelines: [
+      "Use delegate_apply only when the user explicitly asks to apply a returned coding worker; never apply automatically after delegate or delegate_parallel.",
+    ],
+    parameters: DelegateApplyParams,
+    async execute(_toolCallId, params) {
+      pi.sendUserMessage(`/delegate-apply ${params.jobId}`, { deliverAs: "followUp" });
+      return {
+        content: [{ type: "text", text: `Queued /delegate-apply ${params.jobId}; it will preview the patch and request confirmation.` }],
+        details: { jobId: params.jobId, command: `/delegate-apply ${params.jobId}` },
+      };
+    },
+  });
 
   pi.registerTool({
     name: "delegate",
