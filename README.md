@@ -13,7 +13,7 @@ Included now:
 
 - **Compaction Transcript** extension (`extensions/compaction-transcript/index.ts`)
 - **Tokyo Night** theme (`themes/tokyo-night.json`)
-- **Tokyo Night Footer** extension (`extensions/tokyo-night-footer/index.ts`)
+- **Tokyo Night Status Border** extension (`extensions/tokyo-night-footer/index.ts`)
 - **Yellow File Headers** extension (`extensions/yellow-file-headers/index.ts`)
 - **rg Only** extension (`extensions/rg-only/index.ts`)
 - **Permissions** extension (`extensions/permissions/index.ts`) — retained but disabled
@@ -34,21 +34,15 @@ Each export safely writes its immutable sidecar before atomically refreshing the
 
 Use `/transcript` to refresh the files without compacting. Pi's `--no-session` mode is intentionally not exported because it explicitly disables persistence. Tool output truncated before Pi stores it cannot be recovered. Both reader transcripts and raw snapshots may contain private material; review them before sharing.
 
-## Tokyo Night footer
+## Tokyo Night status border
 
-The custom footer puts the Pi session name first and renders it in bold Tokyo Night cyan so named main sessions and delegated workers are immediately recognizable. The working directory and Git branch remain on the first line at lower contrast. A second, palette-colored line preserves latest generation throughput, context pressure, model, provider, and thinking-level information without cumulative token, cache, or cost totals. Throughput is measured from the first streamed token to completion and displayed as `󰓅 42.3 t/s` (or `⚡` without Nerd Fonts). Extension statuses appear on an optional third line.
+The extension replaces Pi's normal footer with a single status line embedded in the editor's top border. Its left group shows Pi, model, thinking level, working directory, Git branch and change counts, extension statuses, used/total context tokens, and latest generation throughput when those values are available. Git indicators use `*N` for unstaged files, `+N` for staged files, and `?N` for untracked files. The session name is right-aligned and shares a stable Tokyo Night accent with the editor border and the horizontal gap between groups. Use `/name` to set or change it.
 
-The footer is enabled automatically in interactive sessions and follows semantic theme colors, with the included **tokyo-night** theme providing its intended palette. Use `/name` to set or change the prominent session name; unnamed sessions begin with the working directory instead.
+Throughput is calculated from turn start through the completed assistant message and displayed as `󰓅 42.3 tok/s` (or `⚡` without Nerd Fonts). The latest successful value remains visible until another response completes. Context is displayed as `72k/272k`, updates from live assistant usage, and changes from green to yellow above 70% and red above 90%. Git status refreshes asynchronously after file and shell activity, while context follows the active session branch. Statuses such as the permission system's YOLO warning remain visible after the normal footer is hidden.
 
-When [`pi-powerline-footer`](https://github.com/nicobailon/pi-powerline-footer) is installed, it owns Pi's footer component. This extension publishes the styled session name under `ventris-session-name` and the latest output-token throughput under `ventris-tps`, allowing powerline to promote both into dedicated custom segments. The tracked `integrations/pi-powerline-footer/settings.json` fragment puts the name first and pins only context usage and TPS to a separately aligned group at the right edge; cache, cumulative token, and cost/subscription segments are omitted. Merge its `powerline` object into the agent settings when setting up a new machine. The global settings in this environment already match it.
+With the **tokyo-night** theme in a truecolor terminal, status foregrounds use the matching Tokyo Night palette directly while inheriting the editor's background without a fill. The software caret uses Tokyo Night ultraviolet (`#bb9af7`). Other themes and reduced-color terminals fall back to Pi's semantic theme colors. Thin Powerline-style separator glyphs are used when a Nerd Font is detected, but the `pi-powerline-footer` package is neither used nor required.
 
-The matching palette lives at `integrations/pi-powerline-footer/theme.json`. The tracked settings promote `pi-permission-system`'s active `yolo` status after Git using the theme's `error` color and hide it from the aggregate extension-status segment. Powerline 0.7.0 preserves `layout.right` as a group but concatenates it after the left group, so `integrations/pi-powerline-footer/right-aligned-layout.patch` adds true right alignment while retaining responsive overflow. The tracked settings disable the Bash-mode shortcut, and `integrations/pi-powerline-footer/disable-bash-commands.patch` removes `/bash-mode` and `/bash-reset` from slash-command discovery. The setup script applies both patches and links the tracked theme beside the installed module:
-
-```bash
-./scripts/link-powerline-theme.sh
-```
-
-The npm edits are runtime integration only; this repository remains the source of truth for the settings, patch, and colors. Rerun the script after updating `pi-powerline-footer`, then run `/reload`.
+The status border owns Pi's custom editor and custom footer slots, so another extension that replaces either one will conflict with it. The files under `integrations/pi-powerline-footer/` are retained only as legacy integration references and are not part of the active setup.
 
 ## Yellow file headers
 
