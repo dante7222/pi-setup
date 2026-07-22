@@ -421,7 +421,7 @@ function renderTopBorder(
     availableWidth,
     scrollIndicator,
   );
-  const maxSessionWidth = Math.max(12, Math.min(60, Math.floor(availableWidth * 0.4)));
+  const maxSessionWidth = Math.max(1, Math.min(60, availableWidth - 2));
   const rightSegments: StatusSegment[] = sessionName
     ? [
         {
@@ -436,29 +436,30 @@ function renderTopBorder(
     : [];
 
   let left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
-  let right = renderStatusGroup(rightSegments, "right", theme, nerdIcons);
+  const right = renderStatusGroup(rightSegments, "right", theme, nerdIcons);
 
-  // Sacrifice the right title first, then remove low-priority left segments.
-  // Permission and editor-scroll warnings survive decorative/status details.
-  if (visibleWidth(left) + visibleWidth(right) > availableWidth && rightSegments.length > 0) {
-    rightSegments.pop();
-    right = "";
-  }
+  // The right-aligned session title is the identity of parent and worker panes.
+  // Keep it visible while progressively removing lower-priority status details.
   while (visibleWidth(left) + visibleWidth(right) > availableWidth && leftSegments.length > 1) {
     leftSegments.splice(leastImportantSegmentIndex(leftSegments), 1);
     left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
   }
   if (visibleWidth(left) + visibleWidth(right) > availableWidth && leftSegments.length === 1) {
     const groupChromeWidth = 2;
-    leftSegments[0] = {
-      ...leftSegments[0]!,
-      content: truncateToWidth(
-        leftSegments[0]!.content,
-        Math.max(1, availableWidth - groupChromeWidth),
-        "…",
-      ),
-    };
-    left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
+    const leftBudget = Math.max(0, availableWidth - visibleWidth(right));
+    if (leftBudget > groupChromeWidth) {
+      leftSegments[0] = {
+        ...leftSegments[0]!,
+        content: truncateToWidth(
+          leftSegments[0]!.content,
+          leftBudget - groupChromeWidth,
+          "…",
+        ),
+      };
+      left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
+    } else {
+      left = "";
+    }
   }
   if (visibleWidth(left) + visibleWidth(right) > availableWidth) left = "";
 
