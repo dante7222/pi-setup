@@ -4,9 +4,30 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+  acquireDestinationApplyLock,
+  destinationApplyStateDir,
+  recoverStaleDestinationApplyLock,
+  releaseDestinationApplyLock,
+} from "./apply-lock.ts";
+import {
+  durableAtomicWrite,
+  ensureDirectoryDurable,
+  syncDirectory,
+} from "./durable-state.ts";
+import {
+  authenticateRunnerExit,
+  readJobDecision,
+  readJobLifecycle,
+  readRunnerExit,
+  readRunnerProcess,
+  readWorkerTerminal,
+} from "./lifecycle.ts";
+import type { ProcessIdentity } from "./process-identity.ts";
+import {
   decodeSupacodeResourceId,
   sameSupacodeUuid,
 } from "./resource-id.ts";
+import { verifyWorkerProcessesAbsent } from "./worker-supervisor.ts";
 
 const HANDOFF_VERSION = 1;
 const GIT_TIMEOUT_MS = 60_000;
@@ -32,10 +53,15 @@ interface StoredCodingJob {
   codeWorktreeId: string;
   tabId: string;
   surfaceId: string;
+  launchNonce: string;
   createdAt?: string;
   delegateLoop: boolean;
   loopState?: string;
   acceptedTree?: string;
+  acceptedCommit?: string;
+  acceptedRef?: string;
+  activeWorkerJobDir: string;
+  lifecyclePhase: string;
   jobDir: string;
   workerState: WorkerCompletionState;
 }
@@ -63,6 +89,8 @@ export interface PreparedDelegateHandoff {
   baseIsAncestor: boolean;
   commitCount?: number;
   targetRoot: string;
+  targetGitDir: string;
+  targetCommonGitDir: string;
   targetHead: string;
   targetBranch?: string;
   targetStatus: string;
@@ -115,6 +143,8 @@ interface HandoffManifest {
   };
   destination: {
     root: string;
+    gitDir: string;
+    commonGitDir: string;
     branch?: string;
     head: string;
   };
@@ -130,6 +160,38 @@ interface HandoffManifest {
     diagnostic?: string;
   };
   cleanup?: HandoffCleanupResult;
+}
+
+interface DestinationBaseline {
+  indexPath: string;
+  indexBackupPath: string;
+  indexSha256: string;
+  tree: string;
+  expectedTree?: string;
+}
+
+interface DestinationTransaction {
+  version: 1;
+  id: string;
+  jobId: string;
+  state: HandoffState | "rolled_back" | "resolved";
+  createdAt: string;
+  updatedAt: string;
+  destination: {
+    root: string;
+    gitDir: string;
+    commonGitDir: string;
+    head: string;
+    branch?: string;
+  };
+  patch: {
+    sha256: string;
+    bytes: number;
+    touchedPaths: string[];
+  };
+  baseline?: DestinationBaseline;
+  diagnostic?: string;
+  jobManifestPath: string;
 }
 
 interface CommandResult {
@@ -159,11 +221,8 @@ function diagnosticText(result: CommandResult): string {
     : text;
 }
 
-async function atomicWrite(filePath: string, content: string): Promise<void> {
-  await fs.promises.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.promises.writeFile(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
-  await fs.promises.rename(temporaryPath, filePath);
+async function atomicWrite(filePath: string, content: string | Buffer): Promise<void> {
+  await durableAtomicWrite(filePath, content);
 }
 
 async function readJsonRecord(filePath: string): Promise<Record<string, unknown> | undefined> {
@@ -190,21 +249,31 @@ async function commandWithInput(
   input: Buffer,
   options: { signal?: AbortSignal; timeout: number },
 ): Promise<CommandResult> {
+  if (options.signal?.aborted) throw new Error(`${command} aborted before launch.`);
   return new Promise<CommandResult>((resolve, reject) => {
     const child = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
-      signal: options.signal,
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let timedOut = false;
+    let aborted = false;
+    let inputError: Error | undefined;
     let settled = false;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    const terminate = (): void => {
+      child.kill("SIGTERM");
+      forceKillTimer ??= setTimeout(() => child.kill("SIGKILL"), 5000);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
+      terminate();
     }, options.timeout);
+    const abort = () => {
+      aborted = true;
+      terminate();
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
 
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
@@ -213,6 +282,7 @@ async function commandWithInput(
       settled = true;
       clearTimeout(timer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      options.signal?.removeEventListener("abort", abort);
       reject(error);
     });
     child.on("close", (code) => {
@@ -220,6 +290,15 @@ async function commandWithInput(
       settled = true;
       clearTimeout(timer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      options.signal?.removeEventListener("abort", abort);
+      if (aborted) {
+        reject(new Error(`${command} aborted after process exit.`));
+        return;
+      }
+      if (inputError) {
+        reject(inputError);
+        return;
+      }
       resolve({
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
@@ -229,11 +308,8 @@ async function commandWithInput(
     });
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       if (error.code !== "EPIPE" && !settled) {
-        settled = true;
-        clearTimeout(timer);
-        if (forceKillTimer) clearTimeout(forceKillTimer);
-        child.kill("SIGTERM");
-        reject(error);
+        inputError = error;
+        terminate();
       }
     });
     child.stdin.end(input);
@@ -313,7 +389,10 @@ async function readWorkerState(jobDir: string): Promise<WorkerCompletionState> {
 
 async function parseStoredJob(jobDir: string): Promise<StoredCodingJob | undefined> {
   const record = await readJsonRecord(path.join(jobDir, "job.json"));
-  if (!record || stringValue(record, "mode") !== "coding") return undefined;
+  if (
+    !record || record.schemaVersion !== 2 ||
+    stringValue(record, "mode") !== "coding"
+  ) return undefined;
 
   const id = stringValue(record, "id");
   const batchId = stringValue(record, "batchId");
@@ -327,9 +406,10 @@ async function parseStoredJob(jobDir: string): Promise<StoredCodingJob | undefin
   const codeWorktreeId = stringValue(record, "codeWorktreeId");
   const tabId = stringValue(record, "tabId");
   const surfaceId = stringValue(record, "surfaceId");
+  const launchNonce = stringValue(record, "launchNonce");
   if (
     !id || !batchId || !batchTitle || !title || !originalCwd || !worktreePath ||
-    !branch || !baseSha || !tabWorktreeId || !codeWorktreeId || !tabId || !surfaceId ||
+    !branch || !baseSha || !tabWorktreeId || !codeWorktreeId || !tabId || !surfaceId || !launchNonce ||
     !UUID_PATTERN.test(id) || !UUID_PATTERN.test(batchId) || !UUID_PATTERN.test(tabId) ||
     !UUID_PATTERN.test(surfaceId) || !OBJECT_ID_PATTERN.test(baseSha) ||
     !path.isAbsolute(originalCwd) || !path.isAbsolute(worktreePath)
@@ -338,6 +418,20 @@ async function parseStoredJob(jobDir: string): Promise<StoredCodingJob | undefin
   }
   const expectedBranch = `pi-agent/${batchId.slice(0, 6).toLowerCase()}/${id.slice(0, 6).toLowerCase()}`;
   if (branch !== expectedBranch) return undefined;
+  const lifecycle = await readJobLifecycle(jobDir);
+  if (!lifecycle || lifecycle.jobId !== id) return undefined;
+  const control = await readJsonRecord(path.join(jobDir, "control.json"));
+  if (control && stringValue(control, "action") === "cancel") return undefined;
+  if (booleanValue(record, "delegateLoop")) {
+    const decision = await readJobDecision(jobDir);
+    if (!decision || decision.jobId !== id || decision.owner !== "accept") return undefined;
+  }
+  const activeWorkerJobDir = path.resolve(stringValue(record, "activeWorkerJobDir") ?? jobDir);
+  const resolvedJobDir = path.resolve(jobDir);
+  if (
+    activeWorkerJobDir !== resolvedJobDir &&
+    !activeWorkerJobDir.startsWith(`${resolvedJobDir}${path.sep}`)
+  ) return undefined;
 
   return {
     id,
@@ -352,10 +446,15 @@ async function parseStoredJob(jobDir: string): Promise<StoredCodingJob | undefin
     codeWorktreeId,
     tabId,
     surfaceId,
+    launchNonce,
     createdAt: stringValue(record, "createdAt"),
     delegateLoop: booleanValue(record, "delegateLoop"),
     loopState: stringValue(record, "loopState"),
     acceptedTree: stringValue(record, "acceptedTree"),
+    acceptedCommit: stringValue(record, "acceptedCommit"),
+    acceptedRef: stringValue(record, "acceptedRef"),
+    activeWorkerJobDir,
+    lifecyclePhase: lifecycle.phase,
     jobDir,
     workerState: await readWorkerState(jobDir),
   };
@@ -439,6 +538,15 @@ async function canonicalCommonGitDir(
   return fs.promises.realpath(path.resolve(root, commonDir));
 }
 
+async function canonicalGitDir(
+  pi: ExtensionAPI,
+  root: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const gitDir = await gitOutput(pi, root, ["rev-parse", "--absolute-git-dir"], signal);
+  return fs.promises.realpath(gitDir);
+}
+
 async function listedWorktreeIdForRoot(
   listOutput: string,
   root: string,
@@ -491,13 +599,20 @@ export async function snapshotWorktreeTree(
   indexPath: string,
   signal?: AbortSignal,
 ): Promise<string> {
-  await fs.promises.rm(indexPath, { force: true });
+  const lockPath = `${indexPath}.lock`;
+  await Promise.all([
+    fs.promises.rm(indexPath, { force: true }),
+    fs.promises.rm(lockPath, { force: true }),
+  ]);
   try {
     await gitOutput(pi, root, ["read-tree", head], signal, indexPath);
     await gitOutput(pi, root, ["add", "-A", "--", "."], signal, indexPath);
     return await gitOutput(pi, root, ["write-tree"], signal, indexPath);
   } finally {
-    await fs.promises.rm(indexPath, { force: true });
+    await Promise.all([
+      fs.promises.rm(indexPath, { force: true }),
+      fs.promises.rm(lockPath, { force: true }),
+    ]);
   }
 }
 
@@ -515,6 +630,19 @@ async function statusPaths(
   return uniqueSortedPaths(
     parseNulPaths(output).map((record) => record.length >= 4 ? record.slice(3) : record),
   );
+}
+
+async function ignoredPaths(
+  pi: ExtensionAPI,
+  root: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  return uniqueSortedPaths(parseNulPaths(await gitStdout(
+    pi,
+    root,
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    signal,
+  )));
 }
 
 export async function repositoryOperationBlockers(
@@ -553,11 +681,11 @@ export async function repositoryOperationBlockers(
 }
 
 async function priorSnapshotApplied(
-  jobDir: string,
+  targetGitDir: string,
   patchSha256: string,
   targetRoot: string,
 ): Promise<boolean> {
-  const handoffsDir = path.join(jobDir, "handoffs");
+  const handoffsDir = path.join(destinationApplyStateDir(targetGitDir), "transactions");
   let entries: fs.Dirent[];
   try {
     entries = await fs.promises.readdir(handoffsDir, { withFileTypes: true });
@@ -567,18 +695,25 @@ async function priorSnapshotApplied(
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    const manifest = await readJsonRecord(path.join(handoffsDir, entry.name, "manifest.json"));
-    if (!manifest) continue;
+    const transactionPath = path.join(handoffsDir, entry.name, "transaction.json");
+    const manifest = await readJsonRecord(transactionPath);
+    if (!manifest) throw new Error(`Destination transaction metadata is corrupt: ${transactionPath}`);
     const patchRecord = isRecord(manifest.patch) ? manifest.patch : undefined;
     const destinationRecord = isRecord(manifest.destination) ? manifest.destination : undefined;
     const state = stringValue(manifest, "state");
+    const storedPatch = patchRecord && stringValue(patchRecord, "sha256");
+    const storedRoot = destinationRecord && stringValue(destinationRecord, "root");
     if (
-      (state === "applying" || state === "applied" || state === "conflicted" || state === "indeterminate") &&
-      patchRecord && stringValue(patchRecord, "sha256") === patchSha256 &&
-      destinationRecord && stringValue(destinationRecord, "root") === targetRoot
+      !state || !storedPatch || !storedRoot || storedRoot !== targetRoot ||
+      !["prepared", "applying", "applied", "blocked", "conflicted", "failed", "indeterminate", "rolled_back", "resolved"].includes(state)
     ) {
-      return true;
+      throw new Error(`Destination transaction metadata is invalid: ${transactionPath}`);
     }
+    if (state === "applying" || state === "conflicted" || state === "indeterminate") {
+      if (storedPatch === patchSha256) return true;
+      throw new Error(`Destination has unresolved ${state} transaction ${entry.name}; recover it before another apply.`);
+    }
+    if ((state === "applied" || state === "resolved") && storedPatch === patchSha256) return true;
   }
   return false;
 }
@@ -644,6 +779,34 @@ export async function prepareDelegateHandoff(
   if (job.workerState === "running") {
     throw new Error(`Worker ${job.id} is still running.`);
   }
+  if (!["completed", "failed", "timed_out", "cancelled"].includes(job.lifecyclePhase)) {
+    throw new Error(`Worker ${job.id} lifecycle is ${job.lifecyclePhase}; reconcile it before applying.`);
+  }
+  const terminal = await readWorkerTerminal<{ processIdentity?: ProcessIdentity }>(job.activeWorkerJobDir);
+  if (!terminal) throw new Error(`Worker ${job.id} has no authoritative terminal claim.`);
+  if (terminal.owner === "worker") {
+    const [runner, exit] = await Promise.all([
+      readRunnerProcess(job.activeWorkerJobDir),
+      readRunnerExit(job.activeWorkerJobDir),
+    ]);
+    if (!authenticateRunnerExit(job.id, job.launchNonce, runner, exit)) {
+      throw new Error(`Worker ${job.id} has no authenticated normal runner exit.`);
+    }
+  }
+  const processes = await verifyWorkerProcessesAbsent(
+    {
+      id: job.id,
+      jobDir: job.activeWorkerJobDir,
+      tabWorktreeId: job.tabWorktreeId,
+      tabId: job.tabId,
+      surfaceId: job.surfaceId,
+      launchNonce: job.launchNonce,
+    },
+    terminal.status.processIdentity,
+  );
+  if (!processes.absent) {
+    throw new Error(`Worker ${job.id} termination is not verified (${processes.states.join(", ")}).`);
+  }
   if (!await pathExists(job.worktreePath)) {
     throw new Error(`Worker worktree no longer exists: ${job.worktreePath}`);
   }
@@ -664,9 +827,10 @@ export async function prepareDelegateHandoff(
     throw new Error("Worker metadata does not map its pane Supacode worktree ID to the source checkout.");
   }
 
-  const [sourceCommonDir, targetCommonDir, sourceBranch, listedWorktrees] = await Promise.all([
+  const [sourceCommonDir, targetCommonDir, targetGitDir, sourceBranch, listedWorktrees] = await Promise.all([
     canonicalCommonGitDir(pi, sourceRoot, signal),
     canonicalCommonGitDir(pi, targetRoot, signal),
+    canonicalGitDir(pi, targetRoot, signal),
     currentBranch(pi, sourceRoot, signal),
     pi.exec("supacode", ["worktree", "list"], { signal, timeout: GIT_TIMEOUT_MS }),
   ]);
@@ -719,8 +883,19 @@ export async function prepareDelegateHandoff(
       if (job.loopState !== "awaiting_apply") {
         throw new Error(`Delegate loop is ${job.loopState ?? "missing its terminal state"}; only accepted loops can be applied.`);
       }
-      if (!job.acceptedTree || !OBJECT_ID_PATTERN.test(job.acceptedTree)) {
-        throw new Error("Accepted delegate loop is missing a valid reviewed tree identity.");
+      if (
+        !job.acceptedTree || !OBJECT_ID_PATTERN.test(job.acceptedTree) ||
+        !job.acceptedCommit || !OBJECT_ID_PATTERN.test(job.acceptedCommit) ||
+        !job.acceptedRef || !job.acceptedRef.startsWith("refs/pi-agent-candidates/")
+      ) {
+        throw new Error("Accepted delegate loop is missing valid reviewed tree, commit, or ref identities.");
+      }
+      const [acceptedCommit, acceptedTree] = await Promise.all([
+        gitOutput(pi, sourceRoot, ["rev-parse", "--verify", job.acceptedRef], signal),
+        gitOutput(pi, sourceRoot, ["rev-parse", `${job.acceptedRef}^{tree}`], signal),
+      ]);
+      if (acceptedCommit !== job.acceptedCommit || acceptedTree !== job.acceptedTree) {
+        throw new Error("Accepted delegate-loop ref no longer identifies its reviewed commit and tree.");
       }
       if (sourceTree !== job.acceptedTree) {
         throw new Error("Delegate loop worktree changed after acceptance; rerun checks and review before applying.");
@@ -755,18 +930,23 @@ export async function prepareDelegateHandoff(
     )));
     if (touchedPaths.length === 0) throw new Error("Worker patch contains no changed paths.");
 
-    const [sourceStatus, targetHead, targetBranch, targetStatus, targetDirtyPaths, operationBlockers] = await Promise.all([
+    const [sourceStatus, targetHead, targetBranch, targetStatus, targetDirtyPaths, targetIgnoredPaths, operationBlockers] = await Promise.all([
       gitOutput(pi, sourceRoot, ["status", "--short"], signal),
       gitOutput(pi, targetRoot, ["rev-parse", "HEAD"], signal),
       currentBranch(pi, targetRoot, signal),
       gitOutput(pi, targetRoot, ["status", "--short"], signal),
       statusPaths(pi, targetRoot, signal),
+      ignoredPaths(pi, targetRoot, signal),
       repositoryOperationBlockers(pi, targetRoot, signal),
     ]);
     const blockedPaths = overlappingDirtyPaths(touchedPaths, targetDirtyPaths);
+    const ignoredBlockedPaths = overlappingDirtyPaths(touchedPaths, targetIgnoredPaths);
     const blockers = [...operationBlockers];
     if (blockedPaths.length > 0) {
       blockers.push(`Destination changes overlap the patch: ${blockedPaths.map(displayPath).join(", ")}`);
+    }
+    if (ignoredBlockedPaths.length > 0) {
+      blockers.push(`Ignored destination entries overlap the patch: ${ignoredBlockedPaths.map(displayPath).join(", ")}`);
     }
 
     const baseAncestorResult = await gitResult(
@@ -788,7 +968,7 @@ export async function prepareDelegateHandoff(
     }
 
     const patchSha256 = createHash("sha256").update(patchBuffer).digest("hex");
-    if (await priorSnapshotApplied(job.jobDir, patchSha256, targetRoot)) {
+    if (await priorSnapshotApplied(targetGitDir, patchSha256, targetRoot)) {
       blockers.push("This exact worker snapshot was already applied to this destination.");
     }
 
@@ -818,6 +998,8 @@ export async function prepareDelegateHandoff(
       baseIsAncestor,
       commitCount,
       targetRoot,
+      targetGitDir,
+      targetCommonGitDir: targetCommonDir,
       targetHead,
       targetBranch,
       targetStatus,
@@ -866,6 +1048,8 @@ function manifestFor(
     },
     destination: {
       root: prepared.targetRoot,
+      gitDir: prepared.targetGitDir,
+      commonGitDir: prepared.targetCommonGitDir,
       branch: prepared.targetBranch,
       head: prepared.targetHead,
     },
@@ -886,22 +1070,242 @@ async function writeManifest(
   await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
+function destinationTransactionPath(prepared: PreparedDelegateHandoff): string {
+  return path.join(
+    destinationApplyStateDir(prepared.targetGitDir),
+    "transactions",
+    prepared.id,
+    "transaction.json",
+  );
+}
+
+async function writeDestinationTransaction(
+  prepared: PreparedDelegateHandoff,
+  manifestPath: string,
+  state: DestinationTransaction["state"],
+  baseline?: DestinationBaseline,
+  diagnostic?: string,
+): Promise<void> {
+  const transactionPath = destinationTransactionPath(prepared);
+  const prior = await readJsonRecord(transactionPath);
+  const createdAt = prior && stringValue(prior, "createdAt") || new Date().toISOString();
+  const transaction = {
+    version: 1,
+    id: prepared.id,
+    jobId: prepared.job.id,
+    state,
+    createdAt,
+    updatedAt: new Date().toISOString(),
+    destination: {
+      root: prepared.targetRoot,
+      gitDir: prepared.targetGitDir,
+      commonGitDir: prepared.targetCommonGitDir,
+      head: prepared.targetHead,
+      branch: prepared.targetBranch,
+    },
+    patch: {
+      sha256: prepared.patchSha256,
+      bytes: prepared.patchBytes,
+      touchedPaths: prepared.touchedPaths,
+    },
+    baseline,
+    diagnostic,
+    jobManifestPath: manifestPath,
+  } satisfies DestinationTransaction;
+  await atomicWrite(transactionPath, `${JSON.stringify(transaction, null, 2)}\n`);
+}
+
+async function captureDestinationBaseline(
+  pi: ExtensionAPI,
+  prepared: PreparedDelegateHandoff,
+  handoffDir: string,
+  patchBuffer: Buffer,
+  signal?: AbortSignal,
+): Promise<DestinationBaseline> {
+  const indexOutput = await gitOutput(pi, prepared.targetRoot, ["rev-parse", "--git-path", "index"], signal);
+  const indexPath = path.resolve(prepared.targetRoot, indexOutput);
+  const indexBuffer = await fs.promises.readFile(indexPath);
+  const indexBackupPath = path.join(handoffDir, "destination.index");
+  await atomicWrite(indexBackupPath, indexBuffer);
+  const tree = await snapshotWorktreeTree(
+    pi,
+    prepared.targetRoot,
+    prepared.targetHead,
+    path.join(handoffDir, "destination-baseline.index"),
+    signal,
+  );
+  const expectedWorktreeIndexPath = path.join(handoffDir, "destination-expected-worktree.index");
+  await fs.promises.rm(expectedWorktreeIndexPath, { force: true });
+  await gitOutput(pi, prepared.targetRoot, ["read-tree", tree], signal, expectedWorktreeIndexPath);
+  const expectedWorktreeApply = await commandWithInput(
+    "env",
+    [
+      `GIT_INDEX_FILE=${expectedWorktreeIndexPath}`,
+      "git",
+      "-C",
+      prepared.targetRoot,
+      "apply",
+      "--3way",
+      "--cached",
+      "--binary",
+      "-",
+    ],
+    patchBuffer,
+    { signal, timeout: GIT_TIMEOUT_MS },
+  );
+  const expectedTree = expectedWorktreeApply.code === 0
+    ? await gitOutput(pi, prepared.targetRoot, ["write-tree"], signal, expectedWorktreeIndexPath)
+    : undefined;
+  await fs.promises.rm(expectedWorktreeIndexPath, { force: true });
+  return {
+    indexPath,
+    indexBackupPath,
+    indexSha256: createHash("sha256").update(indexBuffer).digest("hex"),
+    tree,
+    expectedTree,
+  };
+}
+
+async function replaceDestinationIndex(
+  baseline: DestinationBaseline,
+  replacement: Buffer,
+): Promise<void> {
+  const lockPath = `${baseline.indexPath}.lock`;
+  const handle = await fs.promises.open(lockPath, "wx", 0o600);
+  try {
+    const currentIndexHash = createHash("sha256")
+      .update(await fs.promises.readFile(baseline.indexPath))
+      .digest("hex");
+    if (currentIndexHash !== baseline.indexSha256) {
+      throw new Error("Destination index changed before the transaction acquired index.lock.");
+    }
+    await handle.writeFile(replacement);
+    await handle.sync();
+    await handle.close();
+    await fs.promises.rename(lockPath, baseline.indexPath);
+    const directory = await fs.promises.open(path.dirname(baseline.indexPath), fs.constants.O_RDONLY);
+    try {
+      await directory.sync();
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EISDIR") throw error;
+    } finally {
+      await directory.close();
+    }
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await fs.promises.rm(lockPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function verifyAppliedPostcondition(
+  pi: ExtensionAPI,
+  prepared: PreparedDelegateHandoff,
+  baseline: DestinationBaseline,
+  handoffDir: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const failures: string[] = [];
+  const [root, gitDir, commonGitDir, head, branch, unmerged] = await Promise.all([
+    canonicalGitRoot(pi, prepared.targetRoot, signal),
+    canonicalGitDir(pi, prepared.targetRoot, signal),
+    canonicalCommonGitDir(pi, prepared.targetRoot, signal),
+    gitOutput(pi, prepared.targetRoot, ["rev-parse", "HEAD"], signal),
+    currentBranch(pi, prepared.targetRoot, signal),
+    gitStdout(pi, prepared.targetRoot, ["diff", "--name-only", "--diff-filter=U", "-z"], signal),
+  ]);
+  if (root !== prepared.targetRoot || gitDir !== prepared.targetGitDir || commonGitDir !== prepared.targetCommonGitDir) {
+    failures.push("destination identity changed");
+  }
+  if (head !== prepared.targetHead || branch !== prepared.targetBranch) failures.push("destination HEAD or branch changed");
+  if (parseNulPaths(unmerged).length > 0) failures.push("destination has unresolved conflicts");
+  const indexHash = createHash("sha256").update(await fs.promises.readFile(baseline.indexPath)).digest("hex");
+  if (indexHash !== baseline.indexSha256) failures.push("destination index was not restored exactly");
+  const worktreeTree = await snapshotWorktreeTree(
+    pi,
+    prepared.targetRoot,
+    prepared.targetHead,
+    path.join(handoffDir, "destination-postcondition.index"),
+    signal,
+  );
+  if (!baseline.expectedTree || worktreeTree !== baseline.expectedTree) {
+    failures.push("destination worktree does not match the precomputed result tree");
+  }
+  return failures;
+}
+
+async function rollbackDestination(
+  pi: ExtensionAPI,
+  prepared: PreparedDelegateHandoff,
+  baseline: DestinationBaseline,
+  handoffDir: string,
+): Promise<{ rolledBack: boolean; diagnostic?: string }> {
+  try {
+    const [root, gitDir, commonGitDir, head, branch] = await Promise.all([
+      canonicalGitRoot(pi, prepared.targetRoot),
+      canonicalGitDir(pi, prepared.targetRoot),
+      canonicalCommonGitDir(pi, prepared.targetRoot),
+      gitOutput(pi, prepared.targetRoot, ["rev-parse", "HEAD"]),
+      currentBranch(pi, prepared.targetRoot),
+    ]);
+    if (
+      root !== prepared.targetRoot || gitDir !== prepared.targetGitDir ||
+      commonGitDir !== prepared.targetCommonGitDir || head !== prepared.targetHead ||
+      branch !== prepared.targetBranch
+    ) {
+      return { rolledBack: false, diagnostic: "Destination identity changed; automatic rollback was refused." };
+    }
+    const currentTree = await snapshotWorktreeTree(
+      pi,
+      prepared.targetRoot,
+      prepared.targetHead,
+      path.join(handoffDir, "destination-rollback-ownership.index"),
+    );
+    const currentIndexHash = createHash("sha256")
+      .update(await fs.promises.readFile(baseline.indexPath))
+      .digest("hex");
+    if (currentTree === baseline.tree && currentIndexHash === baseline.indexSha256) {
+      return { rolledBack: true };
+    }
+    return {
+      rolledBack: false,
+      diagnostic: "Destination is not already at the exact baseline; destructive automatic rollback was refused to preserve concurrent edits and symlink safety.",
+    };
+  } catch (error) {
+    return { rolledBack: false, diagnostic: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 async function currentPreflightBlockers(
   pi: ExtensionAPI,
   prepared: PreparedDelegateHandoff,
   signal?: AbortSignal,
 ): Promise<{ blockers: string[]; blockedPaths: string[] }> {
-  const [destinationBlockers, sourceBlockers] = await Promise.all([
+  const [destinationBlockers, sourceBlockers, currentRoot, currentGitDir, currentCommonGitDir] = await Promise.all([
     repositoryOperationBlockers(pi, prepared.targetRoot, signal),
     repositoryOperationBlockers(pi, prepared.sourceRoot, signal, "Source checkout"),
+    canonicalGitRoot(pi, prepared.targetRoot, signal),
+    canonicalGitDir(pi, prepared.targetRoot, signal),
+    canonicalCommonGitDir(pi, prepared.targetRoot, signal),
   ]);
-  const blockers = [...destinationBlockers, ...sourceBlockers];
+  const blockers = [...prepared.blockers, ...destinationBlockers, ...sourceBlockers];
+  if (
+    currentRoot !== prepared.targetRoot ||
+    currentGitDir !== prepared.targetGitDir ||
+    currentCommonGitDir !== prepared.targetCommonGitDir
+  ) {
+    blockers.push("Destination checkout identity changed after the apply preview.");
+  }
+  if (await pathExists(path.join(prepared.targetGitDir, "index.lock"))) {
+    blockers.push("Destination Git index is locked by another operation.");
+  }
   const currentHead = await gitOutput(pi, prepared.targetRoot, ["rev-parse", "HEAD"], signal);
   const branch = await currentBranch(pi, prepared.targetRoot, signal);
   if (currentHead !== prepared.targetHead || branch !== prepared.targetBranch) {
     blockers.push("Destination HEAD or branch changed after the apply preview; run the command again.");
   }
-  if (await priorSnapshotApplied(prepared.job.jobDir, prepared.patchSha256, prepared.targetRoot)) {
+  if (await priorSnapshotApplied(prepared.targetGitDir, prepared.patchSha256, prepared.targetRoot)) {
     blockers.push("This exact worker snapshot already has an active or applied handoff for this destination.");
   }
   const blockedPaths = overlappingDirtyPaths(
@@ -911,27 +1315,14 @@ async function currentPreflightBlockers(
   if (blockedPaths.length > 0) {
     blockers.push(`Destination changes overlap the patch: ${blockedPaths.map(displayPath).join(", ")}`);
   }
-  return { blockers, blockedPaths };
-}
-
-async function unstagePaths(
-  pi: ExtensionAPI,
-  root: string,
-  paths: string[],
-  handoffDir: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  if (paths.length === 0) return;
-  const pathspecPath = path.join(handoffDir, "applied-paths.pathspec");
-  await fs.promises.writeFile(pathspecPath, `${paths.join("\0")}\0`, { encoding: "utf8", mode: 0o600 });
-  const result = await gitResult(
-    pi,
-    root,
-    ["reset", "--quiet", "HEAD", `--pathspec-from-file=${pathspecPath}`, "--pathspec-file-nul"],
-    signal,
+  const ignoredBlockedPaths = overlappingDirtyPaths(
+    prepared.touchedPaths,
+    await ignoredPaths(pi, prepared.targetRoot, signal),
   );
-  await fs.promises.rm(pathspecPath, { force: true });
-  if (result.code !== 0) throw new Error(`Could not unstage applied paths: ${diagnosticText(result)}`);
+  if (ignoredBlockedPaths.length > 0) {
+    blockers.push(`Ignored destination entries overlap the patch: ${ignoredBlockedPaths.map(displayPath).join(", ")}`);
+  }
+  return { blockers, blockedPaths: uniqueSortedPaths([...blockedPaths, ...ignoredBlockedPaths]) };
 }
 
 async function tabExists(
@@ -982,8 +1373,6 @@ async function closeWorkerPane(
     ],
     { timeout: GIT_TIMEOUT_MS },
   );
-  if (closed.code === 0) return { closed: true };
-
   let consecutiveMissingChecks = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
     const exists = await workerPaneExists(pi, job);
@@ -995,7 +1384,12 @@ async function closeWorkerPane(
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  return { closed: false, error: `Could not close worker pane: ${diagnosticText(closed)}` };
+  return {
+    closed: false,
+    error: closed.code === 0
+      ? "Supacode acknowledged worker pane closure, but surface absence was not verified."
+      : `Could not close worker pane: ${diagnosticText(closed)}`,
+  };
 }
 
 function workerRecoveryRef(prepared: PreparedDelegateHandoff): string {
@@ -1141,12 +1535,28 @@ async function listedSourceWorktreeId(
 async function cleanupAppliedWorktree(
   pi: ExtensionAPI,
   prepared: PreparedDelegateHandoff,
+  onRecoveryRef?: (recoveryRef: string) => Promise<void>,
 ): Promise<HandoffCleanupResult> {
   const errors: string[] = [];
   const backup = await createBranchBackup(pi, prepared);
   if (!backup.ref) {
     if (backup.error) errors.push(backup.error);
     return { paneClosed: false, worktreeRemoved: false, branchPreserved: false, errors };
+  }
+  if (onRecoveryRef) {
+    try {
+      await onRecoveryRef(backup.ref);
+    } catch (error) {
+      errors.push(`Cleanup stopped because its recovery state could not be recorded: ${error instanceof Error ? error.message : String(error)}`);
+      errors.push(`Worker recovery ref retained at ${backup.ref}.`);
+      return {
+        paneClosed: false,
+        worktreeRemoved: false,
+        branchPreserved: true,
+        recoveryRef: backup.ref,
+        errors,
+      };
+    }
   }
   const retained = (paneClosed: boolean, preservedHead?: string): HandoffCleanupResult => ({
     paneClosed,
@@ -1284,31 +1694,20 @@ async function cleanupAppliedWorktree(
   };
 }
 
-async function acquireApplyLock(jobDir: string): Promise<string> {
-  const handoffsDir = path.join(jobDir, "handoffs");
-  await fs.promises.mkdir(handoffsDir, { recursive: true, mode: 0o700 });
-  const lockPath = path.join(handoffsDir, ".apply.lock");
-  try {
-    const handle = await fs.promises.open(lockPath, "wx", 0o600);
-    await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`);
-    await handle.close();
-    return lockPath;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error(`Another apply is active or needs recovery. Inspect ${lockPath}.`);
-    }
-    throw error;
-  }
-}
-
 async function applyPreparedDelegateHandoffUnlocked(
   pi: ExtensionAPI,
   prepared: PreparedDelegateHandoff,
   signal: AbortSignal | undefined,
-  cleanup: boolean,
 ): Promise<DelegateHandoffResult> {
   const finalDir = path.join(prepared.job.jobDir, "handoffs", prepared.id);
+  const finalParent = path.dirname(finalDir);
+  const draftParent = path.dirname(prepared.draftDir);
+  await ensureDirectoryDurable(finalParent);
   await fs.promises.rename(prepared.draftDir, finalDir);
+  await Promise.all([
+    syncDirectory(draftParent),
+    syncDirectory(finalParent),
+  ]);
   const patchPath = path.join(finalDir, "changes.patch");
   const manifestPath = path.join(finalDir, "manifest.json");
   const emptyCleanup: HandoffCleanupResult = {
@@ -1319,6 +1718,7 @@ async function applyPreparedDelegateHandoffUnlocked(
   };
   await fs.promises.chmod(patchPath, 0o400);
   await writeManifest(manifestPath, manifestFor(prepared, "prepared"));
+  await writeDestinationTransaction(prepared, manifestPath, "prepared");
 
   const preflight = await currentPreflightBlockers(pi, prepared, signal);
   if (preflight.blockers.length > 0) {
@@ -1330,6 +1730,7 @@ async function applyPreparedDelegateHandoffUnlocked(
       diagnostic,
     };
     await writeManifest(manifestPath, manifestFor(prepared, "blocked", apply, emptyCleanup));
+    await writeDestinationTransaction(prepared, manifestPath, "blocked", undefined, diagnostic);
     return {
       id: prepared.id,
       state: "blocked",
@@ -1349,6 +1750,7 @@ async function applyPreparedDelegateHandoffUnlocked(
     const diagnostic = "Stored handoff patch changed after preview; nothing was applied.";
     const apply = { appliedPaths: [], conflictedPaths: [], blockedPaths: [], diagnostic };
     await writeManifest(manifestPath, manifestFor(prepared, "blocked", apply, emptyCleanup));
+    await writeDestinationTransaction(prepared, manifestPath, "blocked", undefined, diagnostic);
     return {
       id: prepared.id,
       state: "blocked",
@@ -1362,26 +1764,71 @@ async function applyPreparedDelegateHandoffUnlocked(
     };
   }
 
+  let baseline: DestinationBaseline;
+  try {
+    baseline = await captureDestinationBaseline(pi, prepared, finalDir, patchBuffer, signal);
+  } catch (error) {
+    const diagnostic = `Could not capture destination rollback and postcondition evidence: ${error instanceof Error ? error.message : String(error)}`;
+    const apply = { appliedPaths: [], conflictedPaths: [], blockedPaths: [], diagnostic };
+    await writeManifest(manifestPath, manifestFor(prepared, "failed", apply, emptyCleanup));
+    await writeDestinationTransaction(prepared, manifestPath, "failed", undefined, diagnostic);
+    return {
+      id: prepared.id,
+      state: "failed",
+      appliedPaths: [],
+      conflictedPaths: [],
+      blockedPaths: [],
+      diagnostic,
+      manifestPath,
+      patchPath,
+      cleanup: emptyCleanup,
+    };
+  }
   await writeManifest(manifestPath, manifestFor(prepared, "applying"));
+  await writeDestinationTransaction(prepared, manifestPath, "applying", baseline);
+  const applyIndexPath = path.join(finalDir, "destination-apply.index");
+  await atomicWrite(applyIndexPath, await fs.promises.readFile(baseline.indexBackupPath));
   let applied: CommandResult;
   try {
     applied = await commandWithInput(
-      "git",
-      ["-C", prepared.targetRoot, "apply", "--3way", "--index", "--binary", "-"],
+      "env",
+      [
+        `GIT_INDEX_FILE=${applyIndexPath}`,
+        "git",
+        "-C",
+        prepared.targetRoot,
+        "apply",
+        "--3way",
+        "--index",
+        "--binary",
+        "-",
+      ],
       patchBuffer,
       { signal, timeout: GIT_TIMEOUT_MS },
     );
   } catch (error) {
-    const diagnostic = `Git apply ended unexpectedly and the destination needs inspection: ${error instanceof Error ? error.message : String(error)}`;
+    const rollback = await rollbackDestination(pi, prepared, baseline, finalDir);
+    const state = rollback.rolledBack ? "failed" : "indeterminate";
+    const diagnostic = [
+      `Git apply ended unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+      rollback.rolledBack ? "Destination was rolled back to its exact baseline." : rollback.diagnostic,
+    ].filter(Boolean).join("\n");
     const apply = { appliedPaths: [], conflictedPaths: [], blockedPaths: [], diagnostic };
     try {
-      await writeManifest(manifestPath, manifestFor(prepared, "indeterminate", apply, emptyCleanup));
+      await writeManifest(manifestPath, manifestFor(prepared, state, apply, emptyCleanup));
+      await writeDestinationTransaction(
+        prepared,
+        manifestPath,
+        rollback.rolledBack ? "rolled_back" : "indeterminate",
+        baseline,
+        diagnostic,
+      );
     } catch {
       // The prepared and applying manifests remain as recovery evidence.
     }
     return {
       id: prepared.id,
-      state: "indeterminate",
+      state,
       appliedPaths: [],
       conflictedPaths: [],
       blockedPaths: [],
@@ -1396,103 +1843,74 @@ async function applyPreparedDelegateHandoffUnlocked(
   let appliedPaths: string[] = [];
   let conflictedPaths: string[] = [];
   let diagnostic: string | undefined;
+  let transactionState: DestinationTransaction["state"];
   try {
     conflictedPaths = uniqueSortedPaths(parseNulPaths(await gitStdout(
       pi,
       prepared.targetRoot,
       ["diff", "--name-only", "--diff-filter=U", "-z"],
       signal,
+      applyIndexPath,
     )).filter((conflictedPath) =>
       prepared.touchedPaths.some((touchedPath) => delegatePathsOverlap(touchedPath, conflictedPath))));
     const dirtyAfterApply = await statusPaths(pi, prepared.targetRoot, signal);
     appliedPaths = prepared.touchedPaths.filter((touchedPath) =>
       dirtyAfterApply.some((dirtyPath) => delegatePathsOverlap(touchedPath, dirtyPath)));
-    const cleanAppliedPaths = appliedPaths.filter((appliedPath) =>
-      !conflictedPaths.some((conflictedPath) => delegatePathsOverlap(appliedPath, conflictedPath)));
-
-    let resetError: string | undefined;
-    try {
-      await unstagePaths(pi, prepared.targetRoot, cleanAppliedPaths, finalDir, signal);
-    } catch (error) {
-      resetError = error instanceof Error ? error.message : String(error);
-    }
     const applyOutput = (applied.stderr || applied.stdout).trim();
-    const timeoutDiagnostic = applied.timedOut
-      ? "Git apply timed out and the destination may be partially changed."
-      : undefined;
-    diagnostic = [applyOutput || undefined, timeoutDiagnostic, resetError].filter(Boolean).join("\n") || undefined;
-    state = applied.timedOut || resetError
-      ? "indeterminate"
-      : conflictedPaths.length > 0
-        ? "conflicted"
-        : applied.code !== 0 && appliedPaths.length > 0
-          ? "indeterminate"
-          : applied.code === 0
-            ? "applied"
-            : "failed";
-    const apply = { appliedPaths, conflictedPaths, blockedPaths: [], diagnostic };
-    await writeManifest(manifestPath, manifestFor(prepared, state, apply, emptyCleanup));
-  } catch (error) {
-    state = "indeterminate";
-    diagnostic = `Git changed the destination, but result collection failed: ${error instanceof Error ? error.message : String(error)}`;
-    const apply = { appliedPaths, conflictedPaths, blockedPaths: [], diagnostic };
-    try {
-      await writeManifest(manifestPath, manifestFor(prepared, state, apply, emptyCleanup));
-    } catch {
-      // The applying manifest remains as recovery evidence.
+
+    if (conflictedPaths.length > 0) {
+      await replaceDestinationIndex(baseline, await fs.promises.readFile(applyIndexPath));
+      state = "conflicted";
+      transactionState = "conflicted";
+      diagnostic = applyOutput || undefined;
+    } else if (applied.code === 0 && !applied.timedOut) {
+      const postconditionFailures = await verifyAppliedPostcondition(
+        pi,
+        prepared,
+        baseline,
+        finalDir,
+        signal,
+      );
+      if (postconditionFailures.length === 0) {
+        state = "applied";
+        transactionState = "applied";
+        appliedPaths = [...prepared.touchedPaths];
+        diagnostic = applyOutput || undefined;
+      } else {
+        const rollback = await rollbackDestination(pi, prepared, baseline, finalDir);
+        state = rollback.rolledBack ? "failed" : "indeterminate";
+        transactionState = rollback.rolledBack ? "rolled_back" : "indeterminate";
+        appliedPaths = [];
+        diagnostic = [
+          `Apply postcondition failed: ${postconditionFailures.join("; ")}.`,
+          rollback.rolledBack ? "Destination was rolled back to its exact baseline." : rollback.diagnostic,
+        ].filter(Boolean).join("\n");
+      }
+    } else {
+      const rollback = await rollbackDestination(pi, prepared, baseline, finalDir);
+      state = rollback.rolledBack ? "failed" : "indeterminate";
+      transactionState = rollback.rolledBack ? "rolled_back" : "indeterminate";
+      appliedPaths = [];
+      diagnostic = [
+        applyOutput || `git apply exited ${applied.code}`,
+        applied.timedOut ? "Git apply timed out." : undefined,
+        rollback.rolledBack ? "Destination was rolled back to its exact baseline." : rollback.diagnostic,
+      ].filter(Boolean).join("\n");
     }
-    return {
-      id: prepared.id,
-      state,
-      appliedPaths,
-      conflictedPaths,
-      blockedPaths: [],
-      diagnostic,
-      manifestPath,
-      patchPath,
-      cleanup: emptyCleanup,
-    };
+  } catch (error) {
+    const rollback = await rollbackDestination(pi, prepared, baseline, finalDir);
+    state = rollback.rolledBack ? "failed" : "indeterminate";
+    transactionState = rollback.rolledBack ? "rolled_back" : "indeterminate";
+    appliedPaths = [];
+    diagnostic = [
+      `Apply result collection or postcondition verification failed: ${error instanceof Error ? error.message : String(error)}`,
+      rollback.rolledBack ? "Destination was rolled back to its exact baseline." : rollback.diagnostic,
+    ].filter(Boolean).join("\n");
   }
 
   const apply = { appliedPaths, conflictedPaths, blockedPaths: [], diagnostic };
-  let cleanupResult = emptyCleanup;
-  if (state === "applied" && cleanup) {
-    const recoveryRef = workerRecoveryRef(prepared);
-    const pendingCleanup: HandoffCleanupResult = {
-      paneClosed: false,
-      worktreeRemoved: false,
-      branchPreserved: false,
-      recoveryRef,
-      errors: ["Cleanup pending; inspect the recovery ref and source worktree if this process stops."],
-    };
-    try {
-      await writeManifest(manifestPath, manifestFor(prepared, state, apply, pendingCleanup));
-    } catch (error) {
-      cleanupResult = {
-        ...emptyCleanup,
-        errors: [`Cleanup was skipped because its recovery state could not be recorded: ${error instanceof Error ? error.message : String(error)}`],
-      };
-    }
-    if (cleanupResult.errors.length === 0) {
-      try {
-        cleanupResult = await cleanupAppliedWorktree(pi, prepared);
-      } catch (error) {
-        cleanupResult = {
-          paneClosed: false,
-          worktreeRemoved: false,
-          branchPreserved: false,
-          recoveryRef,
-          errors: [`Cleanup ended unexpectedly; inspect the recovery ref and source worktree: ${error instanceof Error ? error.message : String(error)}`],
-        };
-      }
-    }
-  }
-  try {
-    await writeManifest(manifestPath, manifestFor(prepared, state, apply, cleanupResult));
-  } catch (error) {
-    cleanupResult.errors.push(`Could not record final cleanup state: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
+  await writeManifest(manifestPath, manifestFor(prepared, state, apply, emptyCleanup));
+  await writeDestinationTransaction(prepared, manifestPath, transactionState, baseline, diagnostic);
   return {
     id: prepared.id,
     state,
@@ -1502,7 +1920,7 @@ async function applyPreparedDelegateHandoffUnlocked(
     diagnostic,
     manifestPath,
     patchPath,
-    cleanup: cleanupResult,
+    cleanup: emptyCleanup,
   };
 }
 
@@ -1512,10 +1930,241 @@ export async function applyPreparedDelegateHandoff(
   signal?: AbortSignal,
   cleanup = true,
 ): Promise<DelegateHandoffResult> {
-  const lockPath = await acquireApplyLock(prepared.job.jobDir);
+  const lock = await acquireDestinationApplyLock(
+    prepared.targetGitDir,
+    prepared.id,
+    prepared.targetRoot,
+  );
+  let result: DelegateHandoffResult;
   try {
-    return await applyPreparedDelegateHandoffUnlocked(pi, prepared, signal, cleanup);
+    result = await applyPreparedDelegateHandoffUnlocked(pi, prepared, signal);
   } finally {
-    await fs.promises.rm(lockPath, { force: true });
+    await releaseDestinationApplyLock(lock);
+  }
+  if (result.state !== "applied" || !cleanup) return result;
+
+  const apply = {
+    appliedPaths: result.appliedPaths,
+    conflictedPaths: result.conflictedPaths,
+    blockedPaths: result.blockedPaths,
+    diagnostic: result.diagnostic,
+  };
+  let cleanupResult: HandoffCleanupResult;
+  const cleanupIntent: HandoffCleanupResult = {
+    paneClosed: false,
+    worktreeRemoved: false,
+    branchPreserved: false,
+    errors: [`Cleanup intent recorded before creating ${workerRecoveryRef(prepared)}.`],
+  };
+  try {
+    await writeManifest(
+      result.manifestPath,
+      manifestFor(prepared, "applied", apply, cleanupIntent),
+    );
+  } catch (error) {
+    return {
+      ...result,
+      cleanup: {
+        ...cleanupIntent,
+        errors: [`Cleanup was skipped because its write-ahead intent could not be recorded: ${error instanceof Error ? error.message : String(error)}`],
+      },
+    };
+  }
+  try {
+    cleanupResult = await cleanupAppliedWorktree(pi, prepared, async (recoveryRef) => {
+      const pendingCleanup: HandoffCleanupResult = {
+        paneClosed: false,
+        worktreeRemoved: false,
+        branchPreserved: true,
+        recoveryRef,
+        errors: ["Cleanup pending; the verified recovery ref preserves the source HEAD."],
+      };
+      await writeManifest(
+        result.manifestPath,
+        manifestFor(prepared, "applied", apply, pendingCleanup),
+      );
+    });
+  } catch (error) {
+    cleanupResult = {
+      paneClosed: false,
+      worktreeRemoved: false,
+      branchPreserved: false,
+      errors: [`Cleanup ended unexpectedly; inspect the source worktree: ${error instanceof Error ? error.message : String(error)}`],
+    };
+  }
+  try {
+    await writeManifest(
+      result.manifestPath,
+      manifestFor(prepared, "applied", apply, cleanupResult),
+    );
+  } catch (error) {
+    cleanupResult.errors.push(`Could not record final cleanup state: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return { ...result, cleanup: cleanupResult };
+}
+
+export async function recoverDelegateApplyState(
+  pi: ExtensionAPI,
+  destinationCwd: string,
+  signal?: AbortSignal,
+): Promise<{ recovered: boolean; message: string; transactions: string[] }> {
+  const root = await canonicalGitRoot(pi, destinationCwd, signal);
+  const gitDir = await canonicalGitDir(pi, root, signal);
+  const lock = await recoverStaleDestinationApplyLock(gitDir);
+  const recoveryLock = await acquireDestinationApplyLock(
+    gitDir,
+    `recovery-${randomUUID()}`,
+    root,
+  );
+  try {
+    const transactionsDir = path.join(destinationApplyStateDir(gitDir), "transactions");
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = await fs.promises.readdir(transactionsDir, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const transactions: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const transactionPath = path.join(transactionsDir, entry.name, "transaction.json");
+      const record = await readJsonRecord(transactionPath);
+      if (!record) {
+        transactions.push(`${entry.name}: corrupt transaction metadata; manual recovery required.`);
+        continue;
+      }
+      const state = stringValue(record, "state");
+      if (state !== "applying" && state !== "indeterminate" && state !== "conflicted") continue;
+      const destination = isRecord(record.destination) ? record.destination : undefined;
+      const baseline = isRecord(record.baseline) ? record.baseline : undefined;
+      const expectedRoot = destination && stringValue(destination, "root");
+      const expectedGitDir = destination && stringValue(destination, "gitDir");
+      const expectedCommonGitDir = destination && stringValue(destination, "commonGitDir");
+      const expectedHead = destination && stringValue(destination, "head");
+      const expectedBranch = destination && stringValue(destination, "branch");
+      const baselineTree = baseline && stringValue(baseline, "tree");
+      const expectedTree = baseline && stringValue(baseline, "expectedTree");
+      const indexPath = baseline && stringValue(baseline, "indexPath");
+      const indexSha256 = baseline && stringValue(baseline, "indexSha256");
+      const jobManifestPath = stringValue(record, "jobManifestPath");
+      if (
+        !expectedRoot || !expectedGitDir || !expectedCommonGitDir || !expectedHead ||
+        !baselineTree || !indexPath || !indexSha256 || !jobManifestPath
+      ) {
+        transactions.push(`${entry.name}: malformed recovery evidence; no state changed.`);
+        continue;
+      }
+      const [observedGitDir, observedCommonGitDir, observedHead, observedBranch] = await Promise.all([
+        canonicalGitDir(pi, root, signal),
+        canonicalCommonGitDir(pi, root, signal),
+        gitOutput(pi, root, ["rev-parse", "HEAD"], signal),
+        currentBranch(pi, root, signal),
+      ]);
+      if (
+        expectedRoot !== root || expectedGitDir !== observedGitDir ||
+        expectedCommonGitDir !== observedCommonGitDir || expectedHead !== observedHead ||
+        expectedBranch !== observedBranch
+      ) {
+        transactions.push(`${entry.name}: destination identity, HEAD, or branch mismatch; no state changed.`);
+        continue;
+      }
+      if (state === "conflicted") {
+        const unresolved = parseNulPaths(await gitStdout(
+          pi,
+          root,
+          ["diff", "--name-only", "--diff-filter=U", "-z"],
+          signal,
+        ));
+        if (unresolved.length > 0) {
+          transactions.push(`${entry.name}: conflicts remain unresolved (${unresolved.map(displayPath).join(", ")}).`);
+          continue;
+        }
+        const recoveryDiagnostic = "Manual conflict resolution was observed; destination transaction marked resolved.";
+        const jobManifest = await readJsonRecord(jobManifestPath);
+        if (
+          !jobManifest || stringValue(jobManifest, "id") !== entry.name ||
+          stringValue(jobManifest, "jobId") !== stringValue(record, "jobId")
+        ) {
+          transactions.push(`${entry.name}: job-local manifest identity mismatch; no state changed.`);
+          continue;
+        }
+        await atomicWrite(
+          jobManifestPath,
+          `${JSON.stringify({
+            ...jobManifest,
+            updatedAt: new Date().toISOString(),
+            apply: {
+              ...(isRecord(jobManifest.apply) ? jobManifest.apply : {}),
+              diagnostic: recoveryDiagnostic,
+            },
+          }, null, 2)}\n`,
+        );
+        await atomicWrite(
+          transactionPath,
+          `${JSON.stringify({
+            ...record,
+            state: "resolved",
+            updatedAt: new Date().toISOString(),
+            diagnostic: recoveryDiagnostic,
+          }, null, 2)}\n`,
+        );
+        transactions.push(`${entry.name}: resolved.`);
+        continue;
+      }
+      const currentTree = await snapshotWorktreeTree(
+        pi,
+        root,
+        observedHead,
+        path.join(transactionsDir, entry.name, "recovery.index"),
+        signal,
+      );
+      const currentIndexSha256 = createHash("sha256")
+        .update(await fs.promises.readFile(indexPath))
+        .digest("hex");
+      let recoveredState: DestinationTransaction["state"] | undefined;
+      if (currentTree === baselineTree && currentIndexSha256 === indexSha256) {
+        recoveredState = "rolled_back";
+      } else if (
+        expectedTree && currentTree === expectedTree && currentIndexSha256 === indexSha256
+      ) {
+        recoveredState = "applied";
+      }
+      if (!recoveredState) {
+        transactions.push(`${entry.name}: destination matches neither baseline nor expected result; manual recovery required.`);
+        continue;
+      }
+      const recoveryDiagnostic = `Recovered by exact tree and index postcondition as ${recoveredState}.`;
+      const jobManifest = await readJsonRecord(jobManifestPath);
+      if (
+        !jobManifest || stringValue(jobManifest, "id") !== entry.name ||
+        stringValue(jobManifest, "jobId") !== stringValue(record, "jobId")
+      ) {
+        transactions.push(`${entry.name}: job-local manifest identity mismatch; no state changed.`);
+        continue;
+      }
+      await atomicWrite(
+        jobManifestPath,
+        `${JSON.stringify({
+          ...jobManifest,
+          state: recoveredState === "applied" ? "applied" : "failed",
+          updatedAt: new Date().toISOString(),
+          apply: {
+            ...(isRecord(jobManifest.apply) ? jobManifest.apply : {}),
+            diagnostic: recoveryDiagnostic,
+          },
+        }, null, 2)}\n`,
+      );
+      const updated = {
+        ...record,
+        state: recoveredState,
+        updatedAt: new Date().toISOString(),
+        diagnostic: recoveryDiagnostic,
+      };
+      await atomicWrite(transactionPath, `${JSON.stringify(updated, null, 2)}\n`);
+      transactions.push(`${entry.name}: ${recoveredState}.`);
+    }
+    return { ...lock, transactions };
+  } finally {
+    await releaseDestinationApplyLock(recoveryLock);
   }
 }

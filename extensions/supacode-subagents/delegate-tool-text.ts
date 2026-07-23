@@ -7,7 +7,7 @@ export interface DelegateToolText {
 export const delegateToolText = {
   delegate_apply: {
     description:
-      "After explicit user instruction, queue a confirmed preview to apply a returned coding worker's filesystem without a destination commit. Clean applies attempt cleanup; branch and artifacts remain.",
+      "After explicit user instruction, queue a confirmed, destination-locked apply with exact postconditions and no destination commit. Clean applies attempt cleanup; recovery artifacts remain.",
     promptSnippet: "Preview and confirm applying a returned coding worker",
     promptGuidelines: [
       "Call delegate_apply only when the user explicitly asks to apply a returned worker; never call it automatically after any delegation.",
@@ -23,7 +23,7 @@ export const delegateToolText = {
   },
   delegate_loop: {
     description:
-      "Run a bounded implement-check-review-repair loop from a clean parent in one same-host worktree, with predeclared validation commands and fail-closed context-isolated reviews. It never applies automatically; workers are instructed not to push or merge.",
+      "Run a bounded implement-check-review-repair loop from a clean parent. Each attempt binds predeclared validation commands and fail-closed reviews to fresh detached checkouts of one immutable Git tree. It never applies automatically; workers do not push or merge.",
     promptSnippet: "Run a coding loop with checks and review",
     promptGuidelines: [
       "Give delegate_loop a self-contained objective with acceptance criteria and boundaries.",

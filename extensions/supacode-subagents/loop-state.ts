@@ -6,6 +6,7 @@ export type DelegateLoopState =
   | "awaiting_apply"
   | "blocked"
   | "exhausted"
+  | "cancelled"
   | "failed";
 
 export type ReviewVerdict = "pass" | "repair" | "blocked";
