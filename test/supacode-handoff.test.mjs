@@ -293,6 +293,126 @@ test("handoff rejects persisted pane worktree identity mismatches", async () => 
   }
 });
 
+test("handoff rejects an active Git operation in the source checkout", async () => {
+  const fixture = await createFixture();
+  try {
+    const mergeHeadPath = await git(fixture.worker, "rev-parse", "--git-path", "MERGE_HEAD");
+    await writeFile(mergeHeadPath, `${fixture.baseSha}\n`);
+
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /source checkout with an active Git operation/i,
+    );
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
+test("handoff rechecks source Git operations after preview", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeFile(join(fixture.worker, "a.txt"), "one\nworker\nthree\n");
+    const prepared = await prepareDelegateHandoff(
+      fixture.pi,
+      JOB_ID,
+      undefined,
+      fixture.agentDir,
+    );
+    const mergeHeadPath = await git(fixture.worker, "rev-parse", "--git-path", "MERGE_HEAD");
+    await writeFile(mergeHeadPath, `${fixture.baseSha}\n`);
+
+    const result = await applyPreparedDelegateHandoff(fixture.pi, prepared, undefined, false);
+    assert.equal(result.state, "blocked");
+    assert.match(result.diagnostic, /Source checkout has an active Git operation/);
+    assert.equal(await readFile(join(fixture.parent, "a.txt"), "utf8"), "one\ntwo\nthree\n");
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
+test("handoff rejects submodules and embedded Git repositories", async () => {
+  const fixture = await createFixture();
+  try {
+    const embedded = join(fixture.worker, "embedded");
+    await checked("git", ["init", embedded]);
+    await git(embedded, "config", "user.email", "test@example.com");
+    await git(embedded, "config", "user.name", "Test User");
+    await writeFile(join(embedded, "nested.txt"), "nested\n");
+    await git(embedded, "add", "nested.txt");
+    await git(embedded, "commit", "-m", "nested");
+
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /Submodules and embedded Git repositories are not supported.*embedded/i,
+    );
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
+test("handoff applies only the immutable tree accepted by a delegate loop", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeFile(join(fixture.worker, "a.txt"), "one\naccepted\nthree\n");
+    const snapshot = await prepareDelegateHandoff(
+      fixture.pi,
+      JOB_ID,
+      undefined,
+      fixture.agentDir,
+    );
+    const acceptedTree = snapshot.sourceTree;
+    await discardPreparedDelegateHandoff(snapshot);
+
+    const jobPath = join(fixture.jobDir, "job.json");
+    const job = JSON.parse(await readFile(jobPath, "utf8"));
+    Object.assign(job, {
+      delegateLoop: true,
+      loopState: "awaiting_apply",
+      acceptedTree,
+    });
+    await writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`);
+
+    const accepted = await prepareDelegateHandoff(
+      fixture.pi,
+      JOB_ID,
+      undefined,
+      fixture.agentDir,
+    );
+    assert.equal(accepted.sourceTree, acceptedTree);
+    await discardPreparedDelegateHandoff(accepted);
+
+    await writeFile(join(fixture.parent, "parent-advanced.txt"), "new destination\n");
+    await git(fixture.parent, "add", "parent-advanced.txt");
+    await git(fixture.parent, "commit", "-m", "advance destination");
+    const drifted = await prepareDelegateHandoff(
+      fixture.pi,
+      JOB_ID,
+      undefined,
+      fixture.agentDir,
+    );
+    assert.equal(
+      drifted.blockers.some((blocker) => blocker.includes("rerun the loop")),
+      true,
+    );
+    await discardPreparedDelegateHandoff(drifted);
+
+    await writeFile(join(fixture.worker, "after-review.txt"), "unreviewed\n");
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /changed after acceptance/,
+    );
+
+    job.loopState = "blocked";
+    await writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`);
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /only accepted loops can be applied/,
+    );
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
 test("handoff refuses a patch changed after preview", async () => {
   const fixture = await createFixture();
   try {
@@ -385,6 +505,52 @@ test("handoff leaves three-way conflicts and preserves the source worktree", asy
     assert.equal(result.cleanup.worktreeRemoved, false);
     assert.equal(await readFile(join(fixture.parent, "a.txt"), "utf8").then((text) => text.includes("<<<<<<< ours")), true);
     assert.equal(await readFile(join(fixture.worker, "a.txt"), "utf8"), "one\nworker\nthree\n");
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
+test("cleanup checks source Git operations before closing the worker pane", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeFile(join(fixture.worker, "a.txt"), "one\napplied\nthree\n");
+    const mergeHeadPath = await git(fixture.worker, "rev-parse", "--git-path", "MERGE_HEAD");
+    const branchRef = `refs/heads/${fixture.branch}`;
+    let injectedOperation = false;
+    let closeCalled = false;
+    const pi = {
+      exec: async (command, args, options) => {
+        if (command !== "supacode") {
+          const result = await execResult(command, args, options);
+          if (
+            command === "git" && !injectedOperation && result.code === 0 &&
+            args.includes("rev-parse") && args.includes("--verify") && args.includes(branchRef)
+          ) {
+            injectedOperation = true;
+            await writeFile(mergeHeadPath, `${fixture.baseSha}\n`);
+          }
+          return result;
+        }
+        if (args[0] === "worktree" && args[1] === "list") {
+          return { stdout: `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "close") {
+          closeCalled = true;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
+      },
+    };
+
+    const prepared = await prepareDelegateHandoff(pi, JOB_ID, undefined, fixture.agentDir);
+    const result = await applyPreparedDelegateHandoff(pi, prepared);
+
+    assert.equal(result.state, "applied");
+    assert.equal(injectedOperation, true);
+    assert.equal(closeCalled, false);
+    assert.equal(result.cleanup.worktreeRemoved, false);
+    assert.equal(result.cleanup.errors.some((error) => error.includes("active Git operation")), true);
+    assert.equal(await readFile(join(fixture.parent, "a.txt"), "utf8"), "one\napplied\nthree\n");
   } finally {
     await removeFixture(fixture);
   }

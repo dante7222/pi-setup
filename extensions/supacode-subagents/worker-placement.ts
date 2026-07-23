@@ -6,7 +6,7 @@ export function workerTabWorktreeId(
   codeWorktreeId?: string,
 ): string {
   if (mode === "research") return parentWorktreeId;
-  if (!codeWorktreeId) throw new Error("Coding worker has no isolated Supacode worktree ID.");
+  if (!codeWorktreeId) throw new Error("Coding worker has no separate Supacode worktree ID.");
   return codeWorktreeId;
 }
 

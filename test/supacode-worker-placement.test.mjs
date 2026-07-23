@@ -10,11 +10,11 @@ test("research workers stay in the parent Supacode worktree", () => {
   assert.equal(workerTabWorktreeId("research", "parent", undefined), "parent");
 });
 
-test("coding workers place their tab in their isolated Supacode worktree", () => {
+test("coding workers place their tab in their separate Supacode worktree", () => {
   assert.equal(workerTabWorktreeId("coding", "parent", "worker"), "worker");
   assert.throws(
     () => workerTabWorktreeId("coding", "parent", undefined),
-    /no isolated Supacode worktree ID/,
+    /no separate Supacode worktree ID/,
   );
 });
 

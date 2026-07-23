@@ -288,6 +288,22 @@ export function permissionRequestsForTool(
     return deduplicate(requests);
   }
 
+  if (name === "delegate_loop") {
+    requests.push({ permission: "task", resource: "coding" });
+    const checks = input.checks;
+    if (!Array.isArray(checks) || checks.length === 0) {
+      throw new Error("delegate_loop.checks must be a non-empty array");
+    }
+    for (const check of checks) {
+      if (!isRecord(check)) throw new Error("delegate_loop.checks entries must be objects");
+      const command = requiredString(check, "command", "delegate_loop check");
+      for (const resource of bashPermissionResources(command)) {
+        requests.push({ permission: "bash", resource });
+      }
+    }
+    return deduplicate(requests);
+  }
+
   if (name === "delegate_apply") {
     return [{ permission: "task", resource: "apply" }];
   }

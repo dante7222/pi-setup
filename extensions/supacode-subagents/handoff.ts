@@ -33,6 +33,9 @@ interface StoredCodingJob {
   tabId: string;
   surfaceId: string;
   createdAt?: string;
+  delegateLoop: boolean;
+  loopState?: string;
+  acceptedTree?: string;
   jobDir: string;
   workerState: WorkerCompletionState;
 }
@@ -143,6 +146,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function stringValue(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function booleanValue(record: Record<string, unknown>, key: string): boolean {
+  return record[key] === true;
 }
 
 function diagnosticText(result: CommandResult): string {
@@ -346,6 +353,9 @@ async function parseStoredJob(jobDir: string): Promise<StoredCodingJob | undefin
     tabId,
     surfaceId,
     createdAt: stringValue(record, "createdAt"),
+    delegateLoop: booleanValue(record, "delegateLoop"),
+    loopState: stringValue(record, "loopState"),
+    acceptedTree: stringValue(record, "acceptedTree"),
     jobDir,
     workerState: await readWorkerState(jobDir),
   };
@@ -453,7 +463,28 @@ async function currentBranch(
   return result.code === 0 ? result.stdout.trim() || undefined : undefined;
 }
 
-async function snapshotWorktreeTree(
+export async function gitlinkPathsForTree(
+  pi: ExtensionAPI,
+  root: string,
+  treeish: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const records = parseNulPaths(await gitStdout(
+    pi,
+    root,
+    ["ls-tree", "-r", "--full-tree", "-z", treeish, "--"],
+    signal,
+  ));
+  return records
+    .filter((record) => record.startsWith("160000 "))
+    .map((record) => {
+      const separator = record.indexOf("\t");
+      if (separator < 0) throw new Error("Git returned a malformed gitlink entry.");
+      return record.slice(separator + 1);
+    });
+}
+
+export async function snapshotWorktreeTree(
   pi: ExtensionAPI,
   root: string,
   head: string,
@@ -486,10 +517,11 @@ async function statusPaths(
   );
 }
 
-async function repositoryOperationBlockers(
+export async function repositoryOperationBlockers(
   pi: ExtensionAPI,
   root: string,
   signal?: AbortSignal,
+  checkoutLabel = "Destination",
 ): Promise<string[]> {
   const blockers: string[] = [];
   const unmerged = parseNulPaths(await gitStdout(
@@ -499,7 +531,7 @@ async function repositoryOperationBlockers(
     signal,
   ));
   if (unmerged.length > 0) {
-    blockers.push(`Destination has unresolved conflicts: ${unmerged.map(displayPath).join(", ")}`);
+    blockers.push(`${checkoutLabel} has unresolved conflicts: ${unmerged.map(displayPath).join(", ")}`);
   }
 
   for (const marker of [
@@ -509,10 +541,12 @@ async function repositoryOperationBlockers(
     "REBASE_HEAD",
     "rebase-merge",
     "rebase-apply",
+    "sequencer",
+    "BISECT_START",
   ]) {
     const markerPath = await gitOutput(pi, root, ["rev-parse", "--git-path", marker], signal);
     if (await pathExists(path.resolve(root, markerPath))) {
-      blockers.push(`Destination has an active Git operation (${marker}).`);
+      blockers.push(`${checkoutLabel} has an active Git operation (${marker}).`);
     }
   }
   return blockers;
@@ -657,6 +691,15 @@ export async function prepareDelegateHandoff(
     codeWorktreeId: sourceWorktreeId,
     tabWorktreeId: sourceWorktreeId,
   };
+  const sourceOperationBlockers = await repositoryOperationBlockers(
+    pi,
+    sourceRoot,
+    signal,
+    "Source checkout",
+  );
+  if (sourceOperationBlockers.length > 0) {
+    throw new Error(`Cannot hand off a source checkout with an active Git operation:\n${sourceOperationBlockers.join("\n")}`);
+  }
 
   const id = randomUUID();
   const draftDir = await fs.promises.mkdtemp(path.join(job.jobDir, `.handoff-${id}-`));
@@ -666,6 +709,23 @@ export async function prepareDelegateHandoff(
   try {
     const sourceHead = await gitOutput(pi, sourceRoot, ["rev-parse", "HEAD"], signal);
     const sourceTree = await snapshotWorktreeTree(pi, sourceRoot, sourceHead, indexPath, signal);
+    const gitlinkPaths = await gitlinkPathsForTree(pi, sourceRoot, sourceTree, signal);
+    if (gitlinkPaths.length > 0) {
+      throw new Error(
+        `Submodules and embedded Git repositories are not supported by delegated handoff: ${gitlinkPaths.map(displayPath).join(", ")}`,
+      );
+    }
+    if (job.delegateLoop) {
+      if (job.loopState !== "awaiting_apply") {
+        throw new Error(`Delegate loop is ${job.loopState ?? "missing its terminal state"}; only accepted loops can be applied.`);
+      }
+      if (!job.acceptedTree || !OBJECT_ID_PATTERN.test(job.acceptedTree)) {
+        throw new Error("Accepted delegate loop is missing a valid reviewed tree identity.");
+      }
+      if (sourceTree !== job.acceptedTree) {
+        throw new Error("Delegate loop worktree changed after acceptance; rerun checks and review before applying.");
+      }
+    }
 
     const patch = await gitResult(
       pi,
@@ -736,7 +796,13 @@ export async function prepareDelegateHandoff(
     if (job.workerState !== "completed") warnings.push(`Worker state is ${job.workerState}; changes may be incomplete.`);
     if (!baseIsAncestor) warnings.push("Delegation base is not an ancestor of the worker HEAD.");
     if (sourceStatus) warnings.push("The patch includes the worker's final uncommitted filesystem state.");
-    if (targetHead !== job.baseSha) warnings.push("Destination HEAD advanced or changed since delegation; Git will use a three-way apply.");
+    if (targetHead !== job.baseSha) {
+      if (job.delegateLoop) {
+        blockers.push("Destination HEAD changed since the loop was reviewed; rerun the loop against the current destination.");
+      } else {
+        warnings.push("Destination HEAD advanced or changed since delegation; Git will use a three-way apply.");
+      }
+    }
     if (targetStatus && blockedPaths.length === 0) warnings.push("Unrelated destination working-tree changes will be preserved.");
 
     return {
@@ -825,7 +891,11 @@ async function currentPreflightBlockers(
   prepared: PreparedDelegateHandoff,
   signal?: AbortSignal,
 ): Promise<{ blockers: string[]; blockedPaths: string[] }> {
-  const blockers = await repositoryOperationBlockers(pi, prepared.targetRoot, signal);
+  const [destinationBlockers, sourceBlockers] = await Promise.all([
+    repositoryOperationBlockers(pi, prepared.targetRoot, signal),
+    repositoryOperationBlockers(pi, prepared.sourceRoot, signal, "Source checkout"),
+  ]);
+  const blockers = [...destinationBlockers, ...sourceBlockers];
   const currentHead = await gitOutput(pi, prepared.targetRoot, ["rev-parse", "HEAD"], signal);
   const branch = await currentBranch(pi, prepared.targetRoot, signal);
   if (currentHead !== prepared.targetHead || branch !== prepared.targetBranch) {
@@ -1087,6 +1157,21 @@ async function cleanupAppliedWorktree(
     errors,
   });
 
+  const sourceOperationBlockersBeforeClose = await pathExists(prepared.sourceRoot)
+    ? await repositoryOperationBlockers(
+        pi,
+        prepared.sourceRoot,
+        undefined,
+        "Source checkout",
+      )
+    : [];
+  if (sourceOperationBlockersBeforeClose.length > 0) {
+    errors.push("Worker cleanup stopped because its source checkout has an active Git operation.");
+    errors.push(...sourceOperationBlockersBeforeClose);
+    errors.push(`Worker recovery ref retained at ${backup.ref}.`);
+    return retained(false);
+  }
+
   const pane = await closeWorkerPane(pi, prepared.job);
   if (!pane.closed) {
     if (pane.error) errors.push(pane.error);
@@ -1111,6 +1196,19 @@ async function cleanupAppliedWorktree(
       preservedHead: prepared.sourceHead,
       errors,
     };
+  }
+
+  const sourceOperationBlockers = await repositoryOperationBlockers(
+    pi,
+    prepared.sourceRoot,
+    undefined,
+    "Source checkout",
+  );
+  if (sourceOperationBlockers.length > 0) {
+    errors.push("Worker cleanup stopped because its source checkout has an active Git operation.");
+    errors.push(...sourceOperationBlockers);
+    errors.push(`Worker recovery ref retained at ${backup.ref}.`);
+    return retained(true);
   }
 
   try {

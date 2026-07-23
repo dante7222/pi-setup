@@ -150,6 +150,19 @@ test("subagents use task permission with one resource per mode", () => {
       { permission: "task", resource: "coding" },
     ],
   );
+  assert.deepEqual(
+    permissionRequestsForTool(
+      "delegate_loop",
+      { checks: [{ command: "npm test && npm run lint" }, { command: "git diff --check" }] },
+      "/repo",
+    ),
+    [
+      { permission: "task", resource: "coding" },
+      { permission: "bash", resource: "npm test" },
+      { permission: "bash", resource: "npm run lint" },
+      { permission: "bash", resource: "git diff --check" },
+    ],
+  );
   assert.deepEqual(permissionRequestsForTool("delegate_apply", { jobId: "abcd" }, "/repo"), [
     { permission: "task", resource: "apply" },
   ]);
