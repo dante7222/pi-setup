@@ -143,6 +143,10 @@ The extension requires the parent Pi session to run inside a Supacode terminal. 
 
 ## Local development
 
+The active `pi` executable on `PATH` is the development-runtime source of truth. `npm test` and `npm run typecheck` first run the runtime synchronizer, which skips this project's `node_modules/.bin`, reads the exact `pi-ai`, `pi-coding-agent`, `pi-tui`, and TypeBox versions bundled with the active Pi installation, and synchronizes the exact local development dependencies and lockfile. Without an external Pi executable, validation uses the committed local pins without network access. Published compatibility remains expressed through `"*"` peer ranges. After upgrading Pi, the next local validation updates `package.json` and `package-lock.json`; review and commit those generated changes. Set `PI_RUNTIME_BIN` to an explicit Pi executable when testing a non-default installation.
+
+Delegated jobs also record the parent process's Pi CLI path and loaded Pi version. A worker verifies that exact runtime before starting and fails with a restart instruction rather than mixing Pi versions after an in-place update. Restart the parent Pi process after upgrading; `/reload` cannot replace its already-loaded core runtime.
+
 Install this checkout globally by path:
 
 ```bash

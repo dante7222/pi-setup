@@ -1,32 +1,29 @@
 import assert from "node:assert/strict";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire, registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   publishWorkerReport,
   writeRunnerProcess,
 } from "../extensions/supacode-subagents/lifecycle.ts";
 
-const globalModules = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
-const piRoot = join(globalModules, "@earendil-works", "pi-coding-agent");
+const projectRoot = fileURLToPath(new URL("../", import.meta.url));
+const piRoot = join(projectRoot, "node_modules", "@earendil-works", "pi-coding-agent");
 const runtimePackages = new Map([
-  ["@earendil-works/pi-ai", join(piRoot, "node_modules", "@earendil-works", "pi-ai", "dist", "index.js")],
+  ["@earendil-works/pi-ai", join(piRoot, "node_modules", "@earendil-works", "pi-ai", "dist", "compat.js")],
   ["@earendil-works/pi-coding-agent", join(piRoot, "dist", "index.js")],
+  ["@earendil-works/pi-tui", join(piRoot, "node_modules", "@earendil-works", "pi-tui", "dist", "index.js")],
   ["typebox", join(piRoot, "node_modules", "typebox", "build", "index.mjs")],
 ]);
 registerHooks({
   resolve(specifier, context, nextResolve) {
-    try {
-      return nextResolve(specifier, context);
-    } catch (error) {
-      const filePath = runtimePackages.get(specifier);
-      if (filePath) return { url: pathToFileURL(filePath).href, shortCircuit: true };
-      throw error;
-    }
+    const filePath = runtimePackages.get(specifier);
+    if (filePath) return { url: pathToFileURL(filePath).href, shortCircuit: true };
+    return nextResolve(specifier, context);
   },
 });
 const {
@@ -231,6 +228,7 @@ test("delegate_loop repairs and accepts one Git tree attested by every check and
     };
     const tools = new Map();
     supacodeSubagents({
+      __supacodePiExecutableForTests: process.execPath,
       exec: (command, args, options) => command === "supacode"
         ? supacodeExec(args)
         : execResult(command, args, options),
@@ -327,6 +325,10 @@ test("generated worker runner launches interactive Pi with quoted paths", async 
     const metadataPath = join(root, "metadata.txt");
     const fakePiPath = join(binDir, "pi");
     await writeFile(fakePiPath, `#!/bin/zsh
+if [[ "$1" == "--version" ]]; then
+  printf '%s\\n' "\${FAKE_PI_VERSION:-0.82.0}"
+  exit 0
+fi
 printf '%s\\0' "$@" > "$ARGS_PATH"
 printf '%s\\n' "$PI_PERMISSION_CONFIG" > "$ENVIRONMENT_PATH"
 printf '%s\\n' 'fake interactive worker response'
@@ -357,6 +359,10 @@ fs.appendFileSync(process.env.META_PATH, process.argv.slice(2).join(":") + "\\n"
       thinking: "high",
       yolo: true,
       projectTrusted: true,
+      piRuntime: {
+        executable: fakePiPath,
+        version: "0.82.0",
+      },
       originalCwd: workerCwd,
       workerCwd,
       jobDir,
@@ -420,6 +426,23 @@ fs.appendFileSync(process.env.META_PATH, process.argv.slice(2).join(":") + "\\n"
     });
     assert.equal(failed.code, 37);
     assert.equal(await readFile(metadataPath, "utf8"), "start\nexit:37\n");
+
+    await writeFile(metadataPath, "");
+    const mismatched = await execResult("/bin/zsh", [runnerPath], {
+      cwd: workerCwd,
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        ARGS_PATH: argsPath,
+        ENVIRONMENT_PATH: environmentPath,
+        META_PATH: metadataPath,
+        FAKE_PI_VERSION: "0.83.0",
+      },
+      timeout: 10_000,
+    });
+    assert.equal(mismatched.code, 74);
+    assert.match(mismatched.stderr, /expected 0\.82\.0, found 0\.83\.0/);
+    assert.equal(await readFile(metadataPath, "utf8"), "start\nexit:74\n");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

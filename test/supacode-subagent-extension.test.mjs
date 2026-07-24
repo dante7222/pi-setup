@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire, registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   claimJobDecision,
   claimWorkerTerminal,
@@ -23,22 +23,19 @@ import {
 } from "../extensions/supacode-subagents/lifecycle.ts";
 import { captureProcessIdentity, inspectProcessIdentity } from "../extensions/supacode-subagents/process-identity.ts";
 
-const globalModules = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
-const piRoot = join(globalModules, "@earendil-works", "pi-coding-agent");
+const projectRoot = fileURLToPath(new URL("../", import.meta.url));
+const piRoot = join(projectRoot, "node_modules", "@earendil-works", "pi-coding-agent");
 const runtimePackages = new Map([
-  ["@earendil-works/pi-ai", join(piRoot, "node_modules", "@earendil-works", "pi-ai", "dist", "index.js")],
+  ["@earendil-works/pi-ai", join(piRoot, "node_modules", "@earendil-works", "pi-ai", "dist", "compat.js")],
   ["@earendil-works/pi-coding-agent", join(piRoot, "dist", "index.js")],
+  ["@earendil-works/pi-tui", join(piRoot, "node_modules", "@earendil-works", "pi-tui", "dist", "index.js")],
   ["typebox", join(piRoot, "node_modules", "typebox", "build", "index.mjs")],
 ]);
 registerHooks({
   resolve(specifier, context, nextResolve) {
-    try {
-      return nextResolve(specifier, context);
-    } catch (error) {
-      const filePath = runtimePackages.get(specifier);
-      if (filePath) return { url: pathToFileURL(filePath).href, shortCircuit: true };
-      throw error;
-    }
+    const filePath = runtimePackages.get(specifier);
+    if (filePath) return { url: pathToFileURL(filePath).href, shortCircuit: true };
+    return nextResolve(specifier, context);
   },
 });
 const { default: supacodeSubagents } = createRequire(import.meta.url)("../extensions/supacode-subagents/index.ts");
@@ -76,6 +73,7 @@ function registerExtension(execute = execResult) {
   const commands = new Map();
   const pi = {
     exec: execute,
+    __supacodePiExecutableForTests: process.execPath,
     __supacodeLaunchForTests: (args, options) => execute("supacode", args, options),
     getSessionName: () => "test",
     getThinkingLevel: () => "medium",

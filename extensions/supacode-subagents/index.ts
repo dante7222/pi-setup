@@ -14,6 +14,7 @@ import {
   getAgentDir,
   truncateHead,
   truncateTail,
+  VERSION,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -179,6 +180,11 @@ interface WorkerSpec {
   workingDirectory?: string;
 }
 
+interface PiRuntime {
+  executable: string;
+  version: string;
+}
+
 interface WorkerStatus {
   state: WorkerState;
   pid?: number;
@@ -204,6 +210,7 @@ interface WorkerJob {
   thinking: ThinkingLevel;
   yolo: boolean;
   projectTrusted: boolean;
+  piRuntime: PiRuntime;
   permissionConfigPath?: string;
   disableContextFiles?: boolean;
   disableProjectFiles?: boolean;
@@ -271,6 +278,7 @@ type ExtensionAPIWithLaunchTestHook = ExtensionAPI & {
     args: string[],
     options: SupacodeLaunchOptions,
   ) => Promise<SupacodeLaunchResult>;
+  __supacodePiExecutableForTests?: string;
   __supacodePublishWorkerReportForTests?: (
     jobDir: string,
     jobId: string,
@@ -421,6 +429,7 @@ interface LoopWorkspace {
   thinking: ThinkingLevel;
   yolo: boolean;
   projectTrusted: boolean;
+  piRuntime: PiRuntime;
   permissionConfigPath?: string;
   createdAt: string;
 }
@@ -483,6 +492,31 @@ function makeBatchTitle(parentLabel: string, batchId: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function parentPiRuntime(pi: ExtensionAPI): PiRuntime {
+  const testExecutable = (pi as ExtensionAPIWithLaunchTestHook).__supacodePiExecutableForTests;
+  if (testExecutable) return { executable: path.resolve(testExecutable), version: VERSION };
+  const argvPath = process.argv[1];
+  if (!argvPath) throw new Error("Could not identify the Pi CLI executable for delegated workers.");
+  const executable = fs.realpathSync(path.resolve(argvPath));
+  fs.accessSync(executable, fs.constants.X_OK);
+  let directory = path.dirname(executable);
+  while (true) {
+    const manifestPath = path.join(directory, "package.json");
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { name?: unknown };
+      if (manifest.name === "@earendil-works/pi-coding-agent") {
+        return { executable, version: VERSION };
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  throw new Error(`The current entry point is not inside a Pi installation: ${executable}.`);
 }
 
 function normalizeReviewerPrompt(profileId: string, prompt: string): string {
@@ -1012,7 +1046,7 @@ if (phase === "start") {
 
 export function buildRunner(job: PreparedWorkerJob): string {
   const args = [
-    "pi",
+    job.piRuntime.executable,
     "--no-session",
     "--name",
     job.title,
@@ -1034,6 +1068,8 @@ export function buildRunner(job: PreparedWorkerJob): string {
 set -u
 JOB_DIR=${shellQuote(job.jobDir)}
 STDERR_PATH=${shellQuote(job.stderrPath)}
+PI_EXECUTABLE=${shellQuote(job.piRuntime.executable)}
+EXPECTED_PI_VERSION=${shellQuote(job.piRuntime.version)}
 cd -- ${shellQuote(job.workerCwd)} || exit 72
 export ${WORKER_JOB_ENV}="$JOB_DIR"
 ${job.permissionConfigPath ? `export ${PERMISSION_CONFIG_ENV}=${shellQuote(job.permissionConfigPath)}` : ""}
@@ -1041,8 +1077,18 @@ touch "$STDERR_PATH"
 node ${shellQuote(job.runnerMetadataPath)} start || exit 73
 printf '\\n[supacode-subagent %s] %s\\n\\n' ${shellQuote(job.batchId.slice(0, 4))} ${shellQuote(job.title)}
 set +e
-${command} 2> >(tee -a "$STDERR_PATH" >&2)
-EXIT_CODE=$?
+PI_RUNTIME_VERSION=$("$PI_EXECUTABLE" --version 2> >(tee -a "$STDERR_PATH" >&2))
+VERSION_EXIT_CODE=$?
+if (( VERSION_EXIT_CODE != 0 )); then
+  printf 'Pi runtime preflight failed with exit code %s.\\n' "$VERSION_EXIT_CODE" | tee -a "$STDERR_PATH" >&2
+  EXIT_CODE=74
+elif [[ "$PI_RUNTIME_VERSION" != "$EXPECTED_PI_VERSION" ]]; then
+  printf 'Pi runtime changed after worker preparation: expected %s, found %s. Restart the parent Pi session.\\n' "$EXPECTED_PI_VERSION" "$PI_RUNTIME_VERSION" | tee -a "$STDERR_PATH" >&2
+  EXIT_CODE=74
+else
+  ${command} 2> >(tee -a "$STDERR_PATH" >&2)
+  EXIT_CODE=$?
+fi
 node ${shellQuote(job.runnerMetadataPath)} exit "$EXIT_CODE" || true
 exit "$EXIT_CODE"
 `;
@@ -1333,6 +1379,7 @@ async function prepareWorker(
   const projectTrusted = spec.mode === "research" && !spec.disableProjectFiles && spec.workingDirectory === undefined
     ? spec.projectTrusted
     : false;
+  const piRuntime = parentPiRuntime(pi);
   const jobDir = path.join(getAgentDir(), "subagents", batchId, id);
   await ensureDirectoryDurable(jobDir);
   await fs.promises.chmod(jobDir, 0o700);
@@ -1348,6 +1395,7 @@ async function prepareWorker(
       title,
       mode: spec.mode,
       projectTrusted,
+      piRuntime,
       originalCwd: ctxCwd,
       workerCwd: spec.workingDirectory ?? ctxCwd,
       launchNonce,
@@ -1487,6 +1535,7 @@ async function prepareWorker(
     thinking: spec.thinking ?? "medium",
     yolo,
     projectTrusted,
+    piRuntime,
     permissionConfigPath,
     disableContextFiles: spec.disableContextFiles,
     disableProjectFiles: spec.disableProjectFiles,
@@ -1557,6 +1606,7 @@ async function writeJobMetadata(
       thinking: job.thinking,
       yolo: job.yolo,
       projectTrusted: job.projectTrusted,
+      piRuntime: job.piRuntime,
       permissionConfigPath: job.permissionConfigPath,
       disableContextFiles: job.disableContextFiles,
       disableProjectFiles: job.disableProjectFiles,
@@ -2656,6 +2706,7 @@ async function prepareLoopWorkerAttempt(
     thinking: workspace.thinking,
     yolo: workspace.yolo,
     projectTrusted: workspace.projectTrusted,
+    piRuntime: workspace.piRuntime,
     permissionConfigPath: workspace.permissionConfigPath,
     originalCwd: workspace.originalCwd,
     workerCwd: workspace.workerCwd,
@@ -3765,6 +3816,7 @@ async function createLoopWorkspace(
 ): Promise<LoopWorkspace> {
   await assertCleanLoopParent(pi, ctxCwd, signal);
   const projectTrusted = false;
+  const piRuntime = parentPiRuntime(pi);
   const id = randomUUID();
   const batchId = randomUUID();
   const title = taskTitle(options.task, options.title);
@@ -3793,6 +3845,7 @@ async function createLoopWorkspace(
     reviewerTimeoutSeconds: options.reviewerTimeoutSeconds,
     keepOpen: options.keepOpen,
     projectTrusted,
+    piRuntime,
     workspacePlan: worktreePlan,
     worktreeCreationProtocolVersion: 1,
     worktreeLaunchDir: worktreeCreation.launchDir,
@@ -3811,6 +3864,7 @@ async function createLoopWorkspace(
       title,
       mode: "coding",
       projectTrusted,
+      piRuntime,
       originalCwd: ctxCwd,
       branch: worktreePlan.branch,
       baseSha: worktreePlan.baseSha,
@@ -3892,6 +3946,7 @@ async function createLoopWorkspace(
     thinking: options.thinking,
     yolo,
     projectTrusted,
+    piRuntime,
     permissionConfigPath: resolvePermissionConfigPath(process.env[PERMISSION_CONFIG_ENV], ctxCwd),
     createdAt,
   } satisfies LoopWorkspace;

@@ -5,7 +5,10 @@
   "type": "module",
   "description": "Personal Pi extensions, skills, prompts, and themes.",
   "scripts": {
+    "sync-pi-runtime": "node scripts/sync-pi-runtime.mjs --require-active",
+    "pretest": "node scripts/sync-pi-runtime.mjs",
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types --test test/*.test.mjs",
+    "pretypecheck": "node scripts/sync-pi-runtime.mjs",
     "typecheck": "tsc -p tsconfig.json"
   },
   "keywords": [
@@ -13,7 +16,11 @@
   ],
   "license": "MIT",
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.82.0",
+    "@earendil-works/pi-coding-agent": "0.82.0",
+    "@earendil-works/pi-tui": "0.82.0",
     "@types/node": "25.5.0",
+    "typebox": "1.1.38",
     "typescript": "6.0.2"
   },
   "peerDependencies": {
