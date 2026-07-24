@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { durableAtomicWrite, readJsonStrict } from "./durable-state.ts";
+import { durableAtomicWrite, ensureDirectoryDurable, readJsonStrict } from "./durable-state.ts";
 import {
   gitlinkPathsForTree,
   repositoryOperationBlockers,
@@ -280,7 +280,7 @@ export async function createCandidateCheckout(
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const lifecyclePath = path.join(path.dirname(checkoutPath), "checkout-lifecycle.json");
-  await fs.promises.mkdir(path.dirname(checkoutPath), { recursive: true, mode: 0o700 });
+  await ensureDirectoryDurable(path.dirname(checkoutPath));
   await durableAtomicWrite(
     lifecyclePath,
     `${JSON.stringify({

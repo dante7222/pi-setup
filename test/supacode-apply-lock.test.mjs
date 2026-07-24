@@ -111,7 +111,11 @@ test("stale destination locks require process-identity proof before recovery", a
       acquiredAt: new Date().toISOString(),
     }, "stale-lock.json");
     await gitDir(fixture.gitDir, "update-ref", lockRef, staleObject, "0".repeat(staleObject.length));
-    const recovered = await recoverStaleDestinationApplyLock(fixture.gitDir);
+    await assert.rejects(
+      recoverStaleDestinationApplyLock(fixture.gitDir, async () => false),
+      /child process absence is not verified/,
+    );
+    const recovered = await recoverStaleDestinationApplyLock(fixture.gitDir, async () => true);
     assert.equal(recovered.recovered, true);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });

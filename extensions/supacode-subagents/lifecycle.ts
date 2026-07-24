@@ -10,6 +10,7 @@ import {
 import type { ProcessIdentity } from "./process-identity.ts";
 
 export const SUBAGENT_SCHEMA_VERSION = 2;
+const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 
 export type JobLifecyclePhase =
   | "planned"
@@ -446,18 +447,25 @@ export async function readWorkerReport<TStatus>(
   const filePath = path.join(jobDir, "worker-report.json");
   const record = await readJsonStrict<WorkerReportRecord<TStatus>>(filePath);
   if (!record) return undefined;
-  const resolvedJobDir = path.resolve(jobDir);
-  const resolvedResultFile = typeof record.resultFile === "string"
+  const resolvedJobDir = await fs.promises.realpath(jobDir);
+  const lexicalResultFile = typeof record.resultFile === "string"
     ? path.resolve(record.resultFile)
+    : "";
+  const resolvedResultFile = lexicalResultFile
+    ? await fs.promises.realpath(lexicalResultFile)
+    : "";
+  const expectedResultFile = typeof record.reportToken === "string"
+    ? path.join(resolvedJobDir, "worker-reports", `${record.reportToken}.md`)
     : "";
   if (
     record.schemaVersion !== SUBAGENT_SCHEMA_VERSION ||
     typeof record.jobId !== "string" ||
     typeof record.launchNonce !== "string" || record.launchNonce.length === 0 ||
-    typeof record.reportToken !== "string" || typeof record.reportedAt !== "string" ||
+    typeof record.reportToken !== "string" || !UUID_PATTERN.test(record.reportToken) ||
+    typeof record.reportedAt !== "string" ||
     !isRecord(record.status) || typeof record.resultFile !== "string" ||
     !/^[a-f0-9]{64}$/i.test(record.resultSha256) ||
-    !resolvedResultFile.startsWith(`${resolvedJobDir}${path.sep}`) ||
+    resolvedResultFile !== expectedResultFile ||
     (expectedJobId !== undefined && record.jobId !== expectedJobId) ||
     (expectedLaunchNonce !== undefined && record.launchNonce !== expectedLaunchNonce)
   ) throw new Error(`Unsupported worker report metadata at ${filePath}.`);
@@ -504,8 +512,7 @@ export async function claimWorkerTerminal<TStatus>(
     if (!existing) throw new Error(`Terminal claim disappeared for ${jobId}.`);
     return { won: false, record: existing };
   }
-  await durableAtomicWrite(path.join(jobDir, "result.md"), normalizedOutput);
-  await durableAtomicWrite(path.join(jobDir, "status.json"), `${JSON.stringify(status)}\n`);
+  await restoreWorkerTerminalProjection(jobDir, record);
   return { won: true, record };
 }
 
@@ -514,19 +521,26 @@ export async function readWorkerTerminal<TStatus>(
 ): Promise<WorkerTerminalRecord<TStatus> | undefined> {
   const record = await readJsonStrict<WorkerTerminalRecord<TStatus>>(path.join(jobDir, "terminal.json"));
   if (!record) return undefined;
-  const resolvedJobDir = path.resolve(jobDir);
-  const resolvedResultFile = typeof record.resultFile === "string"
+  const resolvedJobDir = await fs.promises.realpath(jobDir);
+  const lexicalResultFile = typeof record.resultFile === "string"
     ? path.resolve(record.resultFile)
+    : "";
+  const resolvedResultFile = lexicalResultFile
+    ? await fs.promises.realpath(lexicalResultFile)
+    : "";
+  const expectedResultFile = typeof record.ownerToken === "string" && typeof record.owner === "string"
+    ? path.join(resolvedJobDir, "terminal-results", `${record.owner}-${record.ownerToken}.md`)
     : "";
   if (
     record.schemaVersion !== SUBAGENT_SCHEMA_VERSION ||
     typeof record.jobId !== "string" ||
     !["worker", "timeout", "abort", "cancel", "runner", "recovery"].includes(record.owner) ||
-    typeof record.ownerToken !== "string" || typeof record.claimedAt !== "string" ||
+    typeof record.ownerToken !== "string" || !UUID_PATTERN.test(record.ownerToken) ||
+    typeof record.claimedAt !== "string" ||
     !isRecord(record.status) ||
     typeof record.resultFile !== "string" ||
     !/^[a-f0-9]{64}$/i.test(record.resultSha256) ||
-    !resolvedResultFile.startsWith(`${resolvedJobDir}${path.sep}`)
+    resolvedResultFile !== expectedResultFile
   ) {
     throw new Error(`Unsupported terminal metadata in ${jobDir}.`);
   }
@@ -540,6 +554,15 @@ export async function readTerminalOutput(record: WorkerTerminalRecord): Promise<
     throw new Error(`Terminal result changed after claim: ${record.resultFile}`);
   }
   return output;
+}
+
+export async function restoreWorkerTerminalProjection(
+  jobDir: string,
+  record: WorkerTerminalRecord,
+): Promise<void> {
+  const output = await readTerminalOutput(record);
+  await durableAtomicWrite(path.join(jobDir, "result.md"), output);
+  await durableAtomicWrite(path.join(jobDir, "status.json"), `${JSON.stringify(record.status)}\n`);
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -559,10 +582,16 @@ export async function listLifecycleJobs(agentDir: string): Promise<LifecycleJobR
   for (const batch of batches) {
     if (!batch.isDirectory()) continue;
     const batchDir = path.join(root, batch.name);
-    const entries = await fs.promises.readdir(batchDir, { withFileTypes: true });
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(batchDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const jobDir = path.join(batchDir, entry.name);
+      try {
       const metadata = await readJsonStrict<Record<string, unknown>>(path.join(jobDir, "job.json"));
       if (!metadata || metadata.schemaVersion !== SUBAGENT_SCHEMA_VERSION) continue;
       const id = nonEmptyString(metadata.id);
@@ -570,12 +599,41 @@ export async function listLifecycleJobs(agentDir: string): Promise<LifecycleJobR
       const title = nonEmptyString(metadata.title);
       const mode = metadata.mode;
       if (!id || !batchId || !title || (mode !== "research" && mode !== "coding")) continue;
+      if (
+        entry.name.toLowerCase() !== id.toLowerCase() ||
+        batch.name.toLowerCase() !== batchId.toLowerCase()
+      ) throw new Error("Job metadata does not match its job and batch directories.");
       const configuredRuntimeDir = nonEmptyString(metadata.activeWorkerJobDir);
-      const resolvedJobDir = path.resolve(jobDir);
-      const runtimeDir = configuredRuntimeDir &&
-          path.resolve(configuredRuntimeDir).startsWith(`${resolvedJobDir}${path.sep}`)
-        ? path.resolve(configuredRuntimeDir)
-        : jobDir;
+      const resolvedJobDir = await fs.promises.realpath(jobDir);
+      const resolvedRuntimeDir = configuredRuntimeDir
+        ? await fs.promises.realpath(configuredRuntimeDir)
+        : resolvedJobDir;
+      if (
+        resolvedRuntimeDir !== resolvedJobDir &&
+        !resolvedRuntimeDir.startsWith(`${resolvedJobDir}${path.sep}`)
+      ) throw new Error("Active worker runtime directory escapes its job directory.");
+      const [lifecycle, terminal, decision, runtimeControl, rootControl] = await Promise.all([
+        readJobLifecycle(jobDir),
+        readWorkerTerminal(resolvedRuntimeDir),
+        readJobDecision(jobDir),
+        readJobControl(resolvedRuntimeDir),
+        resolvedRuntimeDir === resolvedJobDir ? Promise.resolve(undefined) : readJobControl(jobDir),
+      ]);
+      if (lifecycle && (lifecycle.jobId !== id || lifecycle.batchId !== batchId)) {
+        throw new Error("Lifecycle identity does not match job metadata.");
+      }
+      if (terminal && terminal.jobId !== id) {
+        throw new Error("Terminal identity does not match job metadata.");
+      }
+      if (decision && decision.jobId !== id) {
+        throw new Error("Decision identity does not match job metadata.");
+      }
+      if (runtimeControl && runtimeControl.jobId !== id) {
+        throw new Error("Runtime control identity does not match job metadata.");
+      }
+      if (rootControl && rootControl.jobId !== id) {
+        throw new Error("Root control identity does not match job metadata.");
+      }
       jobs.push({
         id,
         batchId,
@@ -584,11 +642,26 @@ export async function listLifecycleJobs(agentDir: string): Promise<LifecycleJobR
         jobDir,
         createdAt: nonEmptyString(metadata.createdAt),
         metadata,
-        lifecycle: await readJobLifecycle(jobDir),
-        terminal: await readWorkerTerminal(runtimeDir),
-        decision: await readJobDecision(jobDir),
-        control: await readJobControl(runtimeDir) ?? await readJobControl(jobDir),
+        lifecycle,
+        terminal,
+        decision,
+        control: runtimeControl ?? rootControl,
       });
+      } catch (error) {
+        if (/^[a-f0-9]{8}-[a-f0-9-]{27}$/i.test(entry.name)) {
+          jobs.push({
+            id: entry.name,
+            batchId: batch.name,
+            title: "corrupt delegation metadata",
+            mode: "research",
+            jobDir,
+            metadata: {
+              schemaVersion: SUBAGENT_SCHEMA_VERSION,
+              corruptMetadataError: error instanceof Error ? error.message : String(error),
+            },
+          });
+        }
+      }
     }
   }
   return jobs.sort((left, right) => (right.createdAt ?? "").localeCompare(left.createdAt ?? ""));
@@ -606,5 +679,8 @@ export async function resolveLifecycleJob(
     job.id.toLowerCase() === requested || job.id.toLowerCase().startsWith(requested));
   if (matches.length === 0) throw new Error(`No lifecycle job matches ${requestedId}.`);
   if (matches.length > 1) throw new Error(`Worker ID prefix ${requestedId} is ambiguous.`);
-  return matches[0];
+  const match = matches[0];
+  const metadataError = nonEmptyString(match.metadata.corruptMetadataError);
+  if (metadataError) throw new Error(`Lifecycle job ${match.id} metadata is corrupt: ${metadataError}`);
+  return match;
 }

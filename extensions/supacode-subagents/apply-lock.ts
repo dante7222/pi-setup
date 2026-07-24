@@ -164,6 +164,7 @@ export async function releaseDestinationApplyLock(lock: DestinationApplyLock): P
 
 export async function recoverStaleDestinationApplyLock(
   targetGitDir: string,
+  verifyOwnerResourcesAbsent?: (record: DestinationApplyLockRecord) => Promise<boolean>,
 ): Promise<{ recovered: boolean; message: string }> {
   const canonicalGitDir = canonicalGitDirectory(targetGitDir);
   const ref = lockRef(canonicalGitDir);
@@ -176,6 +177,9 @@ export async function recoverStaleDestinationApplyLock(
   const state = await inspectProcessIdentity(record.process);
   if (state === "alive" || state === "unknown") {
     throw new Error(`Destination apply lock owner is ${state}; recovery was refused.`);
+  }
+  if (verifyOwnerResourcesAbsent && !await verifyOwnerResourcesAbsent(record)) {
+    throw new Error("Destination apply child process absence is not verified; lock recovery was refused.");
   }
   const recovered = await gitCommand(canonicalGitDir, ["update-ref", "-d", ref, objectId]);
   if (recovered.code !== 0) {

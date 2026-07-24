@@ -232,6 +232,130 @@ test("handoff rejects worker terminal claims without an authenticated runner exi
   }
 });
 
+test("handoff rejects an ordinary cancel decision even when control publication was interrupted", async () => {
+  const fixture = await createFixture();
+  try {
+    await claimJobDecision(fixture.jobDir, JOB_ID, "cancel");
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /No coding worker matches|cancel/i,
+    );
+    await assert.rejects(readFile(join(fixture.jobDir, "control.json")));
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
+test("handoff binds terminal and lifecycle records to the selected job and batch", async () => {
+  const fixture = await createFixture();
+  try {
+    const terminalPath = join(fixture.jobDir, "terminal.json");
+    const terminal = JSON.parse(await readFile(terminalPath, "utf8"));
+    await writeFile(terminalPath, `${JSON.stringify({ ...terminal, jobId: "22222222-3333-4444-8555-666666666666" }, null, 2)}\n`);
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /terminal identity|metadata is corrupt/,
+    );
+
+    await writeFile(terminalPath, `${JSON.stringify({ ...terminal, status: {} }, null, 2)}\n`);
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /terminal status|metadata is corrupt/,
+    );
+
+    await writeFile(terminalPath, `${JSON.stringify(terminal, null, 2)}\n`);
+    const terminalOutput = await readFile(terminal.resultFile, "utf8");
+    const outsideResult = join(fixture.root, "outside-terminal.md");
+    await writeFile(outsideResult, terminalOutput);
+    await rm(terminal.resultFile);
+    await symlink(outsideResult, terminal.resultFile);
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /metadata is corrupt|terminal/i,
+    );
+    await rm(terminal.resultFile);
+    await writeFile(terminal.resultFile, terminalOutput);
+
+    const jobPath = join(fixture.jobDir, "job.json");
+    const job = JSON.parse(await readFile(jobPath, "utf8"));
+    const outsideRuntime = join(fixture.root, "outside-runtime");
+    const linkedRuntime = join(fixture.jobDir, "active-runtime");
+    await mkdir(outsideRuntime);
+    await symlink(outsideRuntime, linkedRuntime);
+    job.activeWorkerJobDir = linkedRuntime;
+    await writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`);
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /runtime directory escapes|metadata is corrupt/,
+    );
+    delete job.activeWorkerJobDir;
+    job.batchId = "aaaaaaab-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    await writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`);
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /lifecycle identity|metadata is corrupt/,
+    );
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
+test("handoff binds declared job identities to directory paths and rejects duplicates", async () => {
+  const fixture = await createFixture();
+  const misplacedId = "22222222-3333-4444-8555-666666666666";
+  const duplicateBatchId = "aaaaaaab-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  try {
+    const job = JSON.parse(await readFile(join(fixture.jobDir, "job.json"), "utf8"));
+    const misplacedDir = join(fixture.agentDir, "subagents", BATCH_ID, misplacedId);
+    await mkdir(misplacedDir, { recursive: true });
+    await writeFile(join(misplacedDir, "job.json"), `${JSON.stringify(job, null, 2)}\n`);
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, misplacedId, undefined, fixture.agentDir),
+      /metadata is corrupt|directories/,
+    );
+
+    const duplicateDir = join(fixture.agentDir, "subagents", duplicateBatchId, JOB_ID);
+    await mkdir(duplicateDir, { recursive: true });
+    await writeFile(join(duplicateDir, "job.json"), `${JSON.stringify({
+      ...job,
+      batchId: duplicateBatchId,
+    }, null, 2)}\n`);
+    await initializeJobLifecycle(duplicateDir, JOB_ID, duplicateBatchId, "completed");
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /ambiguous/,
+    );
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
+test("corrupt sibling coding metadata does not block a valid targeted handoff", async () => {
+  const fixture = await createFixture();
+  const corruptId = "22222222-3333-4444-8555-666666666666";
+  try {
+    const corruptDir = join(fixture.agentDir, "subagents", BATCH_ID, corruptId);
+    await mkdir(corruptDir, { recursive: true });
+    const validJob = JSON.parse(await readFile(join(fixture.jobDir, "job.json"), "utf8"));
+    await writeFile(join(corruptDir, "job.json"), `${JSON.stringify({
+      ...validJob,
+      id: corruptId,
+      branch: "pi-agent/aaaaaa/222222",
+    }, null, 2)}\n`);
+    await writeFile(join(corruptDir, "lifecycle.json"), "{not-json\n");
+    await writeFile(join(fixture.worker, "b.txt"), "worker change\n");
+
+    const prepared = await prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir);
+    await discardPreparedDelegateHandoff(prepared);
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, corruptId, undefined, fixture.agentDir),
+      /metadata is corrupt/,
+    );
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
 test("handoff preserves binary files, executable modes, and symlinks", async () => {
   const fixture = await createFixture();
   try {
@@ -801,6 +925,50 @@ test("handoff blocks overlapping destination changes without mutation", async ()
   }
 });
 
+test("initial conflict-index publication failure remains recoverable after manual staging", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeFile(join(fixture.worker, "a.txt"), "one\nworker\nthree\n");
+    await git(fixture.worker, "add", "a.txt");
+    await git(fixture.worker, "commit", "-m", "worker change");
+    await writeFile(join(fixture.parent, "a.txt"), "one\nparent\nthree\n");
+    await git(fixture.parent, "add", "a.txt");
+    await git(fixture.parent, "commit", "-m", "parent change");
+
+    const prepared = await prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir);
+    const indexPath = resolve(fixture.parent, await git(fixture.parent, "rev-parse", "--git-path", "index"));
+    const transactionPath = join(
+      prepared.targetGitDir,
+      "pi-delegate-handoffs",
+      "transactions",
+      prepared.id,
+      "transaction.json",
+    );
+    let injected = false;
+    fixture.pi.__beforeConflictIndexPublicationForTests = async () => {
+      await writeFile(`${indexPath}.lock`, "block publication\n");
+      injected = true;
+    };
+    const result = await applyPreparedDelegateHandoff(fixture.pi, prepared);
+    await rm(`${indexPath}.lock`, { force: true });
+
+    assert.equal(injected, true);
+    assert.equal(result.state, "conflicted", result.diagnostic);
+    assert.equal(JSON.parse(await readFile(transactionPath, "utf8")).conflictIndex.phase, "pending");
+    await writeFile(join(fixture.parent, "a.txt"), "one\nmanual resolution\nthree\n");
+    await git(fixture.parent, "add", "a.txt");
+    const recovered = await recoverDelegateApplyState(fixture.pi, fixture.parent);
+    assert.equal(
+      recovered.transactions.some((message) => message.includes("conflict resolution requires explicit confirmation")),
+      true,
+      JSON.stringify(recovered),
+    );
+    assert.equal(JSON.parse(await readFile(transactionPath, "utf8")).conflictIndex.phase, "superseded");
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
 test("handoff leaves three-way conflicts and preserves the source worktree", async () => {
   const fixture = await createFixture();
   try {
@@ -826,15 +994,103 @@ test("handoff leaves three-way conflicts and preserves the source worktree", asy
     assert.equal(await readFile(join(fixture.parent, "a.txt"), "utf8").then((text) => text.includes("<<<<<<< ours")), true);
     assert.equal(await readFile(join(fixture.worker, "a.txt"), "utf8"), "one\nworker\nthree\n");
 
+    const interruptedTransactionPath = join(
+      prepared.targetGitDir,
+      "pi-delegate-handoffs",
+      "transactions",
+      prepared.id,
+      "transaction.json",
+    );
+    const interruptedTransaction = JSON.parse(await readFile(interruptedTransactionPath, "utf8"));
+    delete interruptedTransaction.conflictIndex;
+    interruptedTransaction.state = "applying";
+    await writeFile(interruptedTransactionPath, `${JSON.stringify(interruptedTransaction, null, 2)}\n`);
+    await writeFile(
+      interruptedTransaction.baseline.indexPath,
+      await readFile(interruptedTransaction.baseline.indexBackupPath),
+    );
+    const interruptedManifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+    interruptedManifest.state = "applying";
+    await writeFile(result.manifestPath, `${JSON.stringify(interruptedManifest, null, 2)}\n`);
+    const resumedConflict = await recoverDelegateApplyState(fixture.pi, fixture.parent);
+    assert.equal(resumedConflict.transactions.some((message) => message.includes("conflicts remain unresolved")), true);
+    const resumedTransaction = JSON.parse(await readFile(interruptedTransactionPath, "utf8"));
+    assert.equal(resumedTransaction.state, "conflicted");
+    assert.equal(resumedTransaction.conflictIndex.phase, "published");
+
+    resumedTransaction.conflictIndex.phase = "pending";
+    await writeFile(interruptedTransactionPath, `${JSON.stringify(resumedTransaction, null, 2)}\n`);
+    const republished = await recoverDelegateApplyState(fixture.pi, fixture.parent);
+    assert.equal(republished.transactions.some((message) => message.includes("conflicts remain unresolved")), true);
+    const publishedTransaction = JSON.parse(await readFile(interruptedTransactionPath, "utf8"));
+    assert.equal(publishedTransaction.conflictIndex.phase, "published");
+
+    publishedTransaction.conflictIndex.phase = "pending";
+    await writeFile(interruptedTransactionPath, `${JSON.stringify(publishedTransaction, null, 2)}\n`);
     await git(fixture.parent, "checkout", "--ours", "--", "a.txt");
     await git(fixture.parent, "add", "a.txt");
-    const recovered = await recoverDelegateApplyState(fixture.pi, fixture.parent);
-    assert.equal(recovered.transactions.some((message) => message.includes(`${prepared.id}: resolved`)), true);
-    const transaction = JSON.parse(await readFile(
-      join(prepared.targetGitDir, "pi-delegate-handoffs", "transactions", prepared.id, "transaction.json"),
-      "utf8",
-    ));
+    const resolvedWhilePending = await recoverDelegateApplyState(fixture.pi, fixture.parent);
+    assert.equal(
+      resolvedWhilePending.transactions.some((message) => message.includes("conflict resolution requires explicit confirmation")),
+      true,
+      JSON.stringify(resolvedWhilePending),
+    );
+    assert.equal(
+      JSON.parse(await readFile(interruptedTransactionPath, "utf8")).conflictIndex.phase,
+      "superseded",
+    );
+
+    const victimPath = join(fixture.root, "must-not-be-replaced.txt");
+    await writeFile(victimPath, "unchanged\n");
+    const redirectedTransaction = {
+      ...publishedTransaction,
+      baseline: { ...publishedTransaction.baseline, indexPath: victimPath },
+      conflictIndex: { ...publishedTransaction.conflictIndex, phase: "pending" },
+    };
+    await writeFile(interruptedTransactionPath, `${JSON.stringify(redirectedTransaction, null, 2)}\n`);
+    const refusedRedirect = await recoverDelegateApplyState(fixture.pi, fixture.parent);
+    assert.equal(refusedRedirect.transactions.some((message) => message.includes("index path mismatch")), true);
+    assert.equal(await readFile(victimPath, "utf8"), "unchanged\n");
+    await writeFile(interruptedTransactionPath, `${JSON.stringify(publishedTransaction, null, 2)}\n`);
+
+    await git(fixture.parent, "checkout", "--ours", "--", "a.txt");
+    await git(fixture.parent, "add", "a.txt");
+    const pending = await recoverDelegateApplyState(fixture.pi, fixture.parent);
+    assert.equal(
+      pending.transactions.some((message) => message.includes("conflict resolution requires explicit confirmation")),
+      true,
+      JSON.stringify(pending),
+    );
+    const transactionPath = join(
+      prepared.targetGitDir,
+      "pi-delegate-handoffs",
+      "transactions",
+      prepared.id,
+      "transaction.json",
+    );
+    assert.equal(JSON.parse(await readFile(transactionPath, "utf8")).state, "conflicted");
+
+    const recovered = await recoverDelegateApplyState(fixture.pi, fixture.parent, undefined, true);
+    assert.equal(recovered.transactions.some((message) => message.includes(`${prepared.id}: resolved by explicit confirmation`)), true);
+    const transaction = JSON.parse(await readFile(transactionPath, "utf8"));
     assert.equal(transaction.state, "resolved");
+    const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+    assert.equal(manifest.state, "resolved");
+    assert.equal(JSON.parse(await readFile(transaction.resolutionIntentPath, "utf8")).tree.length, 40);
+
+    await writeFile(transactionPath, `${JSON.stringify({
+      ...transaction,
+      state: "conflicted",
+      resolutionIntentPath: undefined,
+    }, null, 2)}\n`);
+    await writeFile(result.manifestPath, `${JSON.stringify({ ...manifest, state: "conflicted" }, null, 2)}\n`);
+    const resumedAcceptance = await recoverDelegateApplyState(fixture.pi, fixture.parent);
+    assert.equal(
+      resumedAcceptance.transactions.some((message) => message.includes("resolved by explicit confirmation")),
+      true,
+      JSON.stringify(resumedAcceptance),
+    );
+    assert.equal(JSON.parse(await readFile(transactionPath, "utf8")).state, "resolved");
   } finally {
     await removeFixture(fixture);
   }
@@ -847,7 +1103,8 @@ test("cleanup checks source Git operations before closing the worker pane", asyn
     const mergeHeadPath = await git(fixture.worker, "rev-parse", "--git-path", "MERGE_HEAD");
     const branchRef = `refs/heads/${fixture.branch}`;
     let injectedOperation = false;
-    let closeCalled = false;
+    let paneClosed = false;
+    let worktreeDeleted = false;
     const pi = {
       exec: async (command, args, options) => {
         if (command !== "supacode") {
@@ -865,7 +1122,14 @@ test("cleanup checks source Git operations before closing the worker pane", asyn
           return { stdout: `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`, stderr: "", code: 0, killed: false };
         }
         if (args[0] === "surface" && args[1] === "close") {
-          closeCalled = true;
+          paneClosed = true;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "list") {
+          return { stdout: paneClosed ? "" : `${SURFACE_ID}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "worktree" && args[1] === "delete") {
+          worktreeDeleted = true;
           return { stdout: "", stderr: "", code: 0, killed: false };
         }
         return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
@@ -877,10 +1141,73 @@ test("cleanup checks source Git operations before closing the worker pane", asyn
 
     assert.equal(result.state, "applied");
     assert.equal(injectedOperation, true);
-    assert.equal(closeCalled, false);
+    assert.equal(paneClosed, false);
     assert.equal(result.cleanup.worktreeRemoved, false);
     assert.equal(result.cleanup.errors.some((error) => error.includes("active Git operation")), true);
     assert.equal(await readFile(join(fixture.parent, "a.txt"), "utf8"), "one\napplied\nthree\n");
+
+    await rm(mergeHeadPath, { force: true });
+    const recovered = await recoverDelegateApplyState(pi, fixture.parent);
+    assert.equal(
+      recovered.transactions.some((message) => message.includes(`${prepared.id}: applied handoff cleanup recovered`)),
+      true,
+      JSON.stringify(recovered),
+    );
+    assert.equal(paneClosed, true);
+    assert.equal(worktreeDeleted, true);
+    await assert.rejects(lstat(fixture.worker), { code: "ENOENT" });
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
+test("cleanup recovery accepts its authenticated preservation commit after interruption", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeFile(join(fixture.worker, "a.txt"), "one\napplied\nthree\n");
+    let paneClosed = false;
+    let failRemovalIdentity = true;
+    let worktreeDeleted = false;
+    const pi = {
+      exec: async (command, args, options) => {
+        if (command !== "supacode") return execResult(command, args, options);
+        if (args[0] === "surface" && args[1] === "close") {
+          paneClosed = true;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "list") {
+          return { stdout: paneClosed ? "" : `${SURFACE_ID}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "worktree" && args[1] === "list") {
+          if (paneClosed && failRemovalIdentity) {
+            failRemovalIdentity = false;
+            return { stdout: "", stderr: "simulated list failure", code: 1, killed: false };
+          }
+          return { stdout: `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "worktree" && args[1] === "delete") {
+          worktreeDeleted = true;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
+      },
+    };
+
+    const prepared = await prepareDelegateHandoff(pi, JOB_ID, undefined, fixture.agentDir);
+    const result = await applyPreparedDelegateHandoff(pi, prepared);
+    assert.equal(result.state, "applied");
+    assert.equal(result.cleanup.worktreeRemoved, false);
+    assert.ok(result.cleanup.preservedHead);
+    assert.equal(await git(fixture.worker, "rev-parse", "HEAD"), result.cleanup.preservedHead);
+
+    const recovered = await recoverDelegateApplyState(pi, fixture.parent);
+    assert.equal(
+      recovered.transactions.some((message) => message.includes(`${prepared.id}: applied handoff cleanup recovered`)),
+      true,
+      JSON.stringify(recovered),
+    );
+    assert.equal(worktreeDeleted, true);
+    await assert.rejects(lstat(fixture.worker), { code: "ENOENT" });
   } finally {
     await removeFixture(fixture);
   }

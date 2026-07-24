@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -40,6 +40,170 @@ test("surface monitoring confirms each missing worker independently", () => {
   );
 });
 
+test("recovery wins the durable launch claim before closing a surface whose runner never started", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-prelaunch-recovery-"));
+  const worker = {
+    id: "prelaunch-job",
+    jobDir,
+    tabWorktreeId: "/worktree",
+    tabId: "eeeeeeee-1111-4222-8333-ffffffffffff",
+    surfaceId: SECOND.surfaceId,
+    launchNonce: "prelaunch-nonce",
+  };
+  let closed = false;
+  try {
+    await writeFile(join(jobDir, "job.json"), `${JSON.stringify({ workerLaunchClaimVersion: 1 })}\n`);
+    const result = await terminateWorker({
+      exec: async (_command, args) => {
+        if (args[0] === "surface" && args[1] === "close") {
+          closed = true;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "list") {
+          return {
+            stdout: closed ? "" : `${SECOND.surfaceId}\n`,
+            stderr: "",
+            code: 0,
+            killed: false,
+          };
+        }
+        return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
+      },
+    }, worker);
+
+    assert.equal(result.verified, true);
+    assert.equal(result.processesAbsent, true);
+    assert.equal(result.surfaceAbsent, true);
+    const claim = JSON.parse(await readFile(join(jobDir, "worker-launch-claim.json"), "utf8"));
+    assert.equal(claim.schemaVersion, 2);
+    assert.equal(claim.jobId, worker.id);
+    assert.equal(claim.launchNonce, worker.launchNonce);
+    assert.equal(claim.owner, "recovery");
+    assert.equal(typeof claim.claimedAt, "string");
+  } finally {
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test("surface cleanup waits for creator exit and a Supacode barrier before reconciliation", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-surface-creator-"));
+  const launchDir = join(jobDir, "surface-launch");
+  const creator = spawn("/bin/zsh", ["-lc", "sleep 30"], { detached: true, stdio: "ignore" });
+  const worker = {
+    id: "surface-creator-job",
+    jobDir,
+    tabWorktreeId: "/worktree",
+    tabId: "eeeeeeee-1111-4222-8333-ffffffffffff",
+    surfaceId: SECOND.surfaceId,
+    launchNonce: "worker-launch-nonce",
+  };
+  const creatorNonce = "creator-launch-nonce";
+  let closed = false;
+  try {
+    const creatorIdentity = await captureProcessIdentity(creator.pid, creatorNonce, creator.pid);
+    assert.ok(creatorIdentity);
+    await writeRunnerProcess(launchDir, {
+      schemaVersion: 2,
+      jobId: `${worker.id}-surface-launch`,
+      launchNonce: creatorNonce,
+      wrapper: creatorIdentity,
+      startedAt: new Date().toISOString(),
+    });
+    await writeFile(join(jobDir, "job.json"), `${JSON.stringify({
+      workerLaunchClaimVersion: 1,
+      surfaceCreationProtocolVersion: 1,
+      surfaceLaunchDir: launchDir,
+      surfaceLaunchJobId: `${worker.id}-surface-launch`,
+      surfaceLaunchNonce: creatorNonce,
+    })}\n`);
+    const pi = {
+      exec: async (_command, args) => {
+        if (args[0] === "surface" && args[1] === "close") {
+          closed = true;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "list") {
+          return { stdout: closed ? "" : `${SECOND.surfaceId}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "worktree" && args[1] === "list") {
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
+      },
+    };
+    const unsettled = await terminateWorker(pi, worker);
+    assert.equal(unsettled.verified, false);
+    assert.equal(closed, false);
+    assert.equal(await inspectProcessIdentity(creatorIdentity), "alive");
+    assert.equal(
+      JSON.parse(await readFile(join(jobDir, "worker-launch-claim.json"), "utf8")).owner,
+      "recovery",
+    );
+
+    process.kill(-creator.pid, "SIGKILL");
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if (await inspectProcessIdentity(creatorIdentity) === "missing") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const settled = await terminateWorker(pi, worker);
+    assert.equal(settled.verified, true);
+    assert.equal(await inspectProcessIdentity(creatorIdentity), "missing");
+    assert.equal(JSON.parse(await readFile(join(jobDir, "worker-launch-claim.json"), "utf8")).owner, "recovery");
+    assert.equal(
+      JSON.parse(await readFile(join(launchDir, "creation-reconciled.json"), "utf8")).launchNonce,
+      creatorNonce,
+    );
+  } finally {
+    try { process.kill(-creator.pid, "SIGKILL"); } catch {}
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test("a runner-owned launch claim authenticates termination before runner metadata publication", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-runner-claim-"));
+  const child = spawn("/bin/zsh", ["-lc", "sleep 30"], { detached: true, stdio: "ignore" });
+  const worker = {
+    id: "runner-claim-job",
+    jobDir,
+    tabWorktreeId: "/worktree",
+    tabId: "eeeeeeee-1111-4222-8333-ffffffffffff",
+    surfaceId: SECOND.surfaceId,
+    launchNonce: "runner-claim-nonce",
+  };
+  let closed = false;
+  try {
+    const identity = await captureProcessIdentity(child.pid, worker.launchNonce, child.pid);
+    assert.ok(identity);
+    await writeFile(join(jobDir, "job.json"), `${JSON.stringify({ workerLaunchClaimVersion: 1 })}\n`);
+    await writeFile(join(jobDir, "worker-launch-claim.json"), `${JSON.stringify({
+      schemaVersion: 2,
+      jobId: worker.id,
+      launchNonce: worker.launchNonce,
+      owner: "runner",
+      wrapper: identity,
+      claimedAt: new Date().toISOString(),
+    })}\n`);
+    const result = await terminateWorker({
+      exec: async (_command, args) => {
+        if (args[0] === "surface" && args[1] === "close") {
+          closed = true;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "list") {
+          return { stdout: closed ? "" : `${SECOND.surfaceId}\n`, stderr: "", code: 0, killed: false };
+        }
+        return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
+      },
+    }, worker);
+
+    assert.equal(result.verified, true);
+    assert.equal(await inspectProcessIdentity(identity), "missing");
+  } finally {
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
 test("worker termination verifies both exact surface and recorded process group absence", async () => {
   const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-supervisor-"));
   const child = spawn("/bin/zsh", ["-lc", "sleep 30"], {
@@ -57,7 +221,10 @@ test("worker termination verifies both exact surface and recorded process group 
       wrapper: identity,
       startedAt: new Date().toISOString(),
     });
-    const mismatched = await verifyWorkerProcessesAbsent({
+    const verificationPi = {
+      exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    };
+    const mismatched = await verifyWorkerProcessesAbsent(verificationPi, {
       id: "job",
       jobDir,
       tabWorktreeId: "/worktree",
@@ -67,7 +234,7 @@ test("worker termination verifies both exact surface and recorded process group 
     }, identity);
     assert.equal(mismatched.absent, false);
     assert.deepEqual(mismatched.states, ["unknown"]);
-    const wrongJob = await verifyWorkerProcessesAbsent({
+    const wrongJob = await verifyWorkerProcessesAbsent(verificationPi, {
       id: "different-job",
       jobDir,
       tabWorktreeId: "/worktree",

@@ -40,7 +40,12 @@ import {
 } from "./candidate-tree.ts";
 import { codingWorkerCwd, repositoryRelativeCwd } from "./coding-context.ts";
 import { delegateToolText } from "./delegate-tool-text.ts";
-import { durableAppendJsonLine, durableAtomicWrite, readJsonStrict } from "./durable-state.ts";
+import {
+  durableAppendJsonLine,
+  durableAtomicWrite,
+  ensureDirectoryDurable,
+  readJsonStrict,
+} from "./durable-state.ts";
 import {
   decideLoopTransition,
   normalizeValidationCommand,
@@ -65,6 +70,7 @@ import {
   readWorkerReportOutput,
   readWorkerTerminal,
   reconcileJobLifecycle,
+  restoreWorkerTerminalProjection,
   resolveLifecycleJob,
   SUBAGENT_SCHEMA_VERSION,
   updateJobLifecycle,
@@ -93,13 +99,16 @@ import {
   workerTabWorktreeId,
 } from "./worker-placement.ts";
 import {
+  recordValidationGateIntent,
   runValidationProcess,
+  validationGateProvesCommandNeverLaunched,
   ValidationProcessFailure,
   type ValidationProcessResult,
 } from "./validation-process.ts";
 import { aggregateUsage } from "./usage.ts";
 import {
   observeWorkerSurfaces,
+  reconcileWorkerSurfaceCreation,
   terminateRecordedProcess,
   terminateWorker,
   verifyWorkerProcessesAbsent,
@@ -130,6 +139,27 @@ const CHECK_OUTPUT_TAIL_BYTES = 16 * 1024;
 const RESEARCH_TOOLS = "read,rg,find,ls";
 const CODING_TOOLS = "read,bash,edit,write,rg,find,ls";
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+const OBJECT_ID_PATTERN = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i;
+const WORKER_OUTPUT_FORMATTER_PATH = fileURLToPath(new URL("./worker-output.mjs", import.meta.url));
+const CREATION_COMPLETION_WRITER_PATH = fileURLToPath(new URL("./creation-complete.mjs", import.meta.url));
+
+class EvaluatorRecoveryFailure extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EvaluatorRecoveryFailure";
+  }
+}
+
+class BatchCleanupFailure extends Error {
+  readonly cleanupErrors: string[];
+
+  constructor(message: string, cleanupErrors: string[]) {
+    super(`${message} Cleanup requires recovery: ${cleanupErrors.join(" ")}`);
+    this.name = "BatchCleanupFailure";
+    this.cleanupErrors = cleanupErrors;
+  }
+}
 
 type WorkerMode = "research" | "coding";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -188,6 +218,15 @@ interface WorkerJob {
   runnerMetadataPath: string;
   runnerExitPath: string;
   launchNonce: string;
+  workerLaunchClaimVersion: 1;
+  surfaceCreationProtocolVersion: 1;
+  worktreeCreationProtocolVersion?: 1;
+  worktreeLaunchDir?: string;
+  worktreeLaunchJobId?: string;
+  worktreeLaunchNonce?: string;
+  observedCodeWorktreeId?: string;
+  observedWorktreePath?: string;
+  worktreeAuthenticationState?: "pending" | "verified";
   tabWorktreeId: string;
   codeWorktreeId?: string;
   worktreePath?: string;
@@ -211,6 +250,34 @@ interface WorkerBatch {
   title: string;
   worktreeId: string;
   tabId: string;
+}
+
+interface SupacodeLaunchResult {
+  stdout: string;
+  stderr: string;
+  code: number;
+  killed: boolean;
+}
+
+interface SupacodeLaunchOptions {
+  signal?: AbortSignal;
+  timeout: number;
+}
+
+type ExtensionAPIWithLaunchTestHook = ExtensionAPI & {
+  __supacodeLaunchForTests?: (
+    args: string[],
+    options: SupacodeLaunchOptions,
+  ) => Promise<SupacodeLaunchResult>;
+};
+
+interface SupacodeCreationCompletion {
+  schemaVersion: 2;
+  jobId: string;
+  launchNonce: string;
+  commandStarted: boolean;
+  exitCode: number;
+  completedAt: string;
 }
 
 interface GitCommitSummary {
@@ -296,6 +363,13 @@ interface LoopCheckResult {
 }
 
 type LoopCandidateEvidence = LoopCandidate;
+
+interface LoopAcceptanceIntent {
+  schemaVersion: 2;
+  jobId: string;
+  candidate: LoopCandidate;
+  createdAt: string;
+}
 
 interface LoopReviewResult {
   profileId: string;
@@ -477,6 +551,135 @@ async function readText(filePath: string): Promise<string> {
   }
 }
 
+async function filePathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.promises.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function recordSupacodeCreationNotStarted(
+  launchDir: string,
+  launchJobId: string,
+  launchNonce: string,
+): Promise<void> {
+  await atomicWrite(
+    path.join(launchDir, "creation-complete.json"),
+    `${JSON.stringify({
+      schemaVersion: SUBAGENT_SCHEMA_VERSION,
+      jobId: launchJobId,
+      launchNonce,
+      commandStarted: false,
+      exitCode: 74,
+      completedAt: isoNow(),
+    } satisfies SupacodeCreationCompletion, null, 2)}\n`,
+  );
+}
+
+async function runSupacodeCreation(
+  pi: ExtensionAPI,
+  args: string[],
+  cwd: string,
+  launchDir: string,
+  launchJobId: string,
+  launchNonce: string,
+  signal?: AbortSignal,
+  timeoutMs = 60_000,
+): Promise<string> {
+  const recordCompletion = (commandStarted: boolean, exitCode: number) => commandStarted
+    ? atomicWrite(
+        path.join(launchDir, "creation-complete.json"),
+        `${JSON.stringify({
+          schemaVersion: SUBAGENT_SCHEMA_VERSION,
+          jobId: launchJobId,
+          launchNonce,
+          commandStarted,
+          exitCode,
+          completedAt: isoNow(),
+        } satisfies SupacodeCreationCompletion, null, 2)}\n`,
+      )
+    : recordSupacodeCreationNotStarted(launchDir, launchJobId, launchNonce);
+  const testHook = (pi as ExtensionAPIWithLaunchTestHook).__supacodeLaunchForTests;
+  let stdout: string;
+  if (testHook) {
+    const result = await testHook(args, { signal, timeout: timeoutMs });
+    await recordCompletion(true, result.code);
+    if (result.code !== 0) {
+      throw new Error((result.stderr || result.stdout || `Supacode exited with ${result.code}`).trim());
+    }
+    stdout = result.stdout;
+  } else {
+    const stdoutPath = path.join(launchDir, "stdout.log");
+    const stderrPath = path.join(launchDir, "stderr.log");
+    const processLogPath = path.join(launchDir, "process.log");
+    try {
+      await Promise.all([
+        atomicWrite(stdoutPath, ""),
+        atomicWrite(stderrPath, ""),
+      ]);
+    } catch (error) {
+      await recordCompletion(false, 74);
+      throw error;
+    }
+    const command = [
+      "set +e",
+      `${["supacode", ...args].map(shellQuote).join(" ")} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}`,
+      "SUPACODE_EXIT_CODE=$?",
+      `node ${shellQuote(CREATION_COMPLETION_WRITER_PATH)} ${shellQuote(launchDir)} ${shellQuote(launchJobId)} ${shellQuote(launchNonce)} "$SUPACODE_EXIT_CODE" || exit 76`,
+      "exit $SUPACODE_EXIT_CODE",
+    ].join("\n");
+    let result: ValidationProcessResult;
+    try {
+      result = await runValidationProcess({
+        command,
+        cwd,
+        logPath: processLogPath,
+        timeoutMs,
+        signal,
+        preserveStartedProcessOnAbort: true,
+        maxLogBytes: 1024 * 1024,
+        tailBytes: 64 * 1024,
+        processLifecycle: { jobDir: launchDir, jobId: launchJobId, launchNonce },
+      });
+    } catch (error) {
+      if (
+        error instanceof ValidationProcessFailure &&
+        error.terminationVerified && !error.commandStarted
+      ) await recordCompletion(false, 74);
+      throw error;
+    }
+    const stderr = await readText(stderrPath);
+    stdout = await readText(stdoutPath);
+    if (!result.commandStarted && result.terminationVerified) await recordCompletion(false, 74);
+    const completion = await readJson<SupacodeCreationCompletion>(
+      path.join(launchDir, "creation-complete.json"),
+    );
+    if (
+      completion?.schemaVersion !== SUBAGENT_SCHEMA_VERSION ||
+      completion.jobId !== launchJobId || completion.launchNonce !== launchNonce ||
+      typeof completion.commandStarted !== "boolean" ||
+      !Number.isSafeInteger(completion.exitCode)
+    ) {
+      throw new ValidationProcessFailure(
+        "Supacode creator exited without durable server-settlement metadata.",
+        result.terminationVerified,
+        result.commandStarted,
+      );
+    }
+    if (result.exitCode !== 0 || result.killed || !result.terminationVerified) {
+      throw new Error(
+        (stderr || stdout || result.outputTail || `Supacode exited with ${result.exitCode}`).trim(),
+      );
+    }
+  }
+  if (signal?.aborted) {
+    throw new ValidationProcessFailure("Supacode creation was cancelled after settlement.", true, true);
+  }
+  return stdout;
+}
+
 function finalAssistantMessage(entries: SessionEntry[]): AssistantMessage | undefined {
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
@@ -541,7 +744,11 @@ function registerWorkerCapture(pi: ExtensionAPI, jobDir: string): void {
       launchNonce = metadata?.launchNonce;
     }
     if (!jobId || !launchNonce) throw new Error(`Worker lifecycle metadata is incomplete in ${jobDir}.`);
-    if (await readJobControl(jobDir)) return;
+    const [control, decision] = await Promise.all([
+      readJobControl(jobDir),
+      readJobDecision(jobDir),
+    ]);
+    if (control || decision?.owner === "cancel") return;
 
     const entries = ctx.sessionManager.getEntries();
     const message = finalAssistantMessage(entries);
@@ -627,6 +834,12 @@ const wrapperPid = process.ppid;
 function ps(field) {
   return execFileSync("ps", ["-o", field + "=", "-p", String(wrapperPid)], { encoding: "utf8" }).trim();
 }
+function syncParent(filePath) {
+  const directory = fs.openSync(path.dirname(filePath), fs.constants.O_RDONLY);
+  try { fs.fsyncSync(directory); } catch (error) {
+    if (!["EINVAL", "ENOTSUP", "EISDIR"].includes(error.code)) throw error;
+  } finally { fs.closeSync(directory); }
+}
 function durableWrite(filePath, value) {
   const temporary = filePath + "." + process.pid + ".tmp";
   const handle = fs.openSync(temporary, "wx", 0o600);
@@ -637,23 +850,69 @@ function durableWrite(filePath, value) {
     fs.closeSync(handle);
   }
   fs.renameSync(temporary, filePath);
-  const directory = fs.openSync(path.dirname(filePath), fs.constants.O_RDONLY);
-  try { fs.fsyncSync(directory); } catch (error) {
-    if (!["EINVAL", "ENOTSUP", "EISDIR"].includes(error.code)) throw error;
-  } finally { fs.closeSync(directory); }
+  syncParent(filePath);
+}
+function durableCreateExclusive(filePath, value) {
+  const temporary = filePath + "." + process.pid + ".claim.tmp";
+  const handle = fs.openSync(temporary, "wx", 0o600);
+  try {
+    fs.writeFileSync(handle, JSON.stringify(value, null, 2) + "\\n", "utf8");
+    fs.fsyncSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
+  try {
+    fs.linkSync(temporary, filePath);
+    syncParent(filePath);
+    return true;
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    return false;
+  } finally {
+    fs.unlinkSync(temporary);
+  }
 }
 if (phase === "start") {
+  for (const fileName of ["control.json", "decision.json"]) {
+    const filePath = path.join(configuration.jobDir, fileName);
+    if (!fs.existsSync(filePath)) continue;
+    const record = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (
+      record.jobId === configuration.jobId &&
+      (record.action === "cancel" || record.owner === "cancel")
+    ) process.exit(75);
+  }
+  const wrapper = {
+    pid: wrapperPid,
+    startSignature: ps("lstart"),
+    processGroup: Number(ps("pgid")),
+    command: ps("command"),
+    launchNonce: configuration.launchNonce,
+  };
+  const claimPath = path.join(configuration.jobDir, "worker-launch-claim.json");
+  const claim = {
+    schemaVersion: configuration.schemaVersion,
+    jobId: configuration.jobId,
+    launchNonce: configuration.launchNonce,
+    owner: "runner",
+    wrapper,
+    claimedAt: new Date().toISOString(),
+  };
+  if (!durableCreateExclusive(claimPath, claim)) {
+    const existing = JSON.parse(fs.readFileSync(claimPath, "utf8"));
+    if (
+      existing.schemaVersion === configuration.schemaVersion &&
+      existing.jobId === configuration.jobId &&
+      existing.launchNonce === configuration.launchNonce &&
+      existing.owner === "recovery"
+    ) process.exit(75);
+    throw new Error("Worker launch claim is invalid or already owned by another runner.");
+  }
   durableWrite(path.join(configuration.jobDir, "runner-process.json"), {
     schemaVersion: configuration.schemaVersion,
     jobId: configuration.jobId,
     launchNonce: configuration.launchNonce,
-    wrapper: {
-      pid: wrapperPid,
-      startSignature: ps("lstart"),
-      processGroup: Number(ps("pgid")),
-      command: ps("command"),
-      launchNonce: configuration.launchNonce,
-    },
+    wrapper,
     startedAt: new Date().toISOString(),
   });
 } else if (phase === "exit") {
@@ -676,6 +935,8 @@ export function buildRunner(job: PreparedWorkerJob): string {
     "pi",
     "--no-session",
     "--print",
+    "--mode",
+    "json",
     "--name",
     job.title,
     "--thinking",
@@ -703,7 +964,8 @@ touch "$STDERR_PATH"
 node ${shellQuote(job.runnerMetadataPath)} start || exit 73
 printf '\\n[supacode-subagent %s] %s\\n\\n' ${shellQuote(job.batchId.slice(0, 4))} ${shellQuote(job.title)}
 set +e
-${command} 2> >(tee -a "$STDERR_PATH" >&2)
+setopt pipefail
+${command} 2> >(tee -a "$STDERR_PATH" >&2) | node ${shellQuote(WORKER_OUTPUT_FORMATTER_PATH)}
 EXIT_CODE=$?
 node ${shellQuote(job.runnerMetadataPath)} exit "$EXIT_CODE" || true
 exit "$EXIT_CODE"
@@ -819,6 +1081,12 @@ interface CodingWorktreePlan {
   baseSha: string;
 }
 
+interface SupacodeCreationIntent {
+  launchDir: string;
+  launchJobId: string;
+  launchNonce: string;
+}
+
 async function planCodingWorktree(
   pi: ExtensionAPI,
   originalCwd: string,
@@ -851,15 +1119,73 @@ async function planCodingWorktree(
   };
 }
 
+async function authenticateCreatedCodingWorktree(
+  pi: ExtensionAPI,
+  plan: CodingWorktreePlan,
+  worktreeId: string,
+  worktreePath: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const [listed, topLevel, branch, head, status, repoCommonRaw, worktreeCommonRaw, blockers, registered] =
+    await Promise.all([
+      execChecked(pi, "supacode", ["worktree", "list"], { signal, timeout: 30_000 }),
+      gitOutput(pi, worktreePath, ["rev-parse", "--show-toplevel"], signal),
+      gitOutput(pi, worktreePath, ["symbolic-ref", "--short", "HEAD"], signal),
+      gitOutput(pi, worktreePath, ["rev-parse", "HEAD"], signal),
+      gitRawOutput(pi, worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"], signal),
+      gitOutput(pi, plan.repoRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"], signal),
+      gitOutput(pi, worktreePath, ["rev-parse", "--path-format=absolute", "--git-common-dir"], signal),
+      repositoryOperationBlockers(pi, worktreePath, signal, "Created worker checkout"),
+      gitRawOutput(pi, plan.repoRoot, ["worktree", "list", "--porcelain", "-z"], signal),
+    ]);
+  const [canonicalTopLevel, repositoryCommon, worktreeCommon] = await Promise.all([
+    fs.promises.realpath(topLevel),
+    fs.promises.realpath(repoCommonRaw),
+    fs.promises.realpath(worktreeCommonRaw),
+  ]);
+  const listedId = findSupacodePathId(listed, worktreePath);
+  const registeredPaths = registered.split("\0\0").flatMap((record) =>
+    record.split("\0").filter((line) => line.startsWith("worktree ")).map((line) => line.slice("worktree ".length))
+  );
+  let registeredCanonical = await Promise.all(
+    registeredPaths.map((candidate) => canonicalizeMissingPath(candidate)),
+  );
+  const errors: string[] = [];
+  if (!listedId) {
+    errors.push(`Supacode did not publish the returned worktree identity ${worktreeId}.`);
+  }
+  if (canonicalTopLevel !== worktreePath) errors.push("Returned path is not the created checkout root.");
+  if (repositoryCommon !== worktreeCommon) errors.push("Returned checkout belongs to a different Git repository.");
+  if (branch !== plan.branch) errors.push(`Created checkout branch is ${branch || "detached"}, expected ${plan.branch}.`);
+  if (head !== plan.baseSha) errors.push(`Created checkout HEAD is ${head}, expected ${plan.baseSha}.`);
+  if (status.trim()) errors.push("Created checkout is not clean.");
+  if (blockers.length > 0) errors.push(...blockers);
+  if (!registeredCanonical.includes(worktreePath)) errors.push("Git did not register the returned path as a linked worktree.");
+  if (errors.length > 0) {
+    throw new Error(`Supacode returned an unauthenticated coding worktree: ${errors.join(" ")}`);
+  }
+}
+
 async function createCodingWorktree(
   pi: ExtensionAPI,
   plan: CodingWorktreePlan,
+  creation: SupacodeCreationIntent,
   signal?: AbortSignal,
+  onObserved?: (id: string, worktreePath: string) => Promise<void>,
 ): Promise<{ id: string; worktreePath: string; workerCwd: string }> {
-  const repoId = await ensureRepositoryKnown(pi, plan.repoRoot, signal);
-  const stdout = await execChecked(
+  let repoId: string;
+  try {
+    repoId = await ensureRepositoryKnown(pi, plan.repoRoot, signal);
+  } catch (error) {
+    await recordSupacodeCreationNotStarted(
+      creation.launchDir,
+      creation.launchJobId,
+      creation.launchNonce,
+    );
+    throw error;
+  }
+  const stdout = await runSupacodeCreation(
     pi,
-    "supacode",
     [
       "repo",
       "worktree-new",
@@ -872,13 +1198,20 @@ async function createCodingWorktree(
       "--name",
       plan.folderName,
     ],
-    { signal, timeout: 180_000 },
+    plan.repoRoot,
+    creation.launchDir,
+    creation.launchJobId,
+    creation.launchNonce,
+    signal,
+    180_000,
   );
   const id = lastNonEmptyLine(stdout);
   if (!id) throw new Error("Supacode created a worktree but returned no worktree ID.");
   const decodedWorktreePath = decodeSupacodeResourceId(id);
   if (!path.isAbsolute(decodedWorktreePath)) throw new Error(`Unexpected Supacode worktree ID: ${id}`);
   const worktreePath = await fs.promises.realpath(decodedWorktreePath);
+  await onObserved?.(id, worktreePath);
+  await authenticateCreatedCodingWorktree(pi, plan, id, worktreePath, signal);
   return {
     id,
     worktreePath,
@@ -916,19 +1249,16 @@ async function prepareWorker(
   parent: ParentSurface,
   batchId: string,
   batchTitle: string,
+  id: string,
   yolo: boolean,
   signal: AbortSignal | undefined,
 ): Promise<PreparedWorkerJob> {
-  const id = randomUUID();
   const title = taskTitle(spec.task, spec.title);
   const jobDir = path.join(getAgentDir(), "subagents", batchId, id);
-  await fs.promises.mkdir(jobDir, { recursive: true, mode: 0o700 });
+  await ensureDirectoryDurable(jobDir);
   await fs.promises.chmod(jobDir, 0o700);
   const createdAt = isoNow();
   const launchNonce = randomUUID();
-  const worktreePlan = spec.mode === "coding"
-    ? await planCodingWorktree(pi, ctxCwd, title, batchId, id, signal)
-    : undefined;
   await atomicWrite(
     path.join(jobDir, "job.json"),
     `${JSON.stringify({
@@ -941,27 +1271,114 @@ async function prepareWorker(
       originalCwd: ctxCwd,
       workerCwd: spec.workingDirectory ?? ctxCwd,
       launchNonce,
-      workspacePlan: worktreePlan,
       createdAt,
     }, null, 2)}\n`,
   );
-  await initializeJobLifecycle(jobDir, id, batchId, "planned", {
-    mode: spec.mode,
-    workspacePlan: worktreePlan,
-  });
+  await initializeJobLifecycle(jobDir, id, batchId, "planned", { mode: spec.mode });
+  let worktreePlan: CodingWorktreePlan | undefined;
+  try {
+    worktreePlan = spec.mode === "coding"
+      ? await planCodingWorktree(pi, ctxCwd, title, batchId, id, signal)
+      : undefined;
+  } catch (error) {
+    await updateJobLifecycle(jobDir, "failed", error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+  const worktreeCreation = worktreePlan
+    ? {
+        launchDir: path.join(jobDir, "worktree-launch"),
+        launchJobId: `${id}-worktree-launch`,
+        launchNonce: randomUUID(),
+      } satisfies SupacodeCreationIntent
+    : undefined;
+  if (worktreePlan && worktreeCreation) {
+    const metadata = await readJson<Record<string, unknown>>(path.join(jobDir, "job.json")) ?? {};
+    await atomicWrite(
+      path.join(jobDir, "job.json"),
+      `${JSON.stringify({
+        ...metadata,
+        workspacePlan: worktreePlan,
+        branch: worktreePlan.branch,
+        baseSha: worktreePlan.baseSha,
+        worktreeCreationProtocolVersion: 1,
+        worktreeLaunchDir: worktreeCreation.launchDir,
+        worktreeLaunchJobId: worktreeCreation.launchJobId,
+        worktreeLaunchNonce: worktreeCreation.launchNonce,
+      }, null, 2)}\n`,
+    );
+  }
 
   let workerCwd = spec.workingDirectory ?? ctxCwd;
   let codeWorktreeId: string | undefined;
   let worktreePath: string | undefined;
   let branch = worktreePlan?.branch;
   let baseSha = worktreePlan?.baseSha;
-  if (worktreePlan) {
-    await updateJobLifecycle(jobDir, "provisioning_worktree", undefined, { workspacePlan: worktreePlan });
+  if (worktreePlan && worktreeCreation) {
+    await recordValidationGateIntent(
+      worktreeCreation.launchDir,
+      worktreeCreation.launchJobId,
+      worktreeCreation.launchNonce,
+    );
+    await updateJobLifecycle(jobDir, "provisioning_worktree", undefined, {
+      workspacePlan: worktreePlan,
+      worktreeCreationProtocolVersion: 1,
+      worktreeLaunchDir: worktreeCreation.launchDir,
+      worktreeLaunchJobId: worktreeCreation.launchJobId,
+      worktreeLaunchNonce: worktreeCreation.launchNonce,
+    });
     try {
-      const worktree = await createCodingWorktree(pi, worktreePlan, signal);
+      const worktree = await createCodingWorktree(
+        pi,
+        worktreePlan,
+        worktreeCreation,
+        signal,
+        async (observedCodeWorktreeId, observedWorktreePath) => {
+          const metadata = await readJson<Record<string, unknown>>(path.join(jobDir, "job.json")) ?? {};
+          await atomicWrite(
+            path.join(jobDir, "job.json"),
+            `${JSON.stringify({
+              ...metadata,
+              observedCodeWorktreeId,
+              observedWorktreePath,
+              worktreeAuthenticationState: "pending",
+            }, null, 2)}\n`,
+          );
+          await updateJobLifecycle(jobDir, "provisioning_worktree", undefined, {
+            observedCodeWorktreeId,
+            observedWorktreePath,
+            worktreeAuthenticationState: "pending",
+          });
+        },
+      );
       codeWorktreeId = worktree.id;
       workerCwd = worktree.workerCwd;
       worktreePath = worktree.worktreePath;
+      const metadata = await readJson<Record<string, unknown>>(path.join(jobDir, "job.json")) ?? {};
+      await atomicWrite(
+        path.join(jobDir, "job.json"),
+        `${JSON.stringify({
+          ...metadata,
+          workerCwd,
+          tabWorktreeId: codeWorktreeId,
+          codeWorktreeId,
+          worktreePath,
+          observedCodeWorktreeId: codeWorktreeId,
+          observedWorktreePath: worktreePath,
+          worktreeAuthenticationState: "verified",
+          branch,
+          baseSha,
+        }, null, 2)}\n`,
+      );
+      await updateJobLifecycle(jobDir, "workspace_ready", undefined, {
+        codeWorktreeId,
+        worktreePath,
+        observedCodeWorktreeId: codeWorktreeId,
+        observedWorktreePath: worktreePath,
+        worktreeAuthenticationState: "verified",
+        workerCwd,
+        branch,
+        baseSha,
+      });
     } catch (error) {
       await updateJobLifecycle(
         jobDir,
@@ -1005,6 +1422,15 @@ async function prepareWorker(
     runnerMetadataPath,
     runnerExitPath,
     launchNonce,
+    workerLaunchClaimVersion: 1,
+    surfaceCreationProtocolVersion: 1,
+    worktreeCreationProtocolVersion: worktreeCreation ? 1 : undefined,
+    worktreeLaunchDir: worktreeCreation?.launchDir,
+    worktreeLaunchJobId: worktreeCreation?.launchJobId,
+    worktreeLaunchNonce: worktreeCreation?.launchNonce,
+    observedCodeWorktreeId: codeWorktreeId,
+    observedWorktreePath: worktreePath,
+    worktreeAuthenticationState: codeWorktreeId ? "verified" : undefined,
     tabWorktreeId: workerTabWorktreeId(spec.mode, parent.worktreeId, codeWorktreeId),
     codeWorktreeId,
     worktreePath,
@@ -1057,6 +1483,15 @@ async function writeJobMetadata(
       originalCwd: job.originalCwd,
       workerCwd: job.workerCwd,
       launchNonce: job.launchNonce,
+      workerLaunchClaimVersion: job.workerLaunchClaimVersion,
+      surfaceCreationProtocolVersion: job.surfaceCreationProtocolVersion,
+      worktreeCreationProtocolVersion: job.worktreeCreationProtocolVersion,
+      worktreeLaunchDir: job.worktreeLaunchDir,
+      worktreeLaunchJobId: job.worktreeLaunchJobId,
+      worktreeLaunchNonce: job.worktreeLaunchNonce,
+      observedCodeWorktreeId: job.observedCodeWorktreeId,
+      observedWorktreePath: job.observedWorktreePath,
+      worktreeAuthenticationState: job.worktreeAuthenticationState,
       tabWorktreeId: job.tabWorktreeId,
       codeWorktreeId: job.codeWorktreeId,
       worktreePath: job.worktreePath,
@@ -1080,6 +1515,10 @@ async function createBatchTab(
   const tabId = randomUUID();
   const batch = { id: batchId, title: batchTitle, worktreeId, tabId } satisfies WorkerBatch;
   const batchPath = path.join(getAgentDir(), "subagents", batchId, "batch.json");
+  const tabLaunchDir = path.join(getAgentDir(), "subagents", batchId, "tab-launches", tabId);
+  const tabLaunchJobId = `${batchId}-tab-launch`;
+  const tabLaunchNonce = randomUUID();
+  await recordValidationGateIntent(tabLaunchDir, tabLaunchJobId, tabLaunchNonce);
   await atomicWrite(
     batchPath,
     `${JSON.stringify({
@@ -1087,14 +1526,16 @@ async function createBatchTab(
       ...batch,
       phase: "launching",
       anchorSurfaceId: tabId,
+      tabLaunchDir,
+      tabLaunchJobId,
+      tabLaunchNonce,
       createdAt: isoNow(),
     }, null, 2)}\n`,
   );
   let stdout: string;
   try {
-    stdout = await execChecked(
+    stdout = await runSupacodeCreation(
       pi,
-      "supacode",
       [
         "tab",
         "new",
@@ -1107,38 +1548,111 @@ async function createBatchTab(
         "-n",
         tabId,
       ],
-      { signal, timeout: 60_000 },
+      PACKAGE_ROOT,
+      tabLaunchDir,
+      tabLaunchJobId,
+      tabLaunchNonce,
+      signal,
     );
   } catch (error) {
-    const cleanup = await closeBatchTab(pi, batch);
+    const message = error instanceof Error ? error.message : String(error);
+    await cleanupFailedBatchTabLaunch(pi, batch, batchPath, message);
+    throw error;
+  }
+  const returnedTabId = lastNonEmptyLine(stdout);
+  if (!sameSupacodeUuid(returnedTabId, tabId)) {
+    const message = `Unexpected Supacode tab ID: ${returnedTabId || "(empty)"}`;
+    await cleanupFailedBatchTabLaunch(pi, batch, batchPath, message);
+    throw new Error(message);
+  }
+  try {
     await atomicWrite(
       batchPath,
       `${JSON.stringify({
         schemaVersion: SUBAGENT_SCHEMA_VERSION,
         ...batch,
-        phase: cleanup.closed ? "closed" : "recovery_required",
-        error: error instanceof Error ? error.message : String(error),
-        cleanupError: cleanup.error,
+        phase: "running",
+        anchorSurfaceId: tabId,
+        tabLaunchDir,
+        tabLaunchJobId,
+        tabLaunchNonce,
         createdAt: isoNow(),
       }, null, 2)}\n`,
     );
-    throw error;
-  }
-  const returnedTabId = lastNonEmptyLine(stdout);
-  if (!sameSupacodeUuid(returnedTabId, tabId)) {
-    await closeBatchTab(pi, batch);
-    throw new Error(`Unexpected Supacode tab ID: ${returnedTabId || "(empty)"}`);
-  }
-  try {
-    await atomicWrite(
-      batchPath,
-      `${JSON.stringify({ schemaVersion: SUBAGENT_SCHEMA_VERSION, ...batch, phase: "running", anchorSurfaceId: tabId, createdAt: isoNow() }, null, 2)}\n`,
-    );
   } catch (error) {
-    await closeBatchTab(pi, batch);
+    const message = error instanceof Error ? error.message : String(error);
+    await cleanupFailedBatchTabLaunch(pi, batch, batchPath, message);
     throw error;
   }
   return batch;
+}
+
+async function closeBatchAnchor(
+  pi: ExtensionAPI,
+  batch: WorkerBatch,
+  workers: WorkerJob[],
+  signal?: AbortSignal,
+): Promise<void> {
+  const batchPath = path.join(getAgentDir(), "subagents", batch.id, "batch.json");
+  const priorMetadata = await readJson<Record<string, unknown>>(batchPath) ?? {};
+  const anchorCloseIntentAt = isoNow();
+  await atomicWrite(
+    batchPath,
+    `${JSON.stringify({
+      ...priorMetadata,
+      anchorSurfaceState: "closing",
+      anchorCloseIntentAt,
+    }, null, 2)}\n`,
+  );
+  const closed = await pi.exec(
+    "supacode",
+    [
+      "surface",
+      "close",
+      "-w",
+      batch.worktreeId,
+      "-t",
+      batch.tabId,
+      "-s",
+      batch.tabId,
+    ],
+    { signal, timeout: 5000 },
+  );
+  if (closed.code !== 0) {
+    throw new Error(`Could not close batch anchor surface: ${(closed.stderr || closed.stdout || `exit ${closed.code}`).trim()}`);
+  }
+  let confirmedMissing = 0;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const listed = await pi.exec(
+      "supacode",
+      ["surface", "list", "-w", batch.worktreeId, "-t", batch.tabId],
+      { signal, timeout: 5000 },
+    );
+    if (listed.code === 0) {
+      const surfaceIds = listed.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      const anchorMissing = !surfaceIds.some((surfaceId) => sameSupacodeUuid(surfaceId, batch.tabId));
+      const workersPresent = workers.every((worker) =>
+        surfaceIds.some((surfaceId) => sameSupacodeUuid(surfaceId, worker.surfaceId))
+      );
+      confirmedMissing = anchorMissing && workersPresent ? confirmedMissing + 1 : 0;
+      if (confirmedMissing >= 2) {
+        await atomicWrite(
+          batchPath,
+          `${JSON.stringify({
+            ...priorMetadata,
+            anchorSurfaceState: "closed",
+            anchorCloseIntentAt,
+            anchorClosedAt: isoNow(),
+          }, null, 2)}\n`,
+        );
+        return;
+      }
+    } else {
+      confirmedMissing = 0;
+    }
+    await delay(100, signal);
+  }
+  throw new Error("Batch anchor closure or worker-surface preservation could not be verified.");
 }
 
 async function createWorkerSurface(
@@ -1154,26 +1668,69 @@ async function createWorkerSurface(
     : researchWorkerSplitPlacement(launched);
   const surfaceId = randomUUID();
   const job: WorkerJob = { ...prepared, tabId: batch.tabId, surfaceId };
-  await writeJobMetadata(job);
-  await updateJobLifecycle(job.jobDir, "launching", undefined, {
-    tabWorktreeId: job.tabWorktreeId,
-    tabId: job.tabId,
-    surfaceId: job.surfaceId,
-    launchNonce: job.launchNonce,
-  });
-  await onPrepared?.(job, batch);
-  const [launchControl, launchDecision] = await Promise.all([
-    readJobControl(job.jobDir),
-    readJobDecision(job.jobDir),
-  ]);
-  if (launchControl || launchDecision?.owner === "cancel") {
-    throw new Error(`Worker ${job.id} was cancelled before surface launch.`);
+  const surfaceLaunchDir = path.join(job.jobDir, "surface-launch");
+  const surfaceLaunchJobId = `${job.id}-surface-launch`;
+  const surfaceLaunchNonce = randomUUID();
+  await recordValidationGateIntent(surfaceLaunchDir, surfaceLaunchJobId, surfaceLaunchNonce);
+  try {
+    const launcherProcessIdentity = await captureProcessIdentity(process.pid, job.launchNonce);
+    if (!launcherProcessIdentity) {
+      throw new Error(`Could not capture the surface launcher identity for worker ${job.id}.`);
+    }
+    await writeJobMetadata(job, job.jobDir, {
+      surfaceLaunchState: "planned",
+      launcherProcessIdentity,
+      surfaceLaunchDir,
+      surfaceLaunchJobId,
+      surfaceLaunchNonce,
+    });
+    await updateJobLifecycle(job.jobDir, "launching", undefined, {
+      tabWorktreeId: job.tabWorktreeId,
+      surfaceCreationProtocolVersion: job.surfaceCreationProtocolVersion,
+      tabId: job.tabId,
+      surfaceId: job.surfaceId,
+      launchNonce: job.launchNonce,
+      surfaceLaunchState: "planned",
+      launcherProcessIdentity,
+      surfaceLaunchDir,
+      surfaceLaunchJobId,
+      surfaceLaunchNonce,
+    });
+    await onPrepared?.(job, batch);
+    const [launchControl, launchDecision] = await Promise.all([
+      readJobControl(job.jobDir),
+      readJobDecision(job.jobDir),
+    ]);
+    if (launchControl || launchDecision?.owner === "cancel") {
+      throw new Error(`Worker ${job.id} was cancelled before surface launch.`);
+    }
+    await writeJobMetadata(job, job.jobDir, {
+      surfaceLaunchState: "requested",
+      launcherProcessIdentity,
+      surfaceLaunchDir,
+      surfaceLaunchJobId,
+      surfaceLaunchNonce,
+    });
+    await updateJobLifecycle(job.jobDir, "launching", undefined, {
+      surfaceLaunchState: "requested",
+      launcherProcessIdentity,
+      surfaceLaunchDir,
+      surfaceLaunchJobId,
+      surfaceLaunchNonce,
+    });
+    signal?.throwIfAborted();
+  } catch (error) {
+    await recordSupacodeCreationNotStarted(
+      surfaceLaunchDir,
+      surfaceLaunchJobId,
+      surfaceLaunchNonce,
+    );
+    throw error;
   }
   let stdout: string;
   try {
-    stdout = await execChecked(
+    stdout = await runSupacodeCreation(
       pi,
-      "supacode",
       [
         "surface",
         "split",
@@ -1190,7 +1747,11 @@ async function createWorkerSurface(
         "-n",
         surfaceId,
       ],
-      { signal, timeout: 60_000 },
+      job.workerCwd,
+      surfaceLaunchDir,
+      surfaceLaunchJobId,
+      surfaceLaunchNonce,
+      signal,
     );
   } catch (error) {
     const termination = await closeWorkerSurface(pi, job);
@@ -1229,14 +1790,54 @@ async function createWorkerSurface(
     throw new Error(`Worker ${job.id} was cancelled during surface launch.`);
   }
   try {
+    let runnerReady = false;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      let runner: RunnerProcessRecord | undefined;
+      try {
+        runner = await readRunnerProcess(job.jobDir);
+      } catch (error) {
+        throw new Error(`Worker runner metadata is invalid: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (runner) {
+        if (runner.jobId !== job.id || runner.launchNonce !== job.launchNonce) {
+          throw new Error(`Worker ${job.id} published mismatched runner identity.`);
+        }
+        runnerReady = true;
+        break;
+      }
+      const [control, decision] = await Promise.all([
+        readJobControl(job.jobDir),
+        readJobDecision(job.jobDir),
+      ]);
+      if (control || decision?.owner === "cancel") {
+        throw new Error(`Worker ${job.id} was cancelled while waiting for runner startup.`);
+      }
+      await delay(100, signal);
+    }
+    if (!runnerReady) {
+      throw new Error(`Worker ${job.id} surface exists, but its runner did not publish identity within 10 seconds.`);
+    }
     await updateJobLifecycle(job.jobDir, "running");
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     const termination = await closeWorkerSurface(pi, job);
+    let terminationPersisted = true;
+    try {
+      await atomicWrite(
+        path.join(job.jobDir, "termination.json"),
+        `${JSON.stringify(termination, null, 2)}\n`,
+      );
+    } catch {
+      terminationPersisted = false;
+    }
     try {
       await updateJobLifecycle(
         job.jobDir,
-        "recovery_required",
-        `Surface launched, but running state could not be recorded: ${error instanceof Error ? error.message : String(error)}. ${termination.errors.join(" ")}`,
+        termination.verified && terminationPersisted && signal?.aborted ? "cancelled" :
+          termination.verified && terminationPersisted ? "failed" : "recovery_required",
+        termination.verified && terminationPersisted
+          ? message
+          : `${message} ${termination.errors.join(" ")} ${terminationPersisted ? "" : "Termination result could not be persisted."}`.trim(),
       );
     } catch {
       // The durable launching intent and exact resource IDs remain for explicit recovery.
@@ -1266,6 +1867,136 @@ async function closeWorkerSurface(
       errors: [error instanceof Error ? error.message : String(error)],
     };
   }
+}
+
+async function terminateWorkerAfterBatchFailure(
+  pi: ExtensionAPI,
+  job: WorkerJob,
+  reason: string,
+  parentAborted: boolean,
+): Promise<{ verified: boolean; error?: string }> {
+  let status = await readJson<WorkerStatus>(job.statusPath);
+  if (!status?.processIdentity) {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try {
+        if (await readRunnerProcess(job.jobDir)) break;
+      } catch {
+        break;
+      }
+      await delay(50);
+      status = await readJson<WorkerStatus>(job.statusPath);
+      if (status?.processIdentity) break;
+    }
+  }
+  const existingTerminal = await readWorkerTerminal<WorkerStatus>(job.jobDir);
+  const [control, decision] = await Promise.all([
+    readJobControl(job.jobDir),
+    readJobDecision(job.jobDir),
+  ]);
+  const cancelled = parentAborted || control !== undefined || decision?.owner === "cancel";
+  await updateJobLifecycle(job.jobDir, "stopping", reason);
+  const termination = await terminateWorker(
+    pi,
+    job,
+    existingTerminal?.status.processIdentity ?? status?.processIdentity,
+  );
+  await atomicWrite(
+    path.join(job.jobDir, "termination.json"),
+    `${JSON.stringify(termination, null, 2)}\n`,
+  );
+  if (!termination.verified) {
+    const error = `${reason} Worker termination is indeterminate: ${termination.errors.join(" ")}`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", error);
+    return { verified: false, error };
+  }
+  if (existingTerminal) {
+    const runnerExit = await readAuthenticatedRunnerExit(job.jobDir, job.id, job.launchNonce);
+    if (existingTerminal.owner === "worker" && !runnerExit) {
+      const error = "Worker terminal claim exists, but its authenticated runner-exit sentinel is missing.";
+      await updateJobLifecycle(job.jobDir, "recovery_required", error);
+      return { verified: false, error };
+    }
+    await reconcileJobLifecycle(
+      job.jobDir,
+      terminalLifecyclePhase(existingTerminal.status),
+      existingTerminal.status.errorMessage,
+    );
+    return { verified: true };
+  }
+  const terminalStatus = {
+    state: "failed",
+    pid: status?.pid,
+    processIdentity: status?.processIdentity,
+    launchNonce: job.launchNonce,
+    completedAt: isoNow(),
+    stopReason: cancelled ? "aborted" : "batch_launch_failed",
+    errorMessage: reason,
+    termination,
+  } satisfies WorkerStatus;
+  await claimWorkerTerminal(
+    job.jobDir,
+    job.id,
+    cancelled ? "abort" : "recovery",
+    terminalStatus,
+    reason,
+  );
+  await reconcileJobLifecycle(
+    job.jobDir,
+    terminalLifecyclePhase(terminalStatus),
+    reason,
+  );
+  return { verified: true };
+}
+
+async function terminateBatchWorkers(
+  pi: ExtensionAPI,
+  jobs: WorkerJob[],
+  reason: string,
+  parentAborted: boolean,
+): Promise<string[]> {
+  const errors: string[] = [];
+  for (const job of jobs) {
+    try {
+      const outcome = await terminateWorkerAfterBatchFailure(pi, job, reason, parentAborted);
+      if (!outcome.verified) errors.push(`${job.id}: ${outcome.error ?? "termination is indeterminate"}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        await updateJobLifecycle(job.jobDir, "recovery_required", message);
+      } catch {
+        // Existing durable worker intent remains available to explicit recovery.
+      }
+      errors.push(`${job.id}: ${message}`);
+    }
+  }
+  return errors;
+}
+
+async function markUnlaunchedPreparedWorkers(
+  prepared: Array<{ index: number; job: PreparedWorkerJob }>,
+  launched: Array<{ index: number; job: WorkerJob }>,
+  reason: string,
+): Promise<string[]> {
+  const launchedIds = new Set(launched.map(({ job }) => job.id));
+  const recoveries: string[] = [];
+  for (const { job } of prepared) {
+    if (launchedIds.has(job.id)) continue;
+    try {
+      const [lifecycle, terminal] = await Promise.all([
+        readJobLifecycle(job.jobDir),
+        readWorkerTerminal<WorkerStatus>(job.jobDir),
+      ]);
+      if (terminal || ["completed", "failed", "timed_out", "cancelled"].includes(lifecycle?.phase ?? "")) {
+        continue;
+      }
+      const recoveryReason = `${reason} Worker was prepared but never launched; explicit recovery is required.`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", recoveryReason);
+      recoveries.push(`${job.id}: ${recoveryReason} Artifacts: ${job.jobDir}`);
+    } catch (error) {
+      recoveries.push(`${job.id}: Could not persist unlaunched-worker recovery: ${error instanceof Error ? error.message : String(error)} Artifacts: ${job.jobDir}`);
+    }
+  }
+  return recoveries;
 }
 
 async function closeBatchTab(
@@ -1333,6 +2064,56 @@ async function closeBatchTab(
     // The prior resource intent still contains the exact tab identity.
   }
   return { closed: false, error };
+}
+
+async function cleanupFailedBatchTabLaunch(
+  pi: ExtensionAPI,
+  batch: WorkerBatch,
+  batchPath: string,
+  reason: string,
+): Promise<void> {
+  const cleanupErrors: string[] = [];
+  let closed = false;
+  let creationReconciled = false;
+  try {
+    const launchMetadata = await readJson<Record<string, unknown>>(batchPath) ?? {};
+    const launchDir = metadataString(launchMetadata, "tabLaunchDir");
+    const launchJobId = metadataString(launchMetadata, "tabLaunchJobId");
+    const launchNonce = metadataString(launchMetadata, "tabLaunchNonce");
+    creationReconciled = launchDir !== undefined && launchJobId !== undefined && launchNonce !== undefined &&
+      path.resolve(launchDir).startsWith(`${path.resolve(path.dirname(batchPath))}${path.sep}`) &&
+      await recoverCreationLaunchProcess(pi, launchDir, launchJobId, launchNonce);
+    if (!creationReconciled) cleanupErrors.push("Tab-creation process is not verified absent; tab cleanup was deferred.");
+  } catch (error) {
+    cleanupErrors.push(`Could not reconcile tab creation: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (creationReconciled) {
+    try {
+      const cleanup = await closeBatchTab(pi, batch);
+      closed = cleanup.closed;
+      if (!cleanup.closed) cleanupErrors.push(cleanup.error ?? `Batch tab ${batch.tabId} remains open.`);
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  try {
+    const priorMetadata = await readJson<Record<string, unknown>>(batchPath) ?? {};
+    await atomicWrite(
+      batchPath,
+      `${JSON.stringify({
+        ...priorMetadata,
+        schemaVersion: SUBAGENT_SCHEMA_VERSION,
+        ...batch,
+        phase: closed ? "closed" : "recovery_required",
+        error: reason,
+        cleanupError: cleanupErrors.join(" ") || undefined,
+        updatedAt: isoNow(),
+      }, null, 2)}\n`,
+    );
+  } catch (error) {
+    cleanupErrors.push(`Could not persist failed tab-launch cleanup: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (cleanupErrors.length > 0) throw new BatchCleanupFailure(reason, cleanupErrors);
 }
 
 async function requireBatchClosed(pi: ExtensionAPI, batch: WorkerBatch): Promise<void> {
@@ -1412,6 +2193,14 @@ async function monitorBatchSurfaces(
             continue;
           }
         }
+        const status = await readJson<WorkerStatus>(job.statusPath);
+        const processes = await verifyWorkerProcessesAbsent(
+          pi,
+          job,
+          terminal?.status.processIdentity ?? status?.processIdentity,
+          POLL_INTERVAL_MS,
+        );
+        if (!processes.absent) continue;
         reported.add(missingId);
         onClosed(job);
         return;
@@ -1523,8 +2312,12 @@ async function waitForWorker(
   try {
     while (Date.now() < deadline) {
       if (signal?.aborted) throw new Error("Subagent operation aborted");
-      const control = await readJobControl(job.jobDir);
-      if (control) {
+      const [control, decision] = await Promise.all([
+        readJobControl(job.jobDir),
+        readJobDecision(job.jobDir),
+      ]);
+      if (control || decision?.owner === "cancel") {
+        const cancellationReason = control?.reason ?? "Cancellation decision won before worker settlement.";
         const runningStatus = await readJson<WorkerStatus>(job.statusPath);
         const cancelledStatus = {
           state: "failed",
@@ -1533,7 +2326,7 @@ async function waitForWorker(
           launchNonce: job.launchNonce,
           completedAt: isoNow(),
           stopReason: "cancelled",
-          errorMessage: control.reason,
+          errorMessage: cancellationReason,
         } satisfies WorkerStatus;
         const existingTerminal = await readWorkerTerminal<WorkerStatus>(job.jobDir);
         const termination = await terminateWorker(
@@ -1548,18 +2341,18 @@ async function waitForWorker(
           await updateJobLifecycle(
             job.jobDir,
             "recovery_required",
-            `${control.reason} Worker termination is indeterminate.`,
+            `${cancellationReason} Worker termination is indeterminate.`,
           );
-          throw new Error(`${control.reason} Worker termination is indeterminate.`);
+          throw new Error(`${cancellationReason} Worker termination is indeterminate.`);
         }
         const claimed = await claimWorkerTerminal(
           job.jobDir,
           job.id,
           "cancel",
           cancelledStatus,
-          control.reason,
+          cancellationReason,
         );
-        await reconcileJobLifecycle(job.jobDir, "cancelled", control.reason);
+        await reconcileJobLifecycle(job.jobDir, "cancelled", cancellationReason);
         return workerResultFromTerminal(pi, job, claimed.record, signal, finalStatus);
       }
       let terminal = await readWorkerTerminal<WorkerStatus>(job.jobDir);
@@ -1568,11 +2361,19 @@ async function waitForWorker(
       if ((terminal && terminal.owner !== "worker") || runnerExit) {
         const processIdentity = terminal?.status.processIdentity ?? report?.status.processIdentity;
         const processes = await verifyWorkerProcessesAbsent(
+          pi,
           job,
           processIdentity,
           POLL_INTERVAL_MS,
         );
         if (processes.absent) {
+          const [settlementControl, settlementDecision] = await Promise.all([
+            readJobControl(job.jobDir),
+            readJobDecision(job.jobDir),
+          ]);
+          if (settlementControl || settlementDecision?.owner === "cancel") continue;
+          const settlement = await claimJobDecision(job.jobDir, job.id, "accept");
+          if (settlement.record.owner === "cancel") continue;
           if (!terminal) {
             if (report) {
               const output = await readWorkerReportOutput(report);
@@ -1596,6 +2397,11 @@ async function waitForWorker(
               terminal = (await claimWorkerTerminal(job.jobDir, job.id, "runner", status, message)).record;
             }
           }
+          const [postClaimControl, postClaimDecision] = await Promise.all([
+            readJobControl(job.jobDir),
+            readJobDecision(job.jobDir),
+          ]);
+          if (postClaimControl || postClaimDecision?.owner === "cancel") continue;
           await reconcileJobLifecycle(
             job.jobDir,
             terminalLifecyclePhase(terminal.status),
@@ -1744,7 +2550,7 @@ async function prepareLoopWorkerAttempt(
     String(attempt).padStart(3, "0"),
     "worker",
   );
-  await fs.promises.mkdir(attemptDir, { recursive: true, mode: 0o700 });
+  await ensureDirectoryDurable(attemptDir);
   const promptPath = path.join(attemptDir, "prompt.md");
   const resultPath = path.join(attemptDir, "result.md");
   const stderrPath = path.join(attemptDir, "stderr.log");
@@ -1779,6 +2585,8 @@ async function prepareLoopWorkerAttempt(
     runnerMetadataPath,
     runnerExitPath,
     launchNonce,
+    workerLaunchClaimVersion: 1,
+    surfaceCreationProtocolVersion: 1,
     tabWorktreeId: workspace.codeWorktreeId,
     codeWorktreeId: workspace.codeWorktreeId,
     worktreePath: workspace.worktreePath,
@@ -1821,40 +2629,94 @@ async function runPreparedWorkerAttempt(
     prepared.tabWorktreeId,
     signal,
   );
-  const job = await createWorkerSurface(pi, batch, prepared, [], signal, onLaunched);
-  const monitorController = new AbortController();
-  const workerSignal = signal
-    ? AbortSignal.any([signal, monitorController.signal])
-    : monitorController.signal;
+  let job: WorkerJob | undefined;
+  let monitorController: AbortController | undefined;
+  let surfaceMonitor: Promise<void> | undefined;
   let manuallyClosed = false;
-  const surfaceMonitor = monitorBatchSurfaces(
-    pi,
-    batch,
-    monitorController.signal,
-    () => ({ jobs: [job], launchComplete: true }),
-    () => {
-      if (manuallyClosed) return;
-      manuallyClosed = true;
-      monitorController.abort();
-      onBatchClosed();
-    },
-  );
-
   try {
+    job = await createWorkerSurface(
+      pi,
+      batch,
+      prepared,
+      [],
+      signal,
+      async (launchedJob, launchedBatch) => {
+        job = launchedJob;
+        await onLaunched(launchedJob, launchedBatch);
+      },
+    );
+    await closeBatchAnchor(pi, batch, [job], signal);
+    monitorController = new AbortController();
+    const workerSignal = signal
+      ? AbortSignal.any([signal, monitorController.signal])
+      : monitorController.signal;
+    surfaceMonitor = monitorBatchSurfaces(
+      pi,
+      batch,
+      monitorController.signal,
+      () => ({ jobs: job ? [job] : [], launchComplete: true }),
+      () => {
+        if (manuallyClosed) return;
+        manuallyClosed = true;
+        monitorController?.abort();
+        onBatchClosed();
+      },
+    );
+    const monitorPromise = surfaceMonitor;
+
     await refocusParent(pi, parent);
     onUpdate?.({
       content: [{ type: "text", text: `${prepared.batchTitle}: ${prepared.title} running...` }],
       details: { batchId: prepared.batchId, jobId: prepared.id, worktreePath: prepared.worktreePath },
     });
-    const result = await waitForWorker(pi, job, timeoutSeconds, workerSignal);
+    const waitPromise = waitForWorker(pi, job, timeoutSeconds, workerSignal);
+    const monitorGuard = monitorPromise
+      .catch((error: unknown) => {
+        monitorController?.abort();
+        throw error;
+      })
+      .then(() => {
+        if (!monitorController?.signal.aborted) {
+          throw new Error("Worker surface monitor stopped unexpectedly.");
+        }
+        return new Promise<never>(() => undefined);
+      });
+    let result: WorkerResult;
+    try {
+      result = await Promise.race([waitPromise, monitorGuard]);
+    } catch (error) {
+      monitorController.abort();
+      await Promise.allSettled([waitPromise, monitorPromise]);
+      throw error;
+    }
+    monitorController.abort();
+    await monitorPromise;
+    surfaceMonitor = undefined;
     if (!keepOpen) await requireBatchClosed(pi, batch);
     return { result, job, batch };
   } catch (error) {
-    if (manuallyClosed) throw new Error("Supacode worker surface closed; parent turn aborted.");
+    const message = manuallyClosed
+      ? "Supacode worker surface closed; parent turn aborted."
+      : error instanceof Error ? error.message : String(error);
+    const cleanupErrors = job
+      ? await terminateBatchWorkers(pi, [job], message, signal?.aborted === true || manuallyClosed)
+      : [];
+    if (cleanupErrors.length === 0) {
+      try {
+        const tabCleanup = await closeBatchTab(pi, batch);
+        if (!tabCleanup.closed) cleanupErrors.push(tabCleanup.error ?? `Batch tab ${batch.tabId} remains open.`);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new BatchCleanupFailure(message, cleanupErrors);
+    }
+    if (manuallyClosed) throw new Error(message);
     throw error;
   } finally {
-    monitorController.abort();
-    await surfaceMonitor;
+    monitorController?.abort();
+    await surfaceMonitor?.catch(() => undefined);
     await refocusParent(pi, parent);
   }
 }
@@ -1916,6 +2778,7 @@ async function runLoopChecks(
       await atomicWrite(logPath, `Candidate tree: ${candidate.tree}\nCommand: ${check.command}\n\n`);
       const processJobId = `${workspace.id}-check-${candidate.attempt}-${index + 1}`;
       const processLaunchNonce = randomUUID();
+      await recordValidationGateIntent(gateDir, processJobId, processLaunchNonce);
       await recordCandidateEvaluatorProcessIntent(checkoutPath, processJobId, processLaunchNonce);
       await updateJobLifecycle(workspace.jobDir, "running", undefined, {
         activeEvaluatorDir: gateDir,
@@ -1975,6 +2838,9 @@ async function runLoopChecks(
           terminationVerified: error instanceof ValidationProcessFailure
             ? error.terminationVerified
             : true,
+          commandStarted: error instanceof ValidationProcessFailure
+            ? error.commandStarted
+            : false,
           outputBytes: Buffer.byteLength(message),
           logBytes: Buffer.byteLength(message),
           logTruncated: false,
@@ -1991,12 +2857,18 @@ async function runLoopChecks(
       after = await attestCandidateCheckout(pi, candidate, checkoutPath, signal);
     } finally {
       if (safeToRemove) {
-        await removeCandidateCheckout(pi, workspace.worktreePath, checkoutPath);
-        await updateJobLifecycle(workspace.jobDir, "running", undefined, {
-          activeEvaluatorDir: undefined,
-          activeEvaluatorJobId: undefined,
-          activeEvaluatorLaunchNonce: undefined,
-        });
+        try {
+          await removeCandidateCheckout(pi, workspace.worktreePath, checkoutPath);
+          await updateJobLifecycle(workspace.jobDir, "running", undefined, {
+            activeEvaluatorDir: undefined,
+            activeEvaluatorJobId: undefined,
+            activeEvaluatorLaunchNonce: undefined,
+          });
+        } catch (error) {
+          throw new EvaluatorRecoveryFailure(
+            `Could not finalize check evaluator cleanup: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
     }
     const controlAfter = await readJobControl(workspace.jobDir);
@@ -2216,11 +3088,15 @@ async function runLoopReviews(
         !runner || runner.jobId !== reviewerJob.id ||
         runner.launchNonce !== reviewerJob.launchNonce
       ) {
-        throw new Error(`Reviewer ${reviewerJob.id} has no authenticated runner identity; evaluator retained for recovery.`);
+        throw new EvaluatorRecoveryFailure(
+          `Reviewer ${reviewerJob.id} has no authenticated runner identity; evaluator retained for recovery.`,
+        );
       }
       const termination = await terminateRecordedProcess(runner.wrapper, reviewerJob.launchNonce);
       if (!termination.verified) {
-        throw new Error(`Reviewer ${reviewerJob.id} process absence is indeterminate; evaluator retained for recovery.`);
+        throw new EvaluatorRecoveryFailure(
+          `Reviewer ${reviewerJob.id} process absence is indeterminate; evaluator retained for recovery.`,
+        );
       }
     }
     evaluatorCleanupVerified = true;
@@ -2228,8 +3104,12 @@ async function runLoopReviews(
       after.push(await attestCandidateCheckout(pi, evidence, checkoutPath, reviewSignal));
     }
   } catch (error) {
-    primaryFailure = error;
-    throw error;
+    primaryFailure = error instanceof BatchCleanupFailure || error instanceof EvaluatorRecoveryFailure
+      ? error
+      : new EvaluatorRecoveryFailure(
+          `Reviewer evaluators were retained after failure: ${error instanceof Error ? error.message : String(error)}`,
+        );
+    throw primaryFailure;
   } finally {
     const cleanupErrors: string[] = [];
     if (primaryFailure === undefined && evaluatorCleanupVerified) {
@@ -2252,7 +3132,9 @@ async function runLoopReviews(
     monitorStop.abort();
     await controlMonitor;
     if (cleanupErrors.length > 0 && primaryFailure === undefined) {
-      throw new Error(`Could not remove reviewer evaluator checkouts: ${cleanupErrors.join(" ")}`);
+      throw new EvaluatorRecoveryFailure(
+        `Could not remove reviewer evaluator checkouts: ${cleanupErrors.join(" ")}`,
+      );
     }
   }
   return results.map((result, index) => {
@@ -2390,6 +3272,7 @@ async function runWorkerBatch(
   const ordered: Array<WorkerResult | undefined> = new Array(specs.length);
   const prepared: Array<{ index: number; job: PreparedWorkerJob }> = [];
   const launched: Array<{ index: number; job: WorkerJob }> = [];
+  const launchRecoveryErrors: string[] = [];
   let batch: WorkerBatch | undefined;
   let manuallyClosed = false;
 
@@ -2399,20 +3282,94 @@ async function runWorkerBatch(
         content: [{ type: "text", text: `Preparing ${batchTitle}: worker ${index + 1}/${specs.length}...` }],
         details: { batchId, batchTitle, prepared: prepared.length, total: specs.length },
       });
+      const workerId = randomUUID();
       try {
-        const job = await prepareWorker(pi, specs[index], ctxCwd, parent, batchId, batchTitle, yolo, signal);
+        const job = await prepareWorker(
+          pi,
+          specs[index],
+          ctxCwd,
+          parent,
+          batchId,
+          batchTitle,
+          workerId,
+          yolo,
+          signal,
+        );
         prepared.push({ index, job });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        const jobDir = path.join(batchDir, workerId);
+        let metadata: Record<string, unknown> | undefined;
+        try {
+          metadata = await readJson<Record<string, unknown>>(path.join(jobDir, "job.json"));
+        } catch {
+          metadata = undefined;
+        }
+        const failureMessage = `${message} Recoverable worker: ${workerId}. Artifacts: ${jobDir}.`;
+        if (signal?.aborted) {
+          const recoveryErrors = [`${workerId}: ${failureMessage}`];
+          for (const preparedItem of prepared) {
+            try {
+              await updateJobLifecycle(
+                preparedItem.job.jobDir,
+                "recovery_required",
+                `Preparation batch aborted before launch. ${failureMessage}`,
+              );
+              recoveryErrors.push(`${preparedItem.job.id}: artifacts ${preparedItem.job.jobDir}`);
+            } catch {
+              recoveryErrors.push(`${preparedItem.job.id}: lifecycle update failed; artifacts ${preparedItem.job.jobDir}`);
+            }
+          }
+          throw new BatchCleanupFailure("Worker preparation aborted.", recoveryErrors);
+        }
+        try {
+          const [lifecycle, terminal] = await Promise.all([
+            readJobLifecycle(jobDir),
+            readWorkerTerminal<WorkerStatus>(jobDir),
+          ]);
+          const retainedWorktree = metadataString(metadata ?? {}, "worktreePath") ??
+            metadataString(metadata ?? {}, "observedWorktreePath");
+          if (!terminal && lifecycle?.phase !== "recovery_required") {
+            if (retainedWorktree) {
+              await updateJobLifecycle(
+                jobDir,
+                "recovery_required",
+                `${message} Authenticated or observed worktree ${retainedWorktree} requires recovery.`,
+              );
+            } else {
+              const status = {
+                state: "failed",
+                launchNonce: metadataString(metadata ?? {}, "launchNonce"),
+                completedAt: isoNow(),
+                stopReason: "preparation_failed",
+                errorMessage: message,
+              } satisfies WorkerStatus;
+              await claimWorkerTerminal(jobDir, workerId, "recovery", status, message);
+              await reconcileJobLifecycle(jobDir, "failed", message);
+            }
+          }
+        } catch (settlementError) {
+          throw new BatchCleanupFailure("Worker preparation failed and durable settlement was not completed.", [
+            `${workerId}: ${settlementError instanceof Error ? settlementError.message : String(settlementError)} Artifacts: ${jobDir}`,
+          ]);
+        }
         ordered[index] = {
-          id: randomUUID(),
+          id: workerId,
           batchId,
           batchTitle,
-          title: taskTitle(specs[index].task, specs[index].title),
+          title: metadataString(metadata ?? {}, "title") ?? taskTitle(specs[index].task, specs[index].title),
           mode: specs[index].mode,
           state: "failed",
-          output: message,
-          error: message,
+          output: failureMessage,
+          error: failureMessage,
+          jobDir,
+          resultPath: path.join(jobDir, "result.md"),
+          stderrPath: path.join(jobDir, "stderr.log"),
+          codeWorktreeId: metadataString(metadata ?? {}, "codeWorktreeId") ??
+            metadataString(metadata ?? {}, "observedCodeWorktreeId"),
+          worktreePath: metadataString(metadata ?? {}, "worktreePath") ??
+            metadataString(metadata ?? {}, "observedWorktreePath"),
+          branch: metadataString(metadata ?? {}, "branch"),
         };
       }
     }
@@ -2429,6 +3386,12 @@ async function runWorkerBatch(
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof BatchCleanupFailure) {
+          for (const item of prepared) {
+            await updateJobLifecycle(item.job.jobDir, "recovery_required", message);
+          }
+          throw error;
+        }
         for (const item of prepared) {
           const status = {
             state: "failed",
@@ -2478,13 +3441,17 @@ async function runWorkerBatch(
           // The parent turn is already aborting; progress reporting is best effort.
         }
       };
+      let monitorFailure: unknown;
       const surfaceMonitor = monitorBatchSurfaces(
         pi,
         batch,
         monitorController.signal,
         () => ({ jobs: launched.map((entry) => entry.job), launchComplete }),
         handleWorkerSurfaceClosed,
-      );
+      ).catch((error: unknown) => {
+        monitorFailure = error;
+        monitorController.abort();
+      });
 
       try {
         for (let preparedIndex = 0; preparedIndex < prepared.length; preparedIndex++) {
@@ -2493,6 +3460,7 @@ async function runWorkerBatch(
             content: [{ type: "text", text: `Tiling ${batchTitle}: pane ${preparedIndex + 1}/${prepared.length}...` }],
             details: { batchId, batchTitle, launched: launched.length, total: specs.length },
           });
+          let launchingJob: WorkerJob | undefined;
           try {
             const job = await createWorkerSurface(
               pi,
@@ -2500,13 +3468,17 @@ async function runWorkerBatch(
               item.job,
               launched.map((entry) => entry.job),
               workerSignal,
+              async (preparedJob) => {
+                launchingJob = preparedJob;
+              },
             );
             launched.push({ index: item.index, job });
           } catch (error) {
-            if (workerSignal.aborted) throw error;
             const message = error instanceof Error ? error.message : String(error);
-            const lifecycle = await readJobLifecycle(item.job.jobDir);
-            if (lifecycle?.phase !== "recovery_required") {
+            const lifecycle = await readJobLifecycle(launchingJob?.jobDir ?? item.job.jobDir);
+            if (lifecycle?.phase === "recovery_required") {
+              launchRecoveryErrors.push(`${item.job.id}: ${lifecycle.reason ?? message}`);
+            } else {
               const cancelled = lifecycle?.phase === "cancelled";
               const status = {
                 state: "failed",
@@ -2528,6 +3500,7 @@ async function runWorkerBatch(
                 message,
               );
             }
+            if (workerSignal.aborted) throw error;
             ordered[item.index] = {
               id: item.job.id,
               batchId,
@@ -2548,11 +3521,27 @@ async function runWorkerBatch(
           }
         }
 
+        if (launchRecoveryErrors.length > 0) {
+          throw new BatchCleanupFailure(
+            "One or more worker launches require recovery.",
+            launchRecoveryErrors,
+          );
+        }
+        if (launched.length > 0) {
+          await closeBatchAnchor(
+            pi,
+            batch,
+            launched.map((entry) => entry.job),
+            workerSignal,
+          );
+        } else {
+          await requireBatchClosed(pi, batch);
+        }
         launchComplete = true;
         await refocusParent(pi, parent);
         let completed = ordered.filter(Boolean).length;
-        await Promise.all(
-          launched.map(async ({ index, job }) => {
+        const waiters = launched.map(async ({ index, job }) => {
+          try {
             const result = await waitForWorker(pi, job, timeoutSeconds, workerSignal);
             ordered[index] = result;
             completed++;
@@ -2560,10 +3549,22 @@ async function runWorkerBatch(
               content: [{ type: "text", text: `${batchTitle}: ${completed}/${specs.length} finished.` }],
               details: resultDetails(ordered.filter((item): item is WorkerResult => Boolean(item))),
             });
-          }),
+          } catch (error) {
+            monitorController.abort();
+            throw error;
+          }
+        });
+        const settlements = await Promise.allSettled(waiters);
+        const rejected = settlements.find(
+          (settlement): settlement is PromiseRejectedResult => settlement.status === "rejected",
         );
+        monitorController.abort();
+        await surfaceMonitor;
+        if (monitorFailure) throw monitorFailure;
+        if (rejected) throw rejected.reason;
       } catch (error) {
         if (manuallyClosed) throw new Error("Supacode worker surface closed; parent turn aborted.");
+        if (monitorFailure) throw monitorFailure;
         throw error;
       } finally {
         monitorController.abort();
@@ -2573,7 +3574,31 @@ async function runWorkerBatch(
       if (!keepOpen) await requireBatchClosed(pi, batch);
     }
   } catch (error) {
-    if (batch && !manuallyClosed) await closeBatchTab(pi, batch);
+    const message = manuallyClosed
+      ? "Supacode worker surface closed; parent turn aborted."
+      : error instanceof Error ? error.message : String(error);
+    const cleanupErrors = error instanceof BatchCleanupFailure
+      ? [...error.cleanupErrors]
+      : [...launchRecoveryErrors];
+    cleanupErrors.push(...await terminateBatchWorkers(
+      pi,
+      launched.map((entry) => entry.job),
+      message,
+      signal?.aborted === true || manuallyClosed,
+    ));
+    if (batch && cleanupErrors.length === 0) {
+      try {
+        const tabCleanup = await closeBatchTab(pi, batch);
+        if (!tabCleanup.closed) cleanupErrors.push(tabCleanup.error ?? `Batch tab ${batch.tabId} remains open.`);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
+      }
+    }
+    cleanupErrors.push(...await markUnlaunchedPreparedWorkers(prepared, launched, message));
+    if (cleanupErrors.length > 0) {
+      throw new BatchCleanupFailure(message, cleanupErrors);
+    }
+    if (manuallyClosed) throw new Error(message);
     throw error;
   } finally {
     await refocusParent(pi, parent);
@@ -2659,10 +3684,15 @@ async function createLoopWorkspace(
   const title = taskTitle(options.task, options.title);
   const batchTitle = makeBatchTitle(`${parentLabel}: ${title}`, batchId);
   const jobDir = path.join(getAgentDir(), "subagents", batchId, id);
-  await fs.promises.mkdir(jobDir, { recursive: true, mode: 0o700 });
+  await ensureDirectoryDurable(jobDir);
   await fs.promises.chmod(jobDir, 0o700);
   const createdAt = isoNow();
   const worktreePlan = await planCodingWorktree(pi, ctxCwd, title, batchId, id, signal);
+  const worktreeCreation = {
+    launchDir: path.join(jobDir, "worktree-launch"),
+    launchJobId: `${id}-worktree-launch`,
+    launchNonce: randomUUID(),
+  } satisfies SupacodeCreationIntent;
   const loopIntent = {
     schemaVersion: SUBAGENT_SCHEMA_VERSION,
     id,
@@ -2677,6 +3707,10 @@ async function createLoopWorkspace(
     reviewerTimeoutSeconds: options.reviewerTimeoutSeconds,
     keepOpen: options.keepOpen,
     workspacePlan: worktreePlan,
+    worktreeCreationProtocolVersion: 1,
+    worktreeLaunchDir: worktreeCreation.launchDir,
+    worktreeLaunchJobId: worktreeCreation.launchJobId,
+    worktreeLaunchNonce: worktreeCreation.launchNonce,
     createdAt,
   };
   await atomicWrite(path.join(jobDir, "loop.json"), `${JSON.stringify(loopIntent, null, 2)}\n`);
@@ -2695,17 +3729,57 @@ async function createLoopWorkspace(
       delegateLoop: true,
       loopState: "implementing",
       workspacePlan: worktreePlan,
+      worktreeCreationProtocolVersion: 1,
+      worktreeLaunchDir: worktreeCreation.launchDir,
+      worktreeLaunchJobId: worktreeCreation.launchJobId,
+      worktreeLaunchNonce: worktreeCreation.launchNonce,
       createdAt,
     }, null, 2)}\n`,
   );
   await initializeJobLifecycle(jobDir, id, batchId, "planned", {
     delegateLoop: true,
     workspacePlan: worktreePlan,
+    worktreeCreationProtocolVersion: 1,
+    worktreeLaunchDir: worktreeCreation.launchDir,
+    worktreeLaunchJobId: worktreeCreation.launchJobId,
+    worktreeLaunchNonce: worktreeCreation.launchNonce,
   });
-  await updateJobLifecycle(jobDir, "provisioning_worktree");
+  await recordValidationGateIntent(
+    worktreeCreation.launchDir,
+    worktreeCreation.launchJobId,
+    worktreeCreation.launchNonce,
+  );
+  await updateJobLifecycle(jobDir, "provisioning_worktree", undefined, {
+    worktreeCreationProtocolVersion: 1,
+    worktreeLaunchDir: worktreeCreation.launchDir,
+    worktreeLaunchJobId: worktreeCreation.launchJobId,
+    worktreeLaunchNonce: worktreeCreation.launchNonce,
+  });
   let worktree: Awaited<ReturnType<typeof createCodingWorktree>>;
   try {
-    worktree = await createCodingWorktree(pi, worktreePlan, signal);
+    worktree = await createCodingWorktree(
+      pi,
+      worktreePlan,
+      worktreeCreation,
+      signal,
+      async (observedCodeWorktreeId, observedWorktreePath) => {
+        const metadata = await readJson<Record<string, unknown>>(path.join(jobDir, "job.json")) ?? {};
+        await atomicWrite(
+          path.join(jobDir, "job.json"),
+          `${JSON.stringify({
+            ...metadata,
+            observedCodeWorktreeId,
+            observedWorktreePath,
+            worktreeAuthenticationState: "pending",
+          }, null, 2)}\n`,
+        );
+        await updateJobLifecycle(jobDir, "provisioning_worktree", undefined, {
+          observedCodeWorktreeId,
+          observedWorktreePath,
+          worktreeAuthenticationState: "pending",
+        });
+      },
+    );
   } catch (error) {
     await updateJobLifecycle(
       jobDir,
@@ -2743,9 +3817,11 @@ async function createLoopWorkspace(
       baseSha: workspace.baseSha,
     }, null, 2)}\n`,
   );
+  const readyMetadata = await readJson<Record<string, unknown>>(path.join(jobDir, "job.json")) ?? {};
   await atomicWrite(
     path.join(jobDir, "job.json"),
     `${JSON.stringify({
+      ...readyMetadata,
       schemaVersion: SUBAGENT_SCHEMA_VERSION,
       id,
       batchId,
@@ -2757,6 +3833,9 @@ async function createLoopWorkspace(
       tabWorktreeId: workspace.codeWorktreeId,
       codeWorktreeId: workspace.codeWorktreeId,
       worktreePath: workspace.worktreePath,
+      observedCodeWorktreeId: workspace.codeWorktreeId,
+      observedWorktreePath: workspace.worktreePath,
+      worktreeAuthenticationState: "verified",
       branch: workspace.branch,
       baseSha: workspace.baseSha,
       delegateLoop: true,
@@ -2772,6 +3851,9 @@ async function createLoopWorkspace(
   await updateJobLifecycle(jobDir, "workspace_ready", undefined, {
     codeWorktreeId: workspace.codeWorktreeId,
     worktreePath: workspace.worktreePath,
+    observedCodeWorktreeId: workspace.codeWorktreeId,
+    observedWorktreePath: workspace.worktreePath,
+    worktreeAuthenticationState: "verified",
     workerCwd: workspace.workerCwd,
     branch: workspace.branch,
     baseSha: workspace.baseSha,
@@ -2816,6 +3898,35 @@ ${attempts.join("\n") || "- No completed attempt."}${apply}
 Artifacts: ${result.jobDir}`;
 }
 
+async function readLoopAcceptanceIntent(
+  jobDir: string,
+  expectedJobId: string,
+): Promise<LoopAcceptanceIntent | undefined> {
+  const filePath = path.join(jobDir, "acceptance.json");
+  const intent = await readJson<LoopAcceptanceIntent>(filePath);
+  if (!intent) return undefined;
+  const candidate = intent.candidate;
+  const resolvedJobDir = path.resolve(jobDir);
+  const resolvedPatchPath = typeof candidate?.patchPath === "string"
+    ? path.resolve(candidate.patchPath)
+    : "";
+  if (
+    intent.schemaVersion !== SUBAGENT_SCHEMA_VERSION || intent.jobId !== expectedJobId ||
+    typeof intent.createdAt !== "string" || !candidate ||
+    !Number.isSafeInteger(candidate.attempt) || candidate.attempt < 1 ||
+    !OBJECT_ID_PATTERN.test(candidate.tree) || !OBJECT_ID_PATTERN.test(candidate.commit) ||
+    !OBJECT_ID_PATTERN.test(candidate.head) || typeof candidate.branch !== "string" ||
+    candidate.ref !== `refs/pi-agent-candidates/${expectedJobId}/${String(candidate.attempt).padStart(3, "0")}` ||
+    !resolvedPatchPath.startsWith(`${resolvedJobDir}${path.sep}`) ||
+    !/^[a-f0-9]{64}$/i.test(candidate.patchSha256) ||
+    !Number.isSafeInteger(candidate.patchBytes) || candidate.patchBytes < 0 ||
+    typeof candidate.patchPreview !== "string" || typeof candidate.patchPreviewTruncated !== "boolean" ||
+    !Array.isArray(candidate.changedPaths) || !candidate.changedPaths.every((entry) => typeof entry === "string") ||
+    !Array.isArray(candidate.gitlinkPaths) || !candidate.gitlinkPaths.every((entry) => typeof entry === "string")
+  ) throw new Error(`Unsupported delegate-loop acceptance intent at ${filePath}.`);
+  return { ...intent, candidate: { ...candidate, patchPath: resolvedPatchPath } };
+}
+
 async function finalizeDelegateLoop(
   pi: ExtensionAPI,
   workspace: LoopWorkspace,
@@ -2839,6 +3950,15 @@ async function finalizeDelegateLoop(
       acceptedCandidate,
       path.join(workspace.jobDir, "final-acceptance.index"),
       signal,
+    );
+    await atomicWrite(
+      path.join(workspace.jobDir, "acceptance.json"),
+      `${JSON.stringify({
+        schemaVersion: SUBAGENT_SCHEMA_VERSION,
+        jobId: workspace.id,
+        candidate: acceptedCandidate,
+        createdAt: isoNow(),
+      } satisfies LoopAcceptanceIntent, null, 2)}\n`,
     );
     const decision = await claimJobDecision(workspace.jobDir, workspace.id, "accept");
     if (decision.record.owner !== "accept") {
@@ -3151,8 +4271,45 @@ async function runDelegateLoop(
     const cancellationWon = explicitCancellation !== undefined || terminalDecision?.owner === "cancel";
     const terminalLoopState = cancellationWon ? "cancelled" : "failed";
     await recordLoopState(workspace, terminalLoopState, attempts.length, message);
+    const recordRecoveryRequired = async (recoveryReason: string) => {
+      await atomicWrite(
+        path.join(workspace.jobDir, "status.json"),
+        `${JSON.stringify({
+          state: "failed",
+          completedAt: isoNow(),
+          stopReason: "recovery_required",
+          errorMessage: recoveryReason,
+        } satisfies WorkerStatus)}\n`,
+      );
+      await updateJobLifecycle(
+        workspace.jobDir,
+        "recovery_required",
+        recoveryReason,
+        { loopState: terminalLoopState, attempts: attempts.length },
+      );
+    };
+    const requiresRecovery = error instanceof BatchCleanupFailure ||
+      error instanceof EvaluatorRecoveryFailure ||
+      (error instanceof ValidationProcessFailure && !error.terminationVerified);
+    if (requiresRecovery) {
+      await recordRecoveryRequired(message);
+      throw error;
+    }
     if (activeJob) {
-      if (!options.keepOpen && activeBatch) await closeBatchTab(pi, activeBatch);
+      if (activeBatch && (!options.keepOpen || cancellationWon || signal?.aborted)) {
+        let tabCleanupError: string | undefined;
+        try {
+          const tabCleanup = await closeBatchTab(pi, activeBatch);
+          if (!tabCleanup.closed) tabCleanupError = tabCleanup.error ?? `Batch tab ${activeBatch.tabId} remains open.`;
+        } catch (cleanupError) {
+          tabCleanupError = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+        }
+        if (tabCleanupError) {
+          const recoveryError = new BatchCleanupFailure(message, [tabCleanupError]);
+          await recordRecoveryRequired(recoveryError.message);
+          throw recoveryError;
+        }
+      }
       const failed = await finalizeDelegateLoop(
         pi,
         workspace,
@@ -3197,39 +4354,113 @@ function metadataRecord(
     : undefined;
 }
 
+function metadataProcessIdentity(
+  metadata: Record<string, unknown>,
+  key: string,
+): ProcessIdentity | undefined {
+  const value = metadataRecord(metadata, key);
+  if (!value) return undefined;
+  if (
+    typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 1 ||
+    typeof value.startSignature !== "string" || value.startSignature.length === 0 ||
+    typeof value.processGroup !== "number" || !Number.isSafeInteger(value.processGroup) || value.processGroup <= 1 ||
+    typeof value.command !== "string" || typeof value.launchNonce !== "string" || value.launchNonce.length === 0
+  ) return undefined;
+  return {
+    pid: value.pid,
+    startSignature: value.startSignature,
+    processGroup: value.processGroup,
+    command: value.command,
+    launchNonce: value.launchNonce,
+  };
+}
+
 function activeReviewerBindings(
   lifecycle: LifecycleJobRecord["lifecycle"],
 ): ActiveReviewerBinding[] {
   const value = lifecycle?.details.activeReviewerJobs;
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((entry) => {
-    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return [];
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("Active reviewer bindings are malformed.");
+  return value.map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error("Active reviewer binding is not an object.");
+    }
     const record = entry as Record<string, unknown>;
     const jobId = metadataString(record, "jobId");
     const jobDir = metadataString(record, "jobDir");
     const launchNonce = metadataString(record, "launchNonce");
     const checkoutPath = metadataString(record, "checkoutPath");
-    return jobId && jobDir && launchNonce && checkoutPath
-      ? [{ jobId, jobDir, launchNonce, checkoutPath }]
-      : [];
+    if (
+      !jobId || !UUID_PATTERN.test(jobId) || !jobDir || !path.isAbsolute(jobDir) ||
+      !launchNonce || !checkoutPath || !path.isAbsolute(checkoutPath)
+    ) throw new Error("Active reviewer binding identity is incomplete.");
+    return { jobId, jobDir, launchNonce, checkoutPath };
   });
 }
 
-function effectiveLifecycleJobDir(job: LifecycleJobRecord): string {
+async function authenticateActiveReviewerBindings(
+  parent: LifecycleJobRecord,
+  bindings: ActiveReviewerBinding[],
+): Promise<Array<{ binding: ActiveReviewerBinding; reviewer: LifecycleJobRecord }>> {
+  const authenticated: Array<{ binding: ActiveReviewerBinding; reviewer: LifecycleJobRecord }> = [];
+  const parentJobDir = await fs.promises.realpath(parent.jobDir);
+  const parentIterationsDir = path.join(parentJobDir, "iterations");
+  for (const binding of bindings) {
+    if (binding.jobId.toLowerCase() === parent.id.toLowerCase()) {
+      throw new Error("Active reviewer binding refers to its parent job.");
+    }
+    const reviewer = await resolveLifecycleJob(getAgentDir(), binding.jobId);
+    const [recordedJobDir, reviewerJobDir, checkoutPath] = await Promise.all([
+      fs.promises.realpath(binding.jobDir),
+      fs.promises.realpath(reviewer.jobDir),
+      fs.promises.realpath(binding.checkoutPath),
+    ]);
+    const reviewerLaunchNonce = metadataString(reviewer.metadata, "launchNonce");
+    const checkoutLifecycle = await readJson<Record<string, unknown>>(
+      path.join(path.dirname(checkoutPath), "checkout-lifecycle.json"),
+    );
+    const recordedCheckoutPath = checkoutLifecycle && metadataString(checkoutLifecycle, "checkoutPath");
+    const recordedProcessJobDir = checkoutLifecycle && metadataString(checkoutLifecycle, "processJobDir");
+    if (!recordedCheckoutPath || !recordedProcessJobDir) {
+      throw new Error(`Reviewer ${binding.jobId} evaluator intent is incomplete.`);
+    }
+    const [intentCheckoutPath, intentJobDir] = await Promise.all([
+      fs.promises.realpath(recordedCheckoutPath),
+      fs.promises.realpath(recordedProcessJobDir),
+    ]);
+    if (
+      recordedJobDir !== reviewerJobDir || reviewerLaunchNonce !== binding.launchNonce ||
+      !checkoutPath.startsWith(`${parentIterationsDir}${path.sep}`) ||
+      checkoutLifecycle?.phase !== "evaluating" || intentCheckoutPath !== checkoutPath ||
+      metadataString(checkoutLifecycle, "processJobId") !== binding.jobId ||
+      intentJobDir !== reviewerJobDir ||
+      metadataString(checkoutLifecycle, "processLaunchNonce") !== binding.launchNonce
+    ) throw new Error(`Active reviewer binding ${binding.jobId} does not match its evaluator intent.`);
+    authenticated.push({ binding, reviewer });
+  }
+  return authenticated;
+}
+
+async function effectiveLifecycleJobDir(job: LifecycleJobRecord): Promise<string> {
   const configured = metadataString(job.metadata, "activeWorkerJobDir");
-  const root = path.resolve(job.jobDir);
-  return configured && path.resolve(configured).startsWith(`${root}${path.sep}`)
-    ? path.resolve(configured)
-    : root;
+  const lexicalRoot = path.resolve(job.jobDir);
+  const canonicalRoot = await fs.promises.realpath(lexicalRoot);
+  if (!configured) return lexicalRoot;
+  const lexicalRuntime = path.resolve(configured);
+  const canonicalRuntime = await fs.promises.realpath(lexicalRuntime);
+  if (canonicalRuntime !== canonicalRoot && !canonicalRuntime.startsWith(`${canonicalRoot}${path.sep}`)) {
+    throw new Error(`Active worker runtime escapes job ${job.id}.`);
+  }
+  return lexicalRuntime;
 }
 
 function hasLifecycleSurfaceIntent(job: LifecycleJobRecord): boolean {
-  return ["tabWorktreeId", "tabId", "surfaceId"].some(
+  return ["tabId", "surfaceId"].some(
     (key) => metadataString(job.metadata, key) !== undefined,
   );
 }
 
-function supervisedLifecycleWorker(job: LifecycleJobRecord): {
+function supervisedLifecycleWorker(job: LifecycleJobRecord, workerDir: string): {
   id: string;
   jobDir: string;
   tabWorktreeId: string;
@@ -3244,7 +4475,7 @@ function supervisedLifecycleWorker(job: LifecycleJobRecord): {
   if (!tabWorktreeId || !tabId || !surfaceId || !launchNonce) return undefined;
   return {
     id: job.id,
-    jobDir: effectiveLifecycleJobDir(job),
+    jobDir: workerDir,
     tabWorktreeId,
     tabId,
     surfaceId,
@@ -3265,10 +4496,12 @@ function formatLifecycleStatus(job: LifecycleJobRecord): string {
   const tabId = metadataString(job.metadata, "tabId");
   const surfaceId = metadataString(job.metadata, "surfaceId");
   const activeEvaluatorDir = lifecycle && metadataString(lifecycle.details, "activeEvaluatorDir");
+  const corruptMetadataError = metadataString(job.metadata, "corruptMetadataError");
   if (worktreePath) lines.push(`Worktree: ${worktreePath}`);
   if (tabId) lines.push(`Tab: ${tabId}`);
   if (surfaceId) lines.push(`Surface: ${surfaceId}`);
   if (activeEvaluatorDir) lines.push(`Active evaluator: ${activeEvaluatorDir}`);
+  if (corruptMetadataError) lines.push(`Metadata error: ${corruptMetadataError}`);
   if (job.decision) lines.push(`Decision: ${job.decision.owner} at ${job.decision.claimedAt}`);
   if (job.terminal) lines.push(`Terminal owner: ${job.terminal.owner} at ${job.terminal.claimedAt}`);
   if (job.control) lines.push(`Control: ${job.control.action} requested at ${job.control.requestedAt}`);
@@ -3281,24 +4514,30 @@ async function cancelLifecycleJob(
   job: LifecycleJobRecord,
   reason: string,
 ): Promise<string> {
+  job = await resolveLifecycleJob(getAgentDir(), job.id);
+  const workerDir = await effectiveLifecycleJobDir(job);
+  const lexicalJobDir = path.resolve(job.jobDir);
+  const currentLifecycle = await readJobLifecycle(job.jobDir);
+  const reviewerBindings = activeReviewerBindings(currentLifecycle);
+  const authenticatedReviewers = await authenticateActiveReviewerBindings(job, reviewerBindings);
+  const workerDecision = workerDir !== lexicalJobDir
+    ? await claimJobDecision(workerDir, job.id, "cancel")
+    : undefined;
   const decision = await claimJobDecision(job.jobDir, job.id, "cancel");
   if (decision.record.owner === "accept") {
     return `Delegation ${job.id} was already accepted before cancellation linearized.`;
   }
-  job = await resolveLifecycleJob(getAgentDir(), job.id);
-  const workerDir = effectiveLifecycleJobDir(job);
-  await writeJobControl(workerDir, job.id, reason);
-  if (workerDir !== job.jobDir) await writeJobControl(job.jobDir, job.id, reason);
-  const currentLifecycle = await readJobLifecycle(job.jobDir);
-  const reviewerBindings = activeReviewerBindings(currentLifecycle);
-  if (reviewerBindings.length > 0) {
+  if (!workerDecision || workerDecision.record.owner === "cancel") {
+    await writeJobControl(workerDir, job.id, reason);
+  }
+  if (workerDir !== lexicalJobDir) await writeJobControl(job.jobDir, job.id, reason);
+  if (authenticatedReviewers.length > 0) {
     const outcomes: string[] = [];
     let verified = true;
-    for (const binding of reviewerBindings) {
+    for (const { binding, reviewer: reviewerJob } of authenticatedReviewers) {
       try {
-        const reviewerJob = await resolveLifecycleJob(getAgentDir(), binding.jobId);
         outcomes.push(await cancelLifecycleJob(pi, reviewerJob, reason));
-        const reviewerLifecycle = await readJobLifecycle(binding.jobDir);
+        const reviewerLifecycle = await readJobLifecycle(reviewerJob.jobDir);
         if (reviewerLifecycle?.phase !== "cancelled") verified = false;
       } catch (error) {
         verified = false;
@@ -3322,10 +4561,19 @@ async function cancelLifecycleJob(
   const evaluatorJobId = currentLifecycle && metadataString(currentLifecycle.details, "activeEvaluatorJobId");
   const evaluatorLaunchNonce = currentLifecycle && metadataString(currentLifecycle.details, "activeEvaluatorLaunchNonce");
   if (activeEvaluatorDir && evaluatorJobId && evaluatorLaunchNonce) {
-    const resolvedEvaluatorDir = path.resolve(activeEvaluatorDir);
-    const resolvedJobDir = path.resolve(job.jobDir);
-    if (!resolvedEvaluatorDir.startsWith(`${resolvedJobDir}${path.sep}`)) {
-      await updateJobLifecycle(job.jobDir, "recovery_required", "Active evaluator path escapes the delegation job.");
+    let resolvedEvaluatorDir: string;
+    try {
+      const resolvedJobDir = await fs.promises.realpath(job.jobDir);
+      resolvedEvaluatorDir = await fs.promises.realpath(activeEvaluatorDir);
+      if (!resolvedEvaluatorDir.startsWith(`${resolvedJobDir}${path.sep}`)) {
+        throw new Error("Active evaluator path escapes the delegation job.");
+      }
+    } catch (error) {
+      await updateJobLifecycle(
+        job.jobDir,
+        "recovery_required",
+        error instanceof Error ? error.message : String(error),
+      );
       return `Cancellation requested for ${job.id}, but evaluator recovery is required.`;
     }
     try {
@@ -3357,9 +4605,18 @@ async function cancelLifecycleJob(
       return `Cancellation requested for ${job.id}, but evaluator recovery is required.`;
     }
   }
+  if (
+    job.mode === "coding" && !hasLifecycleSurfaceIntent(job) &&
+    (metadataRecord(job.metadata, "workspacePlan") || job.metadata.worktreeCreationProtocolVersion === 1)
+  ) {
+    const worktreeRecovery = await recoverUnlaunchedCodingWorktree(pi, job, false);
+    if (worktreeRecovery && !worktreeRecovery.complete) {
+      return `Cancellation requested for ${job.id}, but worktree recovery is required: ${worktreeRecovery.message}`;
+    }
+  }
   const existing = await readWorkerTerminal<WorkerStatus>(workerDir);
   if (existing) {
-    const resource = supervisedLifecycleWorker(job);
+    const resource = supervisedLifecycleWorker(job, workerDir);
     if (!resource) {
       if (hasLifecycleSurfaceIntent(job)) {
         await updateJobLifecycle(
@@ -3408,7 +4665,7 @@ async function cancelLifecycleJob(
     errorMessage: reason,
   } satisfies WorkerStatus;
   await updateJobLifecycle(job.jobDir, "stopping", reason);
-  const resource = supervisedLifecycleWorker(job);
+  const resource = supervisedLifecycleWorker(job, workerDir);
   if (!resource && hasLifecycleSurfaceIntent(job)) {
     await updateJobLifecycle(
       job.jobDir,
@@ -3418,6 +4675,17 @@ async function cancelLifecycleJob(
     return `Cancellation requested for ${job.id}, but its surface metadata requires recovery.`;
   }
   if (!resource) {
+    const batchPath = path.join(getAgentDir(), "subagents", job.batchId, "batch.json");
+    const batchBeforeRecovery = await readJson<Record<string, unknown>>(batchPath);
+    if (batchBeforeRecovery && metadataString(batchBeforeRecovery, "tabId")) {
+      await recoverInterruptedBatchTab(pi, job);
+      const recoveredBatch = await readJson<Record<string, unknown>>(batchPath);
+      if (metadataString(recoveredBatch ?? {}, "phase") !== "closed") {
+        const message = "Cancellation could not verify interrupted batch-tab creation and cleanup.";
+        await updateJobLifecycle(job.jobDir, "recovery_required", message);
+        return `Cancellation requested for ${job.id}, but batch-tab recovery is required.`;
+      }
+    }
     const runner = await readRunnerProcess(workerDir);
     if (status?.processIdentity || runner) {
       const expectedLaunchNonce = status?.launchNonce ?? metadataString(job.metadata, "launchNonce");
@@ -3470,6 +4738,97 @@ async function cancelLifecycleJob(
   return `Cancelled ${job.id}; its surface and recorded processes are absent.`;
 }
 
+async function batchTabClosureSafety(
+  pi: ExtensionAPI,
+  job: LifecycleJobRecord,
+  worktreeId: string,
+  tabId: string,
+): Promise<{ safe: boolean; reason?: string }> {
+  const batchDir = path.join(getAgentDir(), "subagents", job.batchId);
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(batchDir, { withFileTypes: true });
+  } catch (error) {
+    return { safe: false, reason: `Could not enumerate batch jobs: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const knownSurfaces = new Set<string>([tabId.toLowerCase()]);
+  const selectedSurface = metadataString(job.metadata, "surfaceId");
+  if (selectedSurface) knownSurfaces.add(selectedSurface.toLowerCase());
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === "tab-launches") continue;
+    const siblingDir = path.join(batchDir, entry.name);
+    let metadata: Record<string, unknown> | undefined;
+    try {
+      metadata = await readJson<Record<string, unknown>>(path.join(siblingDir, "job.json"));
+    } catch (error) {
+      return { safe: false, reason: `Could not read sibling metadata in ${siblingDir}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!metadata) continue;
+    const siblingId = metadataString(metadata, "id");
+    if (!siblingId || siblingId === job.id) continue;
+    const siblingTabId = metadataString(metadata, "tabId");
+    if (!siblingTabId || !sameSupacodeUuid(siblingTabId, tabId)) continue;
+    const surfaceId = metadataString(metadata, "surfaceId");
+    if (surfaceId) knownSurfaces.add(surfaceId.toLowerCase());
+    const activeWorkerDir = metadataString(metadata, "activeWorkerJobDir");
+    const resolvedSiblingDir = activeWorkerDir &&
+        path.resolve(activeWorkerDir).startsWith(`${path.resolve(siblingDir)}${path.sep}`)
+      ? path.resolve(activeWorkerDir)
+      : siblingDir;
+    let lifecycle: Awaited<ReturnType<typeof readJobLifecycle>>;
+    let terminal: WorkerTerminalRecord<WorkerStatus> | undefined;
+    try {
+      [lifecycle, terminal] = await Promise.all([
+        readJobLifecycle(siblingDir),
+        readWorkerTerminal<WorkerStatus>(resolvedSiblingDir),
+      ]);
+    } catch (error) {
+      return { safe: false, reason: `Could not authenticate sibling ${siblingId}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    const lifecycleTerminal = ["completed", "failed", "timed_out", "cancelled"].includes(lifecycle?.phase ?? "");
+    if (!lifecycleTerminal && !terminal) {
+      return { safe: false, reason: `Sibling worker ${siblingId} is still ${lifecycle?.phase ?? "nonterminal"}.` };
+    }
+    const tabWorktreeId = metadataString(metadata, "tabWorktreeId");
+    const launchNonce = metadataString(metadata, "launchNonce");
+    if (!tabWorktreeId || !surfaceId || !launchNonce) {
+      return { safe: false, reason: `Sibling worker ${siblingId} has incomplete surface identity.` };
+    }
+    const siblingResource = {
+      id: siblingId,
+      jobDir: resolvedSiblingDir,
+      tabWorktreeId,
+      tabId: siblingTabId,
+      surfaceId,
+      launchNonce,
+    };
+    const creation = await reconcileWorkerSurfaceCreation(pi, siblingResource);
+    if (!creation.verified) {
+      return { safe: false, reason: `Sibling worker ${siblingId} creation is indeterminate: ${creation.error ?? "unknown error"}` };
+    }
+    const status = await readJson<WorkerStatus>(path.join(resolvedSiblingDir, "status.json"));
+    const processes = await verifyWorkerProcessesAbsent(
+      pi,
+      siblingResource,
+      terminal?.status.processIdentity ?? status?.processIdentity,
+    );
+    if (!processes.absent) {
+      return { safe: false, reason: `Sibling worker ${siblingId} process state is ${processes.states.join(", ")}.` };
+    }
+  }
+  const listed = await pi.exec(
+    "supacode",
+    ["surface", "list", "-w", worktreeId, "-t", tabId],
+    { timeout: TAB_LIST_TIMEOUT_MS },
+  );
+  if (listed.code !== 0) return { safe: false, reason: "Could not enumerate batch surfaces before tab cleanup." };
+  const unknownSurface = listed.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)
+    .find((surfaceId) => !knownSurfaces.has(surfaceId.toLowerCase()));
+  return unknownSurface
+    ? { safe: false, reason: `Unattributed surface ${unknownSurface} remains in the shared batch tab.` }
+    : { safe: true };
+}
+
 async function recoverInterruptedBatchTab(
   pi: ExtensionAPI,
   job: LifecycleJobRecord,
@@ -3479,16 +4838,43 @@ async function recoverInterruptedBatchTab(
     job.lifecycle?.phase ?? "",
   );
   if (hasSurfaceIntent && !lifecycleTerminal) return undefined;
+  if (!hasSurfaceIntent) {
+    const batchRecovery = await recoverBatchBeforeFirstSurface(pi, job.batchId);
+    if (batchRecovery.recovered) {
+      return batchRecovery.message ?? `Closed batch ${job.batchId} before its first worker surface launched.`;
+    }
+  }
   const batchPath = path.join(getAgentDir(), "subagents", job.batchId, "batch.json");
   const batch = await readJson<Record<string, unknown>>(batchPath);
   const tabId = batch && metadataString(batch, "tabId");
   const worktreeId = batch && metadataString(batch, "worktreeId");
   const phase = batch && metadataString(batch, "phase");
-  if (!batch || !tabId || !worktreeId || phase === "closed") return undefined;
+  if (!batch || !tabId || !worktreeId) return undefined;
   if (
-    phase !== "launching" && phase !== "closing" && phase !== "recovery_required" &&
+    phase !== "launching" && phase !== "running" && phase !== "closing" &&
+    phase !== "closed" && phase !== "recovery_required" &&
     job.lifecycle?.phase !== "recovery_required"
   ) return undefined;
+  const batchDir = path.dirname(batchPath);
+  const tabLaunchDir = metadataString(batch, "tabLaunchDir");
+  const tabLaunchJobId = metadataString(batch, "tabLaunchJobId");
+  const tabLaunchNonce = metadataString(batch, "tabLaunchNonce");
+  if (
+    !tabLaunchDir || !tabLaunchJobId || !tabLaunchNonce ||
+    !path.resolve(tabLaunchDir).startsWith(`${path.resolve(batchDir)}${path.sep}`) ||
+    !await recoverCreationLaunchProcess(pi, tabLaunchDir, tabLaunchJobId, tabLaunchNonce)
+  ) {
+    const reason = "Tab creation process is not verified absent; tab cleanup was deferred.";
+    await atomicWrite(
+      batchPath,
+      `${JSON.stringify({ ...batch, phase: "recovery_required", recoveryError: reason, updatedAt: isoNow() }, null, 2)}\n`,
+    );
+    return reason;
+  }
+  const closureSafety = await batchTabClosureSafety(pi, job, worktreeId, tabId);
+  if (!closureSafety.safe) {
+    return `Shared batch tab ${tabId} was retained: ${closureSafety.reason ?? "sibling cleanup is not verified"}`;
+  }
   await pi.exec(
     "supacode",
     ["tab", "close", "-w", worktreeId, "-t", tabId],
@@ -3525,18 +4911,241 @@ async function recoverInterruptedBatchTab(
   return `Batch tab ${tabId} could not be verified absent.`;
 }
 
+interface WorktreeRecoveryOutcome {
+  message: string;
+  complete: boolean;
+}
+
+interface WorktreeCleanupRecord {
+  schemaVersion: 1;
+  jobId: string;
+  worktreePath: string;
+  worktreeId?: string;
+  gitDir: string;
+  gitDirDevice: string;
+  gitDirInode: string;
+  branch: string;
+  phase: "planned" | "git_removed" | "completed";
+  createdAt: string;
+  updatedAt: string;
+}
+
+async function canonicalizeMissingPath(filePath: string): Promise<string> {
+  const suffix: string[] = [];
+  let cursor = path.resolve(filePath);
+  while (true) {
+    try {
+      return path.join(await fs.promises.realpath(cursor), ...suffix.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw error;
+      suffix.push(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+async function recordedGitWorktreeIdentityMatches(
+  pi: ExtensionAPI,
+  record: WorktreeCleanupRecord,
+): Promise<boolean> {
+  try {
+    let observedGitDir: string;
+    if (await filePathExists(record.worktreePath)) {
+      const output = await gitRawOutput(
+        pi,
+        record.worktreePath,
+        ["rev-parse", "--absolute-git-dir"],
+      );
+      observedGitDir = await fs.promises.realpath(output.trim());
+    } else {
+      observedGitDir = await fs.promises.realpath(record.gitDir);
+    }
+    if (observedGitDir !== record.gitDir) return false;
+    const stat = await fs.promises.stat(observedGitDir);
+    return String(stat.dev) === record.gitDirDevice && String(stat.ino) === record.gitDirInode;
+  } catch {
+    return false;
+  }
+}
+
+async function finishRecordedWorktreeCleanup(
+  pi: ExtensionAPI,
+  job: LifecycleJobRecord,
+  record: WorktreeCleanupRecord,
+  reconcileAsFailed: boolean,
+): Promise<WorktreeRecoveryOutcome | undefined> {
+  const cleanupPath = path.join(job.jobDir, "worktree-cleanup.json");
+  if (record.worktreeId) {
+    let idPath: string;
+    try {
+      idPath = await canonicalizeMissingPath(decodeSupacodeResourceId(record.worktreeId));
+    } catch {
+      const reason = `Supacode cleanup identity is not a valid path: ${record.worktreeId}`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+    if (idPath !== record.worktreePath) {
+      const reason = `Supacode cleanup identity does not match ${record.worktreePath}; cleanup was refused.`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+  }
+  const repository = metadataString(job.metadata, "originalCwd") ?? record.worktreePath;
+  const registered = await gitRawOutput(
+    pi,
+    repository,
+    ["worktree", "list", "--porcelain", "-z"],
+  );
+  const registeredPaths = registered.split("\0\0").flatMap((entry) =>
+    entry.split("\0").filter((line) => line.startsWith("worktree ")).map((line) => line.slice("worktree ".length))
+  );
+  let registeredCanonical = await Promise.all(
+    registeredPaths.map((candidate) => canonicalizeMissingPath(candidate)),
+  );
+  let stillRegistered = registeredCanonical.includes(record.worktreePath);
+  if (
+    stillRegistered && record.phase === "planned" &&
+    !await recordedGitWorktreeIdentityMatches(pi, record)
+  ) {
+    const reason = `Planned worktree cleanup identity was replaced at ${record.worktreePath}; cleanup was refused.`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+    return { message: reason, complete: false };
+  }
+  if (stillRegistered && record.phase !== "planned") {
+    const reason = `Removed worktree cleanup identity was reused at ${record.worktreePath}; cleanup was refused.`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+    return { message: reason, complete: false };
+  }
+  if (stillRegistered && !await filePathExists(record.worktreePath)) {
+    const removedStaleRegistration = await pi.exec(
+      "git",
+      ["-C", repository, "worktree", "remove", record.worktreePath],
+      { timeout: 60_000 },
+    );
+    if (removedStaleRegistration.code !== 0) {
+      const reason = `Git still registers missing worktree ${record.worktreePath}: ${(removedStaleRegistration.stderr || removedStaleRegistration.stdout).trim()}`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+    const afterRemoval = await gitRawOutput(pi, repository, ["worktree", "list", "--porcelain", "-z"]);
+    const afterPaths = afterRemoval.split("\0\0").flatMap((entry) =>
+      entry.split("\0").filter((line) => line.startsWith("worktree ")).map((line) => line.slice("worktree ".length))
+    );
+    registeredCanonical = await Promise.all(afterPaths.map((candidate) => canonicalizeMissingPath(candidate)));
+    stillRegistered = registeredCanonical.includes(record.worktreePath);
+    if (stillRegistered) {
+      const reason = `Git worktree registration remains after exact removal: ${record.worktreePath}`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+  }
+  if (stillRegistered) return undefined;
+  if (await filePathExists(record.worktreePath)) {
+    const reason = `Worktree path was recreated after Git registration removal: ${record.worktreePath}; cleanup was refused.`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+    return { message: reason, complete: false };
+  }
+
+  let current = record;
+  if (current.phase === "planned") {
+    current = { ...current, phase: "git_removed", updatedAt: isoNow() };
+    await atomicWrite(cleanupPath, `${JSON.stringify(current, null, 2)}\n`);
+  }
+  if (current.phase === "git_removed" && current.worktreeId) {
+    let absentConfirmations = 0;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const listed = await pi.exec("supacode", ["worktree", "list"], { timeout: 30_000 });
+      if (listed.code !== 0) {
+        const reason = `Could not verify Supacode worktree cleanup for ${current.worktreeId}.`;
+        await updateJobLifecycle(job.jobDir, "recovery_required", reason, {
+          worktreePath: current.worktreePath,
+          worktreeId: current.worktreeId,
+        });
+        return { message: reason, complete: false };
+      }
+      const present = listed.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)
+        .includes(current.worktreeId);
+      if (!present) {
+        absentConfirmations++;
+        if (absentConfirmations >= 2) break;
+      } else {
+        absentConfirmations = 0;
+        const deleted = await pi.exec(
+          "supacode",
+          ["worktree", "delete", "-w", current.worktreeId],
+          { timeout: 190_000 },
+        );
+        if (deleted.code !== 0) {
+          const reason = `Supacode resource cleanup failed for ${current.worktreeId}: ${(deleted.stderr || deleted.stdout).trim()}`;
+          await updateJobLifecycle(job.jobDir, "recovery_required", reason, {
+            worktreePath: current.worktreePath,
+            worktreeId: current.worktreeId,
+          });
+          return { message: reason, complete: false };
+        }
+      }
+      await delay(100);
+    }
+    if (absentConfirmations < 2) {
+      const reason = `Supacode worktree ${current.worktreeId} could not be verified absent.`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+  }
+  current = { ...current, phase: "completed", updatedAt: isoNow() };
+  await atomicWrite(cleanupPath, `${JSON.stringify(current, null, 2)}\n`);
+  const reason = `Removed untouched worktree left by interrupted provisioning: ${current.worktreePath}`;
+  if (reconcileAsFailed) {
+    await reconcileJobLifecycle(job.jobDir, "failed", reason, {
+      worktreePath: current.worktreePath,
+      worktreeId: current.worktreeId,
+    });
+  }
+  return { message: reason, complete: true };
+}
+
 async function recoverUnlaunchedCodingWorktree(
   pi: ExtensionAPI,
   job: LifecycleJobRecord,
-): Promise<string | undefined> {
+  reconcileAsFailed = true,
+): Promise<WorktreeRecoveryOutcome | undefined> {
   if (job.mode !== "coding" || hasLifecycleSurfaceIntent(job)) return undefined;
   if (
     job.lifecycle?.phase !== "provisioning_worktree" &&
     job.lifecycle?.phase !== "workspace_ready" &&
     job.lifecycle?.phase !== "failed" &&
+    job.lifecycle?.phase !== "cancelled" &&
     job.lifecycle?.phase !== "recovery_required"
   ) return undefined;
-  const workerDir = effectiveLifecycleJobDir(job);
+  if (job.metadata.worktreeCreationProtocolVersion === 1) {
+    const launchDirValue = metadataString(job.metadata, "worktreeLaunchDir") ??
+      metadataString(job.lifecycle?.details ?? {}, "worktreeLaunchDir");
+    const launchJobId = metadataString(job.metadata, "worktreeLaunchJobId") ??
+      metadataString(job.lifecycle?.details ?? {}, "worktreeLaunchJobId");
+    const launchNonce = metadataString(job.metadata, "worktreeLaunchNonce") ??
+      metadataString(job.lifecycle?.details ?? {}, "worktreeLaunchNonce");
+    let launchDir: string | undefined;
+    if (launchDirValue) {
+      try {
+        const canonicalJobDir = await fs.promises.realpath(job.jobDir);
+        const canonicalLaunchDir = await fs.promises.realpath(launchDirValue);
+        if (canonicalLaunchDir.startsWith(`${canonicalJobDir}${path.sep}`)) launchDir = canonicalLaunchDir;
+      } catch {
+        launchDir = undefined;
+      }
+    }
+    if (
+      !launchDir || !launchJobId || !launchNonce ||
+      !await recoverCreationLaunchProcess(pi, launchDir, launchJobId, launchNonce)
+    ) {
+      const reason = "Coding-worktree creation process is not verified absent; worktree recovery was deferred.";
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+  }
+  const workerDir = await effectiveLifecycleJobDir(job);
   const [runnerProcess, workerStatus] = await Promise.all([
     readRunnerProcess(workerDir),
     readJson<WorkerStatus>(path.join(workerDir, "status.json")),
@@ -3544,16 +5153,53 @@ async function recoverUnlaunchedCodingWorktree(
   if (runnerProcess || workerStatus?.processIdentity) {
     const reason = "Worker process metadata exists for a purportedly unlaunched worktree; cleanup was refused.";
     await updateJobLifecycle(job.jobDir, "recovery_required", reason);
-    return reason;
+    return { message: reason, complete: false };
   }
   const plan = metadataRecord(job.metadata, "workspacePlan") ??
     metadataRecord(job.lifecycle.details, "workspacePlan");
   const branch = plan && metadataString(plan, "branch");
   const baseSha = plan && metadataString(plan, "baseSha");
   const originalCwd = metadataString(job.metadata, "originalCwd");
+  const observedWorktreeId = metadataString(job.metadata, "observedCodeWorktreeId") ??
+    metadataString(job.lifecycle?.details ?? {}, "observedCodeWorktreeId");
+  const observedWorktreePath = metadataString(job.metadata, "observedWorktreePath") ??
+    metadataString(job.lifecycle?.details ?? {}, "observedWorktreePath");
   if (!branch || !baseSha || !originalCwd) {
     await updateJobLifecycle(job.jobDir, "recovery_required", "Worktree provisioning intent is incomplete.");
-    return "Worktree provisioning intent is incomplete; no resource was removed.";
+    return { message: "Worktree provisioning intent is incomplete; no resource was removed.", complete: false };
+  }
+  const cleanupPath = path.join(job.jobDir, "worktree-cleanup.json");
+  const cleanupRecord = await readJson<WorktreeCleanupRecord>(cleanupPath);
+  if (cleanupRecord) {
+    if (
+      cleanupRecord.schemaVersion !== 1 || cleanupRecord.jobId !== job.id ||
+      cleanupRecord.branch !== branch || !path.isAbsolute(cleanupRecord.worktreePath) ||
+      !path.isAbsolute(cleanupRecord.gitDir) || !/^\d+$/.test(cleanupRecord.gitDirDevice) ||
+      !/^\d+$/.test(cleanupRecord.gitDirInode) ||
+      (cleanupRecord.worktreeId !== undefined &&
+        (typeof cleanupRecord.worktreeId !== "string" || !cleanupRecord.worktreeId.trim())) ||
+      !["planned", "git_removed", "completed"].includes(cleanupRecord.phase)
+    ) {
+      const reason = "Persisted worktree cleanup transaction does not match job identity.";
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+    const [canonicalCleanupPath, canonicalCleanupIdPath] = await Promise.all([
+      canonicalizeMissingPath(cleanupRecord.worktreePath),
+      cleanupRecord.worktreeId
+        ? canonicalizeMissingPath(decodeSupacodeResourceId(cleanupRecord.worktreeId))
+        : Promise.resolve(undefined),
+    ]);
+    if (
+      canonicalCleanupPath !== cleanupRecord.worktreePath ||
+      (canonicalCleanupIdPath !== undefined && canonicalCleanupIdPath !== cleanupRecord.worktreePath)
+    ) {
+      const reason = "Persisted worktree cleanup path and Supacode identity do not match.";
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+    const resumed = await finishRecordedWorktreeCleanup(pi, job, cleanupRecord, reconcileAsFailed);
+    if (resumed) return resumed;
   }
   const listed = await gitRawOutput(pi, originalCwd, ["worktree", "list", "--porcelain", "-z"]);
   const worktree = listed
@@ -3576,19 +5222,88 @@ async function recoverUnlaunchedCodingWorktree(
     })
     .find((candidate) => candidate.branch === branch);
   if (!worktree?.path) {
+    if (observedWorktreeId || observedWorktreePath) {
+      const reason = `Supacode returned an unauthenticated worktree that was retained for manual reconciliation: ${observedWorktreePath ?? "unknown path"} (${observedWorktreeId ?? "unknown ID"}).`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason, {
+        observedCodeWorktreeId: observedWorktreeId,
+        observedWorktreePath,
+      });
+      return { message: reason, complete: false };
+    }
     const reason = "No Git worktree exists for the persisted provisioning intent.";
-    await reconcileJobLifecycle(job.jobDir, "failed", reason);
-    return reason;
+    if (reconcileAsFailed) await reconcileJobLifecycle(job.jobDir, "failed", reason);
+    return { message: reason, complete: true };
   }
   const worktreePath = await fs.promises.realpath(worktree.path);
+  if (observedWorktreePath) {
+    let canonicalObserved: string;
+    try {
+      canonicalObserved = await fs.promises.realpath(observedWorktreePath);
+    } catch {
+      const reason = `Observed Supacode worktree path disappeared before authentication: ${observedWorktreePath} (${observedWorktreeId ?? "unknown ID"}).`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+    if (canonicalObserved !== worktreePath) {
+      const reason = `Observed Supacode worktree ${canonicalObserved} does not match planned worktree ${worktreePath}; both were retained.`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason, {
+        observedCodeWorktreeId: observedWorktreeId,
+        observedWorktreePath: canonicalObserved,
+        worktreePath,
+      });
+      return { message: reason, complete: false };
+    }
+  }
   const status = await gitRawOutput(pi, worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]);
   if (worktree.head !== baseSha || status.trim()) {
     const reason = `Recovered worktree ${worktreePath} is not an untouched delegation base; it was retained.`;
     await updateJobLifecycle(job.jobDir, "recovery_required", reason, { worktreePath });
-    return reason;
+    return { message: reason, complete: false };
   }
+  const worktreeGitDirOutput = await gitRawOutput(
+    pi,
+    worktreePath,
+    ["rev-parse", "--absolute-git-dir"],
+  );
+  const worktreeGitDir = await fs.promises.realpath(worktreeGitDirOutput.trim());
+  const worktreeGitDirStat = await fs.promises.stat(worktreeGitDir);
   const supacodeList = await execChecked(pi, "supacode", ["worktree", "list"], { timeout: 30_000 });
-  const worktreeId = findSupacodePathId(supacodeList, worktreePath);
+  const worktreeId = findSupacodePathId(supacodeList, worktreePath) ?? observedWorktreeId;
+  if (worktreeId) {
+    let worktreeIdPath: string;
+    try {
+      worktreeIdPath = await canonicalizeMissingPath(decodeSupacodeResourceId(worktreeId));
+    } catch {
+      const reason = `Observed Supacode worktree ID is not a valid path: ${worktreeId}`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+    if (worktreeIdPath !== worktreePath) {
+      const reason = `Observed Supacode worktree ID does not match authenticated path ${worktreePath}; Git cleanup was refused.`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+  }
+  if (cleanupRecord && cleanupRecord.worktreePath !== worktreePath) {
+    const reason = `Persisted cleanup path ${cleanupRecord.worktreePath} does not match recovered worktree ${worktreePath}.`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+    return { message: reason, complete: false };
+  }
+  const now = isoNow();
+  const transaction = {
+    schemaVersion: 1,
+    jobId: job.id,
+    worktreePath,
+    worktreeId: cleanupRecord?.worktreeId ?? worktreeId,
+    gitDir: worktreeGitDir,
+    gitDirDevice: String(worktreeGitDirStat.dev),
+    gitDirInode: String(worktreeGitDirStat.ino),
+    branch,
+    phase: "planned",
+    createdAt: cleanupRecord?.createdAt ?? now,
+    updatedAt: now,
+  } satisfies WorktreeCleanupRecord;
+  await atomicWrite(cleanupPath, `${JSON.stringify(transaction, null, 2)}\n`);
   const removed = await pi.exec(
     "git",
     ["-C", originalCwd, "worktree", "remove", worktreePath],
@@ -3597,29 +5312,410 @@ async function recoverUnlaunchedCodingWorktree(
   if (removed.code !== 0) {
     const reason = `Git refused to remove recovered worktree ${worktreePath}: ${(removed.stderr || removed.stdout).trim()}`;
     await updateJobLifecycle(job.jobDir, "recovery_required", reason, { worktreePath });
-    return reason;
+    return { message: reason, complete: false };
   }
-  if (worktreeId) {
-    const deleted = await pi.exec(
-      "supacode",
-      ["worktree", "delete", "-w", worktreeId],
-      { timeout: 190_000 },
+  const gitRemoved = { ...transaction, phase: "git_removed", updatedAt: isoNow() } satisfies WorktreeCleanupRecord;
+  await atomicWrite(cleanupPath, `${JSON.stringify(gitRemoved, null, 2)}\n`);
+  const finished = await finishRecordedWorktreeCleanup(pi, job, gitRemoved, reconcileAsFailed);
+  if (!finished) {
+    const reason = `Git still reports removed worktree ${worktreePath}; cleanup is indeterminate.`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+    return { message: reason, complete: false };
+  }
+  return finished;
+}
+
+async function recoverCreationLaunchProcess(
+  pi: ExtensionAPI,
+  launchDir: string,
+  launchJobId: string,
+  launchNonce: string,
+): Promise<boolean> {
+  const reconciled = await readJson<{
+    schemaVersion: 1;
+    jobId: string;
+    launchNonce: string;
+    reconciledAt: string;
+  }>(path.join(launchDir, "creation-reconciled.json"));
+  if (reconciled) {
+    return reconciled.schemaVersion === 1 && reconciled.jobId === launchJobId &&
+      reconciled.launchNonce === launchNonce;
+  }
+  const completion = await readJson<SupacodeCreationCompletion>(
+    path.join(launchDir, "creation-complete.json"),
+  );
+  if (completion) {
+    const valid = completion.schemaVersion === SUBAGENT_SCHEMA_VERSION &&
+      completion.jobId === launchJobId && completion.launchNonce === launchNonce &&
+      typeof completion.commandStarted === "boolean" && Number.isSafeInteger(completion.exitCode);
+    if (!valid) return false;
+    const completedRunner = await readRunnerProcess(launchDir);
+    if (!completedRunner) return true;
+    if (
+      completedRunner.jobId !== launchJobId || completedRunner.launchNonce !== launchNonce ||
+      completedRunner.wrapper.launchNonce !== launchNonce
+    ) return false;
+    return (await terminateRecordedProcess(completedRunner.wrapper, launchNonce)).verified;
+  }
+  const runner = await readRunnerProcess(launchDir);
+  if (runner) {
+    if (
+      runner.jobId !== launchJobId || runner.launchNonce !== launchNonce ||
+      runner.wrapper.launchNonce !== launchNonce
+    ) return false;
+    const state = await inspectProcessIdentity(runner.wrapper);
+    if (state === "alive" || state === "unknown") return false;
+    let processGroupAbsent = false;
+    try {
+      process.kill(-runner.wrapper.processGroup, 0);
+    } catch (error) {
+      processGroupAbsent = (error as NodeJS.ErrnoException).code === "ESRCH";
+    }
+    if (!processGroupAbsent) return false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const barrier = await pi.exec("supacode", ["worktree", "list"], { timeout: 30_000 });
+      if (barrier.code !== 0) return false;
+      if (attempt === 0) await delay(100);
+    }
+    await atomicWrite(
+      path.join(launchDir, "creation-reconciled.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        jobId: launchJobId,
+        launchNonce,
+        reconciledAt: isoNow(),
+      }, null, 2)}\n`,
     );
-    if (deleted.code !== 0) {
-      const reason = `Git worktree was removed, but Supacode resource cleanup failed: ${(deleted.stderr || deleted.stdout).trim()}`;
-      await updateJobLifecycle(job.jobDir, "recovery_required", reason, { worktreePath, worktreeId });
-      return reason;
+    return true;
+  }
+  return validationGateProvesCommandNeverLaunched(launchDir, launchJobId, launchNonce);
+}
+
+async function recoverBatchBeforeFirstSurface(
+  pi: ExtensionAPI,
+  batchId: string,
+): Promise<{ recovered: boolean; message?: string }> {
+  if (!UUID_PATTERN.test(batchId)) return { recovered: false };
+  const batchDir = path.join(getAgentDir(), "subagents", batchId);
+  const metadata = await readJson<Record<string, unknown>>(path.join(batchDir, "batch.json"));
+  if (!metadata || metadataString(metadata, "id") !== batchId) return { recovered: false };
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(batchDir, { withFileTypes: true });
+  } catch {
+    return { recovered: false };
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === "tab-launches") continue;
+    const jobDir = path.join(batchDir, entry.name);
+    try {
+      const [jobMetadata, runner, status] = await Promise.all([
+        readJson<Record<string, unknown>>(path.join(jobDir, "job.json")),
+        readRunnerProcess(jobDir),
+        readJson<WorkerStatus>(path.join(jobDir, "status.json")),
+      ]);
+      if (
+        !jobMetadata || metadataString(jobMetadata, "batchId") !== batchId ||
+        metadataString(jobMetadata, "tabId") !== undefined ||
+        metadataString(jobMetadata, "surfaceId") !== undefined ||
+        runner !== undefined || status?.processIdentity !== undefined
+      ) return { recovered: false };
+    } catch {
+      return { recovered: false };
     }
   }
-  const reason = `Removed untouched worktree left by interrupted provisioning: ${worktreePath}`;
-  await reconcileJobLifecycle(job.jobDir, "failed", reason, { worktreePath, worktreeId });
-  return reason;
+  const phase = metadataString(metadata, "phase");
+  const tabId = metadataString(metadata, "tabId");
+  const worktreeId = metadataString(metadata, "worktreeId");
+  if (phase === "planned" && !tabId) {
+    return { recovered: true, message: `Reviewer batch ${batchId} never began tab creation.` };
+  }
+  const tabLaunchDir = metadataString(metadata, "tabLaunchDir");
+  const tabLaunchJobId = metadataString(metadata, "tabLaunchJobId");
+  const tabLaunchNonce = metadataString(metadata, "tabLaunchNonce");
+  if (
+    !tabLaunchDir || !tabLaunchJobId || !tabLaunchNonce ||
+    !path.resolve(tabLaunchDir).startsWith(`${path.resolve(batchDir)}${path.sep}`) ||
+    !await recoverCreationLaunchProcess(pi, tabLaunchDir, tabLaunchJobId, tabLaunchNonce)
+  ) return { recovered: false, message: `Reviewer batch ${batchId} creation process is not verified absent.` };
+  if (phase === "closed") {
+    return { recovered: true, message: `Reviewer batch ${batchId} was already closed before its first surface.` };
+  }
+  if (
+    !tabId || !worktreeId ||
+    !["launching", "running", "closing", "recovery_required"].includes(phase ?? "")
+  ) return { recovered: false };
+  const cleanup = await closeBatchTab(pi, {
+    id: batchId,
+    title: metadataString(metadata, "title") ?? `reviewers ${batchId.slice(0, 4)}`,
+    worktreeId,
+    tabId,
+  });
+  return cleanup.closed
+    ? { recovered: true, message: `Closed reviewer batch ${batchId} before its first surface launched.` }
+    : { recovered: false, message: cleanup.error };
+}
+
+async function recoverReviewerSurfaceBeforeProcess(
+  pi: ExtensionAPI,
+  metadata: Record<string, unknown>,
+  jobDir: string,
+  expectedJobId: string,
+  expectedLaunchNonce: string,
+): Promise<{ recovered: boolean; batch?: WorkerBatch; message?: string }> {
+  const id = metadataString(metadata, "id");
+  const launchNonce = metadataString(metadata, "launchNonce");
+  const batchId = metadataString(metadata, "batchId");
+  const worktreeId = metadataString(metadata, "tabWorktreeId");
+  const tabId = metadataString(metadata, "tabId");
+  const surfaceId = metadataString(metadata, "surfaceId");
+  const launcher = metadataProcessIdentity(metadata, "launcherProcessIdentity");
+  const surfaceLaunchDir = metadataString(metadata, "surfaceLaunchDir");
+  const surfaceLaunchJobId = metadataString(metadata, "surfaceLaunchJobId");
+  const surfaceLaunchNonce = metadataString(metadata, "surfaceLaunchNonce");
+  if (
+    id !== expectedJobId || launchNonce !== expectedLaunchNonce ||
+    !batchId || !worktreeId || !tabId || !surfaceId || !launcher ||
+    launcher.launchNonce !== expectedLaunchNonce ||
+    !surfaceLaunchDir || !surfaceLaunchJobId || !surfaceLaunchNonce ||
+    !path.resolve(surfaceLaunchDir).startsWith(`${path.resolve(jobDir)}${path.sep}`) ||
+    !await recoverCreationLaunchProcess(pi, surfaceLaunchDir, surfaceLaunchJobId, surfaceLaunchNonce)
+  ) return { recovered: false };
+  const [runner, status, launcherState] = await Promise.all([
+    readRunnerProcess(jobDir),
+    readJson<WorkerStatus>(path.join(jobDir, "status.json")),
+    inspectProcessIdentity(launcher),
+  ]);
+  if (
+    runner || status?.processIdentity ||
+    (launcherState !== "missing" && launcherState !== "mismatch")
+  ) return { recovered: false };
+  let missing = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const listed = await pi.exec(
+      "supacode",
+      ["surface", "list", "-w", worktreeId, "-t", tabId],
+      { timeout: TAB_LIST_TIMEOUT_MS },
+    );
+    let absent = listed.code === 0 &&
+      !listed.stdout.split(/\r?\n/).some((listedId) => sameSupacodeUuid(listedId, surfaceId));
+    if (listed.code !== 0) {
+      const tabs = await pi.exec(
+        "supacode",
+        ["tab", "list", "-w", worktreeId],
+        { timeout: TAB_LIST_TIMEOUT_MS },
+      );
+      absent = tabs.code === 0 &&
+        !tabs.stdout.split(/\r?\n/).some((listedId) => sameSupacodeUuid(listedId, tabId));
+    }
+    missing = absent ? missing + 1 : 0;
+    if (missing >= 2) {
+      return {
+        recovered: true,
+        batch: {
+          id: batchId,
+          title: metadataString(metadata, "batchTitle") ?? `reviewers ${batchId.slice(0, 4)}`,
+          worktreeId,
+          tabId,
+        },
+        message: `Reviewer ${expectedJobId} never created its planned surface.`,
+      };
+    }
+    await delay(100);
+  }
+  return { recovered: false, message: `Reviewer ${expectedJobId} surface absence could not be verified.` };
+}
+
+async function recoverActiveReviewerResources(
+  pi: ExtensionAPI,
+  job: LifecycleJobRecord,
+): Promise<{ messages: string[]; complete: boolean }> {
+  const bindings = activeReviewerBindings(job.lifecycle);
+  if (bindings.length === 0) return { messages: [], complete: true };
+  const messages: string[] = [];
+  let complete = true;
+  const batches = new Map<string, WorkerBatch>();
+  let authenticatedReviewers: Array<{ binding: ActiveReviewerBinding; reviewer: LifecycleJobRecord }>;
+  try {
+    authenticatedReviewers = await authenticateActiveReviewerBindings(job, bindings);
+  } catch (error) {
+    return {
+      messages: [`Active reviewer recovery refused unauthenticated bindings: ${error instanceof Error ? error.message : String(error)}`],
+      complete: false,
+    };
+  }
+  for (const { binding, reviewer } of authenticatedReviewers) {
+    const resolvedBindingDir = await fs.promises.realpath(reviewer.jobDir);
+    try {
+      messages.push(await cancelLifecycleJob(pi, reviewer, "Recovering a retained delegate-loop reviewer."));
+      const refreshed = await resolveLifecycleJob(getAgentDir(), binding.jobId);
+      if (refreshed.lifecycle?.phase === "recovery_required") {
+        const unstarted = await recoverReviewerSurfaceBeforeProcess(
+          pi,
+          refreshed.metadata,
+          refreshed.jobDir,
+          binding.jobId,
+          binding.launchNonce,
+        );
+        if (unstarted.recovered && unstarted.batch) {
+          batches.set(unstarted.batch.id, unstarted.batch);
+          const recoveryMessage = unstarted.message ?? `Reviewer ${binding.jobId} never launched.`;
+          await claimWorkerTerminal(
+            refreshed.jobDir,
+            binding.jobId,
+            "recovery",
+            {
+              state: "failed",
+              completedAt: isoNow(),
+              stopReason: "cancelled",
+              errorMessage: recoveryMessage,
+              launchNonce: binding.launchNonce,
+            } satisfies WorkerStatus,
+            recoveryMessage,
+          );
+          await reconcileJobLifecycle(refreshed.jobDir, "cancelled", recoveryMessage);
+          messages.push(recoveryMessage);
+          continue;
+        }
+        complete = false;
+        messages.push(unstarted.message ?? `Reviewer ${binding.jobId} still requires lifecycle recovery.`);
+        continue;
+      }
+      const batchId = metadataString(refreshed.metadata, "batchId") ?? refreshed.batchId;
+      const worktreeId = metadataString(refreshed.metadata, "tabWorktreeId");
+      const tabId = metadataString(refreshed.metadata, "tabId");
+      if (!batchId || !worktreeId) {
+        complete = false;
+        messages.push(`Reviewer ${binding.jobId} has incomplete batch metadata.`);
+        continue;
+      }
+      if (!tabId) {
+        const batchRecovery = await recoverBatchBeforeFirstSurface(pi, batchId);
+        if (batchRecovery.recovered) {
+          messages.push(batchRecovery.message ?? `Reviewer ${binding.jobId} never launched.`);
+          continue;
+        }
+        complete = false;
+        messages.push(batchRecovery.message ?? `Reviewer ${binding.jobId} has incomplete launched-tab metadata.`);
+        continue;
+      }
+      batches.set(batchId, {
+        id: batchId,
+        title: metadataString(refreshed.metadata, "batchTitle") ?? refreshed.title,
+        worktreeId,
+        tabId,
+      });
+    } catch (resolveError) {
+      try {
+        const metadata = await readJson<Record<string, unknown>>(path.join(resolvedBindingDir, "job.json"));
+        const id = metadata && metadataString(metadata, "id");
+        const launchNonce = metadata && metadataString(metadata, "launchNonce");
+        const worktreeId = metadata && metadataString(metadata, "tabWorktreeId");
+        const tabId = metadata && metadataString(metadata, "tabId");
+        const surfaceId = metadata && metadataString(metadata, "surfaceId");
+        const batchId = metadata && metadataString(metadata, "batchId");
+        if (
+          id !== binding.jobId || launchNonce !== binding.launchNonce ||
+          !worktreeId || !batchId ||
+          path.basename(path.dirname(resolvedBindingDir)).toLowerCase() !== batchId.toLowerCase()
+        ) {
+          throw new Error("persisted reviewer resource identity is incomplete or mismatched");
+        }
+        const terminal = await readWorkerTerminal<WorkerStatus>(resolvedBindingDir);
+        const status = await readJson<WorkerStatus>(path.join(resolvedBindingDir, "status.json"));
+        const unstartedSurface = await recoverReviewerSurfaceBeforeProcess(
+          pi,
+          metadata,
+          resolvedBindingDir,
+          binding.jobId,
+          binding.launchNonce,
+        );
+        if (unstartedSurface.recovered && unstartedSurface.batch) {
+          batches.set(unstartedSurface.batch.id, unstartedSurface.batch);
+          const recoveryMessage = unstartedSurface.message ?? `Reviewer ${binding.jobId} never launched.`;
+          await claimWorkerTerminal(
+            resolvedBindingDir,
+            binding.jobId,
+            "recovery",
+            {
+              state: "failed",
+              completedAt: isoNow(),
+              stopReason: "cancelled",
+              errorMessage: recoveryMessage,
+              launchNonce: binding.launchNonce,
+            } satisfies WorkerStatus,
+            recoveryMessage,
+          );
+          await reconcileJobLifecycle(resolvedBindingDir, "cancelled", recoveryMessage);
+          messages.push(recoveryMessage);
+          continue;
+        }
+        if (!tabId || !surfaceId) {
+          const runner = await readRunnerProcess(resolvedBindingDir);
+          const batchRecovery = !tabId && !surfaceId && !runner && !status?.processIdentity
+            ? await recoverBatchBeforeFirstSurface(pi, batchId)
+            : { recovered: false };
+          if (batchRecovery.recovered) {
+            messages.push(batchRecovery.message ?? `Reviewer ${binding.jobId} never launched.`);
+            continue;
+          }
+          throw new Error(batchRecovery.message ?? "reviewer launch metadata is incomplete and absence cannot be proven");
+        }
+        const termination = await terminateWorker(
+          pi,
+          { id, jobDir: resolvedBindingDir, tabWorktreeId: worktreeId, tabId, surfaceId, launchNonce },
+          terminal?.status.processIdentity ?? status?.processIdentity,
+        );
+        await atomicWrite(
+          path.join(resolvedBindingDir, "termination.json"),
+          `${JSON.stringify(termination, null, 2)}\n`,
+        );
+        if (!termination.verified) {
+          complete = false;
+          messages.push(`Reviewer ${binding.jobId} termination is indeterminate: ${termination.errors.join(" ")}`);
+          continue;
+        }
+        batches.set(batchId, {
+          id: batchId,
+          title: metadataString(metadata, "batchTitle") ?? `reviewers ${batchId.slice(0, 4)}`,
+          worktreeId,
+          tabId,
+        });
+        messages.push(`Recovered reviewer ${binding.jobId} from job-local process metadata.`);
+      } catch (error) {
+        complete = false;
+        messages.push(
+          `Reviewer ${binding.jobId} recovery failed after ${resolveError instanceof Error ? resolveError.message : String(resolveError)}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+  if (complete) {
+    for (const batch of batches.values()) {
+      try {
+        const cleanup = await closeBatchTab(pi, batch);
+        if (!cleanup.closed) {
+          complete = false;
+          messages.push(cleanup.error ?? `Reviewer batch tab ${batch.tabId} remains open.`);
+        }
+      } catch (error) {
+        complete = false;
+        messages.push(`Reviewer batch ${batch.id} cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+  if (complete) {
+    await updateJobLifecycle(job.jobDir, job.lifecycle?.phase ?? "recovery_required", undefined, {
+      activeReviewerJobs: undefined,
+    });
+  }
+  return { messages, complete };
 }
 
 async function recoverEvaluatorCheckouts(
   pi: ExtensionAPI,
   job: LifecycleJobRecord,
-): Promise<string[]> {
+): Promise<{ messages: string[]; complete: boolean }> {
   const lifecyclePaths: string[] = [];
   const visit = async (directory: string): Promise<void> => {
     let entries: fs.Dirent[];
@@ -3635,113 +5731,257 @@ async function recoverEvaluatorCheckouts(
       else if (entry.isFile() && entry.name === "checkout-lifecycle.json") lifecyclePaths.push(entryPath);
     }
   };
-  await visit(path.join(job.jobDir, "iterations"));
+  const canonicalJobRoot = await fs.promises.realpath(job.jobDir);
+  const canonicalIterationsRoot = path.join(canonicalJobRoot, "iterations");
+  await visit(canonicalIterationsRoot);
   const repositoryRoot = metadataString(job.metadata, "worktreePath");
-  if (!repositoryRoot) return [];
+  if (!repositoryRoot) {
+    return lifecyclePaths.length === 0
+      ? { messages: [], complete: true }
+      : { messages: ["Evaluator recovery has no recorded repository root."], complete: false };
+  }
   const messages: string[] = [];
+  let complete = true;
+  const recordFailure = (message: string) => {
+    complete = false;
+    messages.push(message);
+  };
   for (const lifecyclePath of lifecyclePaths) {
     const record = await readJson<Record<string, unknown>>(lifecyclePath);
     if (!record) {
-      messages.push(`Evaluator lifecycle metadata is corrupt: ${lifecyclePath}`);
+      recordFailure(`Evaluator lifecycle metadata is corrupt: ${lifecyclePath}`);
       continue;
     }
     const phase = metadataString(record, "phase");
     const checkoutPath = metadataString(record, "checkoutPath");
     if (!checkoutPath) {
-      messages.push(`Evaluator lifecycle has no checkout path: ${lifecyclePath}`);
+      recordFailure(`Evaluator lifecycle has no checkout path: ${lifecyclePath}`);
       continue;
     }
     if (phase === "removed") continue;
-    const jobRoot = path.resolve(job.jobDir);
-    const resolvedCheckout = path.resolve(checkoutPath);
-    if (!resolvedCheckout.startsWith(`${jobRoot}${path.sep}`)) {
-      messages.push(`Evaluator recovery refused an external path: ${resolvedCheckout}`);
+    let resolvedCheckout: string;
+    let resolvedLifecyclePath: string;
+    try {
+      [resolvedCheckout, resolvedLifecyclePath] = await Promise.all([
+        canonicalizeMissingPath(checkoutPath),
+        fs.promises.realpath(lifecyclePath),
+      ]);
+    } catch (error) {
+      recordFailure(`Evaluator recovery could not authenticate ${checkoutPath}: ${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    if (
+      !resolvedCheckout.startsWith(`${canonicalIterationsRoot}${path.sep}`) ||
+      resolvedLifecyclePath !== path.join(path.dirname(resolvedCheckout), "checkout-lifecycle.json")
+    ) {
+      recordFailure(`Evaluator recovery refused a mismatched or external path: ${resolvedCheckout}`);
       continue;
     }
     if (phase === "evaluating") {
       const processJobId = metadataString(record, "processJobId");
       const processJobDir = metadataString(record, "processJobDir");
       const processLaunchNonce = metadataString(record, "processLaunchNonce");
-      const resolvedProcessJobDir = processJobDir && path.resolve(processJobDir);
-      const subagentsRoot = path.resolve(getAgentDir(), "subagents");
+      let resolvedProcessJobDir: string | undefined;
+      let subagentsRoot: string | undefined;
+      try {
+        [resolvedProcessJobDir, subagentsRoot] = processJobDir
+          ? await Promise.all([
+              fs.promises.realpath(processJobDir),
+              fs.promises.realpath(path.resolve(getAgentDir(), "subagents")),
+            ])
+          : [undefined, undefined];
+      } catch {
+        resolvedProcessJobDir = undefined;
+      }
+      const processDirInParent = resolvedProcessJobDir?.startsWith(`${canonicalJobRoot}${path.sep}`) === true;
+      const processDirInAgent = resolvedProcessJobDir !== undefined && subagentsRoot !== undefined &&
+        resolvedProcessJobDir.startsWith(`${subagentsRoot}${path.sep}`) &&
+        path.basename(resolvedProcessJobDir).toLowerCase() === processJobId?.toLowerCase();
       if (
         !processJobId || !resolvedProcessJobDir || !processLaunchNonce ||
-        !resolvedProcessJobDir.startsWith(`${subagentsRoot}${path.sep}`)
+        (!processDirInParent && !processDirInAgent)
       ) {
-        messages.push(`Evaluator ${resolvedCheckout} has no authenticated process intent; it was retained.`);
+        recordFailure(`Evaluator ${resolvedCheckout} has no authenticated process intent; it was retained.`);
         continue;
       }
       try {
         const runner = await readRunnerProcess(resolvedProcessJobDir);
         if (!runner || runner.jobId !== processJobId || runner.launchNonce !== processLaunchNonce) {
-          messages.push(`Evaluator ${resolvedCheckout} has no matching process identity; it was retained.`);
-          continue;
-        }
-        const termination = await terminateRecordedProcess(runner.wrapper, processLaunchNonce);
-        if (!termination.verified) {
-          messages.push(`Evaluator ${resolvedCheckout} process termination is indeterminate: ${termination.error ?? "unknown error"}`);
-          continue;
+          const validationNeverLaunched = !runner && await validationGateProvesCommandNeverLaunched(
+            resolvedProcessJobDir,
+            processJobId,
+            processLaunchNonce,
+          );
+          if (validationNeverLaunched) {
+            messages.push(`Validation evaluator ${resolvedCheckout} never passed its durable launch gate.`);
+          } else {
+            const [processJob, processStatus] = await Promise.all([
+              readJson<Record<string, unknown>>(path.join(resolvedProcessJobDir, "job.json")),
+              readJson<WorkerStatus>(path.join(resolvedProcessJobDir, "status.json")),
+            ]);
+            const batchId = processJob && metadataString(processJob, "batchId");
+            const processJobMatches = !runner && processJob &&
+              metadataString(processJob, "id") === processJobId &&
+              metadataString(processJob, "launchNonce") === processLaunchNonce &&
+              !processStatus?.processIdentity;
+            const unstartedSurface = processJobMatches
+              ? await recoverReviewerSurfaceBeforeProcess(
+                  pi,
+                  processJob,
+                  resolvedProcessJobDir,
+                  processJobId,
+                  processLaunchNonce,
+                )
+              : { recovered: false };
+            const processIntentMatches = processJobMatches &&
+              metadataString(processJob, "tabId") === undefined &&
+              metadataString(processJob, "surfaceId") === undefined && batchId !== undefined;
+            const batchRecovery = !unstartedSurface.recovered && processIntentMatches
+              ? await recoverBatchBeforeFirstSurface(pi, batchId)
+              : { recovered: false };
+            let settledReviewer = false;
+            if (processDirInAgent) {
+              try {
+                const reviewer = await resolveLifecycleJob(getAgentDir(), processJobId);
+                const reviewerTerminal = await readWorkerTerminal<WorkerStatus>(reviewer.jobDir);
+                settledReviewer = reviewerTerminal !== undefined && reviewerTerminal.owner !== "worker" &&
+                  ["completed", "failed", "timed_out", "cancelled"].includes(reviewer.lifecycle?.phase ?? "");
+              } catch {
+                settledReviewer = false;
+              }
+            }
+            if (unstartedSurface.recovered || batchRecovery.recovered || settledReviewer) {
+              messages.push(
+                unstartedSurface.message ?? batchRecovery.message ??
+                (settledReviewer
+                  ? `Evaluator ${resolvedCheckout} belonged to an authenticated terminal reviewer.`
+                  : `Evaluator ${resolvedCheckout} belonged to a reviewer batch that never launched.`),
+              );
+            } else {
+              recordFailure(`Evaluator ${resolvedCheckout} has no matching process identity; it was retained.`);
+              continue;
+            }
+          }
+        } else {
+          const termination = await terminateRecordedProcess(runner.wrapper, processLaunchNonce);
+          if (!termination.verified) {
+            recordFailure(`Evaluator ${resolvedCheckout} process termination is indeterminate: ${termination.error ?? "unknown error"}`);
+            continue;
+          }
         }
       } catch (error) {
-        messages.push(`Evaluator ${resolvedCheckout} process metadata is invalid: ${error instanceof Error ? error.message : String(error)}`);
+        recordFailure(`Evaluator ${resolvedCheckout} process metadata is invalid: ${error instanceof Error ? error.message : String(error)}`);
         continue;
       }
     }
     try {
       await fs.promises.lstat(resolvedCheckout);
+      const canonicalRepositoryRoot = await fs.promises.realpath(repositoryRoot);
+      const codeWorktreeId = metadataString(job.metadata, "codeWorktreeId");
+      if (job.mode === "coding") {
+        if (!codeWorktreeId) throw new Error("Coding evaluator recovery has no Supacode worktree identity.");
+        const idPath = await fs.promises.realpath(decodeSupacodeResourceId(codeWorktreeId));
+        if (idPath !== canonicalRepositoryRoot) {
+          throw new Error("Evaluator repository root does not match its Supacode worktree identity.");
+        }
+      }
+      const repositoryTopLevel = await fs.promises.realpath(
+        (await gitRawOutput(pi, canonicalRepositoryRoot, ["rev-parse", "--show-toplevel"])).trim(),
+      );
+      if (repositoryTopLevel !== canonicalRepositoryRoot) {
+        throw new Error("Evaluator repository root is not the authenticated Git top level.");
+      }
+      const registeredOutput = await gitRawOutput(
+        pi,
+        canonicalRepositoryRoot,
+        ["worktree", "list", "--porcelain", "-z"],
+      );
+      const registeredPaths = registeredOutput.split("\0\0").flatMap((entry) =>
+        entry.split("\0").filter((line) => line.startsWith("worktree ")).map((line) => line.slice("worktree ".length))
+      );
+      const canonicalRegisteredPaths = await Promise.all(
+        registeredPaths.map((registeredPath) => canonicalizeMissingPath(registeredPath)),
+      );
+      if (!canonicalRegisteredPaths.includes(resolvedCheckout)) {
+        throw new Error("Evaluator checkout is not registered to the authenticated repository.");
+      }
       const removed = await pi.exec(
         "git",
-        ["-C", repositoryRoot, "worktree", "remove", "--force", resolvedCheckout],
+        ["-C", canonicalRepositoryRoot, "worktree", "remove", "--force", resolvedCheckout],
         { timeout: 60_000 },
       );
       if (removed.code !== 0) {
-        messages.push(`Could not remove evaluator ${resolvedCheckout}: ${(removed.stderr || removed.stdout).trim()}`);
+        recordFailure(`Could not remove evaluator ${resolvedCheckout}: ${(removed.stderr || removed.stdout).trim()}`);
         continue;
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        recordFailure(`Could not inspect evaluator ${resolvedCheckout}: ${error instanceof Error ? error.message : String(error)}`);
+        continue;
+      }
     }
-    await atomicWrite(
-      lifecyclePath,
-      `${JSON.stringify({
-        schemaVersion: 1,
-        phase: "removed",
-        checkoutPath: resolvedCheckout,
-        recoveredAt: isoNow(),
-      }, null, 2)}\n`,
-    );
-    messages.push(`Removed interrupted evaluator checkout ${resolvedCheckout}.`);
+    try {
+      await atomicWrite(
+        lifecyclePath,
+        `${JSON.stringify({
+          schemaVersion: 1,
+          phase: "removed",
+          checkoutPath: resolvedCheckout,
+          recoveredAt: isoNow(),
+        }, null, 2)}\n`,
+      );
+      messages.push(`Removed interrupted evaluator checkout ${resolvedCheckout}.`);
+    } catch (error) {
+      recordFailure(`Evaluator was removed, but lifecycle persistence failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
-  return messages;
+  return { messages, complete };
 }
 
 async function recoverLifecycleJob(
   pi: ExtensionAPI,
   job: LifecycleJobRecord,
+  acceptResolvedConflicts = false,
 ): Promise<string> {
   if (job.decision?.owner === "cancel") {
     const messages = [await cancelLifecycleJob(pi, job, "Recovered an interrupted cancellation decision.")];
     const refreshed = await resolveLifecycleJob(getAgentDir(), job.id);
-    for (const binding of activeReviewerBindings(refreshed.lifecycle)) {
-      try {
-        const reviewer = await resolveLifecycleJob(getAgentDir(), binding.jobId);
-        const recoveredTab = await recoverInterruptedBatchTab(pi, reviewer);
-        if (recoveredTab) messages.push(recoveredTab);
-      } catch (error) {
-        messages.push(`Reviewer ${binding.jobId} recovery: ${error instanceof Error ? error.message : String(error)}`);
-      }
+    const reviewers = await recoverActiveReviewerResources(pi, refreshed);
+    messages.push(...reviewers.messages);
+    const evaluators = reviewers.complete
+      ? await recoverEvaluatorCheckouts(pi, refreshed)
+      : { messages: ["Evaluator cleanup was deferred until reviewer resources are absent."], complete: false };
+    messages.push(...evaluators.messages);
+    if (reviewers.complete && evaluators.complete) {
+      await reconcileJobLifecycle(job.jobDir, "cancelled", "Recovered an interrupted cancellation decision.");
+    } else {
+      await updateJobLifecycle(
+        job.jobDir,
+        "recovery_required",
+        "One or more reviewer or evaluator resources could not be recovered.",
+      );
     }
-    messages.push(...await recoverEvaluatorCheckouts(pi, refreshed));
     return messages.join("\n");
   }
   const messages: string[] = [];
+  let batchClosedBeforeLaunch = false;
   if (!hasLifecycleSurfaceIntent(job)) {
     const recoveredTab = await recoverInterruptedBatchTab(pi, job);
     if (recoveredTab) messages.push(recoveredTab);
+    const batchMetadata = await readJson<Record<string, unknown>>(
+      path.join(getAgentDir(), "subagents", job.batchId, "batch.json"),
+    );
+    const batchPhase = batchMetadata && metadataString(batchMetadata, "phase");
+    batchClosedBeforeLaunch = batchPhase === "closed" ||
+      (batchPhase === "planned" && metadataString(batchMetadata ?? {}, "tabId") === undefined);
   }
   const provisioning = await recoverUnlaunchedCodingWorktree(pi, job);
-  if (provisioning) return [...messages, provisioning].join("\n");
-  const workerDir = effectiveLifecycleJobDir(job);
+  if (provisioning) return [...messages, provisioning.message].join("\n");
+  const workerDir = await effectiveLifecycleJobDir(job);
+  const delegateLoop = job.metadata.delegateLoop === true;
+  let canonicalLoopStatus = delegateLoop
+    ? await readJson<WorkerStatus>(path.join(job.jobDir, "status.json"))
+    : undefined;
   let terminal = await readWorkerTerminal<WorkerStatus>(workerDir);
   let evaluatorCleanupSafe = false;
   const status = await readJson<WorkerStatus>(path.join(workerDir, "status.json"));
@@ -3755,9 +5995,9 @@ async function recoverLifecycleJob(
   const report = expectedLaunchNonce
     ? await readWorkerReport<WorkerStatus>(workerDir, job.id, expectedLaunchNonce)
     : undefined;
-  const resource = supervisedLifecycleWorker(job);
+  const resource = supervisedLifecycleWorker(job, workerDir);
   const verifyRecordedAbsence = async (identity?: ProcessIdentity) => resource
-    ? verifyWorkerProcessesAbsent(resource, identity)
+    ? verifyWorkerProcessesAbsent(pi, resource, identity)
     : hasLifecycleSurfaceIntent(job)
       ? { absent: false, states: ["unknown" as const] }
       : runnerProcess && expectedLaunchNonce && runnerProcess.jobId === job.id &&
@@ -3808,17 +6048,41 @@ async function recoverLifecycleJob(
   }
   if (terminal) {
     const missingNormalExit = terminal.owner === "worker" && !runnerExit;
-    const processes = terminalPreverified
-      ? { absent: true, states: ["missing" as const] }
-      : await verifyRecordedAbsence(terminal.status.processIdentity);
-    if (processes.absent && !missingNormalExit) {
-      await reconcileJobLifecycle(
-        job.jobDir,
-        terminalLifecyclePhase(terminal.status),
-        terminal.status.errorMessage,
+    let processes: { absent: boolean; states: Array<"alive" | "missing" | "mismatch" | "unknown"> };
+    if (resource) {
+      const termination = await terminateWorker(pi, resource, terminal.status.processIdentity);
+      await atomicWrite(
+        path.join(workerDir, "termination.json"),
+        `${JSON.stringify(termination, null, 2)}\n`,
       );
-      evaluatorCleanupSafe = true;
-      messages.push(`Terminal state reconciled as ${terminal.status.state}; recorded processes are absent.`);
+      processes = {
+        absent: termination.verified,
+        states: [termination.verified ? "missing" : "unknown"],
+      };
+    } else {
+      processes = terminalPreverified
+        ? { absent: true, states: ["missing"] }
+        : await verifyRecordedAbsence(terminal.status.processIdentity);
+    }
+    if (processes.absent && !missingNormalExit) {
+      try {
+        await restoreWorkerTerminalProjection(workerDir, terminal);
+        if (!delegateLoop) {
+          await reconcileJobLifecycle(
+            job.jobDir,
+            terminalLifecyclePhase(terminal.status),
+            terminal.status.errorMessage,
+          );
+        }
+        evaluatorCleanupSafe = true;
+        messages.push(delegateLoop
+          ? `Active implementation terminal ${terminal.status.state} was verified; canonical loop state was preserved.`
+          : `Terminal state reconciled as ${terminal.status.state}; recorded processes are absent.`);
+      } catch (error) {
+        const reason = `Terminal projection recovery failed: ${error instanceof Error ? error.message : String(error)}`;
+        await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+        messages.push(reason);
+      }
     } else {
       const reason = missingNormalExit
         ? "Worker terminal claim exists, but its authenticated runner-exit sentinel is missing."
@@ -3863,12 +6127,57 @@ async function recoverLifecycleJob(
             errorMessage: message,
           } satisfies WorkerStatus;
           await claimWorkerTerminal(workerDir, job.id, "recovery", recoveredStatus, message);
-          await reconcileJobLifecycle(job.jobDir, "failed", message);
+          if (!delegateLoop) await reconcileJobLifecycle(job.jobDir, "failed", message);
           evaluatorCleanupSafe = true;
           messages.push(message);
         }
       }
     }
+  } else if (resource) {
+    const termination = await terminateWorker(pi, resource);
+    await atomicWrite(
+      path.join(workerDir, "termination.json"),
+      `${JSON.stringify(termination, null, 2)}\n`,
+    );
+    if (termination.verified) {
+      const message = "Recovered a surface whose worker runner had not reached terminal publication.";
+      const recoveredStatus = {
+        state: "failed",
+        launchNonce: resource.launchNonce,
+        completedAt: isoNow(),
+        stopReason: "recovered_prelaunch_surface",
+        errorMessage: message,
+        termination,
+      } satisfies WorkerStatus;
+      await atomicWrite(path.join(workerDir, "status.json"), `${JSON.stringify(recoveredStatus)}\n`);
+      await claimWorkerTerminal(workerDir, job.id, "recovery", recoveredStatus, message);
+      if (!delegateLoop) await reconcileJobLifecycle(job.jobDir, "failed", message);
+      evaluatorCleanupSafe = true;
+      messages.push(message);
+    } else {
+      const reason = `Pre-runner surface recovery is indeterminate: ${termination.errors.join(" ")}`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      messages.push(reason);
+    }
+  } else if (batchClosedBeforeLaunch) {
+    const message = "Recovered a batch that ended before its first worker surface launched.";
+    const recoveredStatus = {
+      state: "failed",
+      launchNonce: expectedLaunchNonce ?? metadataString(job.metadata, "launchNonce"),
+      completedAt: isoNow(),
+      stopReason: delegateLoop ? "recovery_required" : "recovered_prelaunch_batch",
+      errorMessage: message,
+    } satisfies WorkerStatus;
+    await atomicWrite(path.join(workerDir, "status.json"), `${JSON.stringify(recoveredStatus)}\n`);
+    await claimWorkerTerminal(workerDir, job.id, "recovery", recoveredStatus, message);
+    if (delegateLoop) {
+      await atomicWrite(path.join(job.jobDir, "status.json"), `${JSON.stringify(recoveredStatus)}\n`);
+      canonicalLoopStatus = recoveredStatus;
+    } else {
+      await reconcileJobLifecycle(job.jobDir, "failed", message);
+    }
+    evaluatorCleanupSafe = true;
+    messages.push(message);
   } else {
     await updateJobLifecycle(
       job.jobDir,
@@ -3878,10 +6187,110 @@ async function recoverLifecycleJob(
     messages.push("No terminal claim or verifiable worker process identity exists.");
   }
 
+  let evaluatorRecoveryComplete = false;
   if (evaluatorCleanupSafe) {
-    messages.push(...await recoverEvaluatorCheckouts(pi, job));
+    const reviewers = await recoverActiveReviewerResources(pi, job);
+    messages.push(...reviewers.messages);
+    const evaluators = reviewers.complete
+      ? await recoverEvaluatorCheckouts(pi, job)
+      : { messages: ["Evaluator cleanup was deferred until reviewer resources are absent."], complete: false };
+    messages.push(...evaluators.messages);
+    evaluatorRecoveryComplete = reviewers.complete && evaluators.complete;
+    if (!evaluatorRecoveryComplete) {
+      await updateJobLifecycle(
+        job.jobDir,
+        "recovery_required",
+        "One or more reviewer or evaluator resources could not be recovered.",
+      );
+    }
   } else {
     messages.push("Evaluator cleanup was skipped until worker process absence is proven.");
+  }
+
+  if (delegateLoop && evaluatorCleanupSafe && evaluatorRecoveryComplete) {
+    const acceptanceIntent = await readLoopAcceptanceIntent(job.jobDir, job.id);
+    if (job.decision?.owner === "accept" || acceptanceIntent) {
+      try {
+        const intent = acceptanceIntent;
+        const worktreePath = metadataString(job.metadata, "worktreePath");
+        const branch = metadataString(job.metadata, "branch");
+        const baseSha = metadataString(job.metadata, "baseSha");
+        if (!intent || !worktreePath || !branch || !baseSha) {
+          throw new Error("Accepted delegate loop has incomplete recovery intent or workspace identity.");
+        }
+        await verifyLoopCandidateSource(
+          pi,
+          { id: job.id, worktreePath, branch, baseSha },
+          intent.candidate,
+          path.join(job.jobDir, "recovery-acceptance.index"),
+        );
+        const decision = job.decision ?? (await claimJobDecision(job.jobDir, job.id, "accept")).record;
+        if (decision.owner !== "accept") {
+          await reconcileJobLifecycle(job.jobDir, "cancelled", "Cancellation won before acceptance recovery.");
+          messages.push("Cancellation won before acceptance recovery; acceptance intent was not applied.");
+        } else {
+          const canonicalMetadata = await readJson<Record<string, unknown>>(
+            path.join(job.jobDir, "job.json"),
+          ) ?? job.metadata;
+          await atomicWrite(
+            path.join(job.jobDir, "job.json"),
+            `${JSON.stringify({
+              ...canonicalMetadata,
+              schemaVersion: SUBAGENT_SCHEMA_VERSION,
+              delegateLoop: true,
+              loopState: "awaiting_apply",
+              attempts: intent.candidate.attempt,
+              acceptedTree: intent.candidate.tree,
+              acceptedCommit: intent.candidate.commit,
+              acceptedRef: intent.candidate.ref,
+            }, null, 2)}\n`,
+          );
+          await atomicWrite(
+            path.join(job.jobDir, "status.json"),
+            `${JSON.stringify({
+              state: "completed",
+              completedAt: isoNow(),
+              stopReason: "delegate_loop_awaiting_apply",
+              usage: canonicalLoopStatus?.usage,
+            } satisfies WorkerStatus)}\n`,
+          );
+          await reconcileJobLifecycle(job.jobDir, "completed", undefined, {
+            loopState: "awaiting_apply",
+            attempts: intent.candidate.attempt,
+            acceptedTree: intent.candidate.tree,
+            acceptedCommit: intent.candidate.commit,
+            acceptedRef: intent.candidate.ref,
+          });
+          messages.push("Recovered accepted delegate-loop metadata from its immutable acceptance intent.");
+        }
+      } catch (error) {
+        const reason = `Accepted delegate-loop recovery failed: ${error instanceof Error ? error.message : String(error)}`;
+        await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+        messages.push(reason);
+      }
+    } else {
+      const stopReason = canonicalLoopStatus?.stopReason;
+      if (stopReason === "delegate_loop_awaiting_apply" && canonicalLoopStatus?.state === "completed") {
+        await reconcileJobLifecycle(job.jobDir, "completed");
+        messages.push("Canonical delegate-loop state reconciled as awaiting apply.");
+      } else if (stopReason === "delegate_loop_cancelled") {
+        await reconcileJobLifecycle(job.jobDir, "cancelled", canonicalLoopStatus?.errorMessage);
+        messages.push("Canonical delegate-loop state reconciled as cancelled.");
+      } else if (
+        stopReason === "recovery_required" ||
+        (typeof stopReason === "string" && stopReason.startsWith("delegate_loop_"))
+      ) {
+        await reconcileJobLifecycle(job.jobDir, "failed", canonicalLoopStatus?.errorMessage);
+        messages.push("Canonical delegate-loop failure state was preserved.");
+      } else {
+        await updateJobLifecycle(
+          job.jobDir,
+          "recovery_required",
+          "Canonical delegate-loop terminal status is missing or incomplete.",
+        );
+        messages.push("Canonical delegate-loop status could not be reconciled safely.");
+      }
+    }
   }
 
   const recoveredTabAfterTerminal = evaluatorCleanupSafe || !hasLifecycleSurfaceIntent(job)
@@ -3897,7 +6306,12 @@ async function recoverLifecycleJob(
   const destination = metadataString(job.metadata, "originalCwd");
   if (destination && job.mode === "coding") {
     try {
-      const apply = await recoverDelegateApplyState(pi, destination);
+      const apply = await recoverDelegateApplyState(
+        pi,
+        destination,
+        undefined,
+        acceptResolvedConflicts,
+      );
       messages.push(apply.message, ...apply.transactions);
     } catch (error) {
       messages.push(`Apply recovery: ${error instanceof Error ? error.message : String(error)}`);
@@ -4100,6 +6514,8 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
           requested = jobs[choices.indexOf(choice)].id;
         }
         const job = await resolveLifecycleJob(getAgentDir(), requested);
+        const metadataError = metadataString(job.metadata, "corruptMetadataError");
+        if (metadataError) throw new Error(`Selected job metadata is corrupt: ${metadataError}`);
         const confirmed = await ctx.ui.confirm(
           "Cancel delegated worker?",
           `${formatLifecycleStatus(job)}\n\nCancellation closes the exact worker surface and verifies recorded process identities before reporting success.`,
@@ -4139,13 +6555,25 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
           requested = jobs[choices.indexOf(choice)].id;
         }
         const job = await resolveLifecycleJob(getAgentDir(), requested);
+        const metadataError = metadataString(job.metadata, "corruptMetadataError");
+        if (metadataError) throw new Error(`Selected job metadata is corrupt: ${metadataError}`);
         const confirmed = await ctx.ui.confirm(
           "Reconcile delegated worker?",
           `${formatLifecycleStatus(job)}\n\nRecovery only removes a destination lock after proving its recorded owner is gone; ambiguous state remains blocked.`,
         );
         if (!confirmed) return;
         ctx.ui.setStatus("delegate-recover", `Recovering ${job.id.slice(0, 8)}...`);
-        const result = await recoverLifecycleJob(pi, job);
+        let result = await recoverLifecycleJob(pi, job);
+        if (result.includes("conflict resolution requires explicit confirmation")) {
+          const acceptResolution = await ctx.ui.confirm(
+            "Accept manual conflict resolution?",
+            "Git has no unmerged entries, but the destination matches neither the exact baseline nor the precomputed result. Accept the currently observed tree and index as the manual resolution? This decision is durably bound and cannot be undone by delegation recovery.",
+          );
+          if (acceptResolution) {
+            const refreshed = await resolveLifecycleJob(getAgentDir(), job.id);
+            result += `\n${await recoverLifecycleJob(pi, refreshed, true)}`;
+          }
+        }
         ctx.ui.notify(result, result.includes("required") || result.includes("indeterminate") ? "warning" : "info");
       } catch (error) {
         ctx.ui.notify(`Could not recover delegation: ${error instanceof Error ? error.message : String(error)}`, "error");

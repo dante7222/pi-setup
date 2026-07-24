@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   runValidationProcess,
+  VALIDATION_WRAPPER_SCRIPT,
   ValidationProcessFailure,
 } from "../extensions/supacode-subagents/validation-process.ts";
 
@@ -24,6 +27,47 @@ async function waitForProcessExit(pid) {
   }
   return !processExists(pid);
 }
+
+test("validation wrapper refuses to launch when its identity gate reaches EOF", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-validation-gate-"));
+  try {
+    const marker = join(directory, "launched");
+    const child = spawn(
+      "/bin/zsh",
+      ["-c", VALIDATION_WRAPPER_SCRIPT, "pi-validation", `touch ${JSON.stringify(marker)}`],
+      { cwd: directory, stdio: ["pipe", "ignore", "pipe"] },
+    );
+    child.stdin.end();
+    const [code] = await once(child, "close");
+    assert.equal(code, 74);
+    await assert.rejects(stat(marker), { code: "ENOENT" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a pre-spawn abort is reported as verified process absence", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-validation-pre-spawn-abort-"));
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    await assert.rejects(
+      runValidationProcess({
+        command: "touch should-not-exist",
+        cwd: directory,
+        logPath: join(directory, "check.log"),
+        timeoutMs: 5000,
+        signal: controller.signal,
+        maxLogBytes: 1024,
+        tailBytes: 256,
+      }),
+      (error) => error instanceof ValidationProcessFailure && error.terminationVerified,
+    );
+    await assert.rejects(stat(join(directory, "should-not-exist")), { code: "ENOENT" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("validation output is drained but its persisted log is capped", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-validation-"));

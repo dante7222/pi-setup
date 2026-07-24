@@ -111,6 +111,8 @@ test("delegate_loop repairs and accepts one Git tree attested by every check and
   const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
   const priorWorktreeId = process.env.SUPACODE_WORKTREE_ID;
   const tabs = new Map();
+  const supacodeWorktrees = [];
+  let anchorClosures = 0;
   try {
     await git(root, "init", "repository");
     await git(repository, "config", "user.name", "Test User");
@@ -135,7 +137,12 @@ test("delegate_loop repairs and accepts one Git tree attested by every check and
         const worktree = join(root, "worktrees", name);
         await mkdir(dirname(worktree), { recursive: true });
         await git(repository, "worktree", "add", "-b", branch, worktree, base);
-        return { stdout: `${encodeURIComponent(await realpath(worktree))}\n`, stderr: "", code: 0, killed: false };
+        const worktreeId = encodeURIComponent(await realpath(worktree));
+        supacodeWorktrees.push(worktreeId);
+        return { stdout: `${worktreeId}\n`, stderr: "", code: 0, killed: false };
+      }
+      if (args[0] === "worktree" && args[1] === "list") {
+        return { stdout: `${supacodeWorktrees.join("\n")}\n`, stderr: "", code: 0, killed: false };
       }
       if (args[0] === "tab" && args[1] === "new") {
         const tabId = argument(args, "-n");
@@ -212,7 +219,10 @@ test("delegate_loop repairs and accepts one Git tree attested by every check and
         };
       }
       if (args[0] === "surface" && args[1] === "close") {
-        tabs.get(argument(args, "-t"))?.delete(argument(args, "-s"));
+        const tabId = argument(args, "-t");
+        const surfaceId = argument(args, "-s");
+        if (surfaceId === tabId) anchorClosures++;
+        tabs.get(tabId)?.delete(surfaceId);
         return { stdout: "", stderr: "", code: 0, killed: false };
       }
       return { stdout: "", stderr: `unexpected Supacode command: ${args.join(" ")}`, code: 1, killed: false };
@@ -222,6 +232,7 @@ test("delegate_loop repairs and accepts one Git tree attested by every check and
       exec: (command, args, options) => command === "supacode"
         ? supacodeExec(args)
         : execResult(command, args, options),
+      __supacodeLaunchForTests: (args) => supacodeExec(args),
       getSessionName: () => "loop test",
       getThinkingLevel: () => "medium",
       registerCommand() {},
@@ -287,6 +298,7 @@ test("delegate_loop repairs and accepts one Git tree attested by every check and
     assert.equal(validationProcess.launchNonce, validationExit.launchNonce);
     assert.equal(validationProcess.wrapper.pid, validationExit.wrapperPid);
     assert.equal(validationExit.exitCode, 0);
+    assert.equal(anchorClosures, 3);
   } finally {
     if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
@@ -314,7 +326,11 @@ test("generated worker runner executes quoted paths in non-interactive print mod
     await writeFile(fakePiPath, `#!/bin/zsh
 printf '%s\\0' "$@" > "$ARGS_PATH"
 printf '%s\\n' "$PI_PERMISSION_CONFIG" > "$ENVIRONMENT_PATH"
-printf 'fake worker response\\n'
+printf '%s\\n' \\
+  '{"type":"agent_start"}' \\
+  '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"fake worker response"}}' \\
+  '{"type":"agent_end"}'
+exit "\${FAKE_PI_EXIT:-0}"
 `);
     await chmod(fakePiPath, 0o700);
     const runnerMetadataPath = join(jobDir, "runner metadata.mjs");
@@ -374,7 +390,9 @@ fs.appendFileSync(process.env.META_PATH, process.argv.slice(2).join(":") + "\\n"
     });
     assert.equal(executed.code, 0, executed.stderr);
     const args = (await readFile(argsPath)).toString("utf8").split("\0").filter(Boolean);
-    assert.deepEqual(args.slice(0, 2), ["--no-session", "--print"]);
+    assert.deepEqual(args.slice(0, 5), ["--no-session", "--print", "--mode", "json", "--name"]);
+    assert.match(executed.stdout, /Pi started; waiting for the model/);
+    assert.match(executed.stdout, /fake worker response/);
     assert.equal(args.includes("--no-context-files"), true);
     assert.equal(args.includes("--no-approve"), true);
     assert.equal(args.includes("--no-skills"), true);
@@ -383,6 +401,22 @@ fs.appendFileSync(process.env.META_PATH, process.argv.slice(2).join(":") + "\\n"
     assert.equal(args.includes(skillPath), true);
     assert.equal(await readFile(environmentPath, "utf8"), `${permissionConfigPath}\n`);
     assert.equal(await readFile(metadataPath, "utf8"), "start\nexit:0\n");
+
+    await writeFile(metadataPath, "");
+    const failed = await execResult("/bin/zsh", [runnerPath], {
+      cwd: workerCwd,
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        ARGS_PATH: argsPath,
+        ENVIRONMENT_PATH: environmentPath,
+        META_PATH: metadataPath,
+        FAKE_PI_EXIT: "37",
+      },
+      timeout: 10_000,
+    });
+    assert.equal(failed.code, 37);
+    assert.equal(await readFile(metadataPath, "utf8"), "start\nexit:37\n");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
