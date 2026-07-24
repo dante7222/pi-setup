@@ -10,6 +10,7 @@ import {
   claimJobDecision,
   claimWorkerTerminal,
   initializeJobLifecycle,
+  publishWorkerReport,
   readJobDecision,
   readJobLifecycle,
   readWorkerReport,
@@ -85,11 +86,12 @@ function registerExtension(execute = execResult) {
   return { pi, tools, commands };
 }
 
-function baseContext(cwd, confirm) {
+function baseContext(cwd, confirm, projectTrusted = true) {
   return {
     cwd,
     model: undefined,
     hasUI: true,
+    isProjectTrusted: () => projectTrusted,
     abort() {},
     ui: {
       confirm,
@@ -142,10 +144,14 @@ async function captureWorker(entries) {
     supacodeSubagents({
       on: (event, handler) => handlers.set(event, handler),
     });
-    await handlers.get("agent_start")();
-    await handlers.get("agent_settled")({}, {
+    let shutdownRequested = false;
+    const context = {
       sessionManager: { getEntries: () => entries },
-    });
+      shutdown: () => { shutdownRequested = true; },
+    };
+    await handlers.get("session_start")({}, context);
+    await handlers.get("agent_start")();
+    await handlers.get("agent_settled")({}, context);
     const report = await readWorkerReport(
       jobDir,
       "11111111-2222-4333-8444-555555555555",
@@ -156,6 +162,7 @@ async function captureWorker(entries) {
     return {
       status: report.status,
       result: await readWorkerReportOutput(report),
+      shutdownRequested,
     };
   } finally {
     if (prior === undefined) delete process.env[WORKER_JOB_ENV];
@@ -187,6 +194,7 @@ test("worker completion requires a normal stop and aggregates all turn usage", a
     { type: "compaction", usage: usage(3) },
     assistantEntry("done", "stop", 2),
   ]);
+  assert.equal(completed.shutdownRequested, true);
   assert.equal(completed.status.state, "completed");
   assert.equal(completed.status.stopReason, "stop");
   assert.equal(completed.status.usage.input, 60);
@@ -197,9 +205,218 @@ test("worker completion requires a normal stop and aggregates all turn usage", a
   const incomplete = await captureWorker([
     assistantEntry("partial answer", "length", 1),
   ]);
+  assert.equal(incomplete.shutdownRequested, true);
   assert.equal(incomplete.status.state, "failed");
   assert.match(incomplete.status.errorMessage, /stopped with length/);
   assert.equal(incomplete.result, "partial answer\n");
+});
+
+test("worker capture reports and exits when an interactive prompt never starts", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-startup-timeout-"));
+  const prior = process.env[WORKER_JOB_ENV];
+  const originalSetTimeout = globalThis.setTimeout;
+  const handlers = new Map();
+  const jobId = "11111111-2222-4333-8444-555555555555";
+  const launchNonce = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  let timeoutCallback;
+  try {
+    await writeFile(join(jobDir, "job.json"), JSON.stringify({
+      schemaVersion: 2,
+      id: jobId,
+      launchNonce,
+    }));
+    process.env[WORKER_JOB_ENV] = jobDir;
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      assert.equal(delay, 60_000);
+      timeoutCallback = () => callback(...args);
+      return 1;
+    };
+    supacodeSubagents({
+      on: (event, handler) => handlers.set(event, handler),
+    });
+    let shutdownRequested = false;
+    await handlers.get("session_start")({}, {
+      shutdown: () => { shutdownRequested = true; },
+    });
+    globalThis.setTimeout = originalSetTimeout;
+    assert.equal(typeof timeoutCallback, "function");
+    await timeoutCallback();
+
+    const report = await readWorkerReport(jobDir, jobId, launchNonce);
+    assert.ok(report);
+    assert.equal(report.status.state, "failed");
+    assert.equal(report.status.stopReason, "startup_timeout");
+    assert.match(await readWorkerReportOutput(report), /did not start an agent run within 60 seconds/);
+    assert.equal(shutdownRequested, true);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    if (prior === undefined) delete process.env[WORKER_JOB_ENV];
+    else process.env[WORKER_JOB_ENV] = prior;
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test("worker startup watchdog is invalidated by session shutdown", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-startup-shutdown-"));
+  const prior = process.env[WORKER_JOB_ENV];
+  const originalSetTimeout = globalThis.setTimeout;
+  const handlers = new Map();
+  const jobId = "11111111-2222-4333-8444-555555555555";
+  const launchNonce = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  let timeoutCallback;
+  try {
+    await writeFile(join(jobDir, "job.json"), JSON.stringify({
+      schemaVersion: 2,
+      id: jobId,
+      launchNonce,
+    }));
+    process.env[WORKER_JOB_ENV] = jobDir;
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      assert.equal(delay, 60_000);
+      timeoutCallback = () => callback(...args);
+      return 1;
+    };
+    supacodeSubagents({
+      on: (event, handler) => handlers.set(event, handler),
+    });
+    let shutdownRequested = false;
+    await handlers.get("session_start")({}, {
+      shutdown: () => { shutdownRequested = true; },
+    });
+    globalThis.setTimeout = originalSetTimeout;
+    const timeoutWork = timeoutCallback();
+    await handlers.get("session_shutdown")();
+    await timeoutWork;
+
+    assert.equal(await readWorkerReport(jobDir, jobId, launchNonce), undefined);
+    assert.equal(shutdownRequested, false);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    if (prior === undefined) delete process.env[WORKER_JOB_ENV];
+    else process.env[WORKER_JOB_ENV] = prior;
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test("worker settled capture is invalidated by session shutdown", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-settled-shutdown-"));
+  const prior = process.env[WORKER_JOB_ENV];
+  const handlers = new Map();
+  const jobId = "11111111-2222-4333-8444-555555555555";
+  const launchNonce = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  try {
+    await writeFile(join(jobDir, "job.json"), JSON.stringify({
+      schemaVersion: 2,
+      id: jobId,
+      launchNonce,
+    }));
+    process.env[WORKER_JOB_ENV] = jobDir;
+    supacodeSubagents({
+      on: (event, handler) => handlers.set(event, handler),
+    });
+    let shutdownRequested = false;
+    const context = {
+      sessionManager: { getEntries: () => [assistantEntry("stale", "stop", 1)] },
+      shutdown: () => { shutdownRequested = true; },
+    };
+    await handlers.get("session_start")({}, context);
+    await handlers.get("agent_start")();
+    const settlement = handlers.get("agent_settled")({}, context);
+    await handlers.get("session_shutdown")();
+    await settlement;
+
+    assert.equal(await readWorkerReport(jobDir, jobId, launchNonce), undefined);
+    assert.equal(shutdownRequested, false);
+  } finally {
+    if (prior === undefined) delete process.env[WORKER_JOB_ENV];
+    else process.env[WORKER_JOB_ENV] = prior;
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test("session shutdown waits for an already-started worker report publication", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-report-shutdown-"));
+  const prior = process.env[WORKER_JOB_ENV];
+  const handlers = new Map();
+  const jobId = "11111111-2222-4333-8444-555555555555";
+  const launchNonce = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  let releasePublication;
+  let markPublicationStarted;
+  const publicationStarted = new Promise((resolve) => { markPublicationStarted = resolve; });
+  try {
+    await writeFile(join(jobDir, "job.json"), JSON.stringify({
+      schemaVersion: 2,
+      id: jobId,
+      launchNonce,
+    }));
+    process.env[WORKER_JOB_ENV] = jobDir;
+    supacodeSubagents({
+      on: (event, handler) => handlers.set(event, handler),
+      __supacodePublishWorkerReportForTests: async (...args) => {
+        markPublicationStarted();
+        await new Promise((resolve) => { releasePublication = resolve; });
+        return publishWorkerReport(...args);
+      },
+    });
+    let shutdownRequested = false;
+    const context = {
+      sessionManager: { getEntries: () => [assistantEntry("committed", "stop", 1)] },
+      shutdown: () => { shutdownRequested = true; },
+    };
+    await handlers.get("session_start")({}, context);
+    await handlers.get("agent_start")();
+    const settlement = handlers.get("agent_settled")({}, context);
+    await publicationStarted;
+    let sessionShutdownCompleted = false;
+    const sessionShutdown = handlers.get("session_shutdown")().then(() => {
+      sessionShutdownCompleted = true;
+    });
+    await Promise.resolve();
+    assert.equal(sessionShutdownCompleted, false);
+    releasePublication();
+    await Promise.all([settlement, sessionShutdown]);
+
+    const report = await readWorkerReport(jobDir, jobId, launchNonce);
+    assert.ok(report);
+    assert.equal(await readWorkerReportOutput(report), "committed\n");
+    assert.equal(shutdownRequested, false);
+  } finally {
+    if (prior === undefined) delete process.env[WORKER_JOB_ENV];
+    else process.env[WORKER_JOB_ENV] = prior;
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test("worker capture requests interactive shutdown when cancellation already won", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-cancel-shutdown-"));
+  const prior = process.env[WORKER_JOB_ENV];
+  const handlers = new Map();
+  const jobId = "11111111-2222-4333-8444-555555555555";
+  const launchNonce = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  try {
+    await writeFile(join(jobDir, "job.json"), JSON.stringify({
+      schemaVersion: 2,
+      id: jobId,
+      launchNonce,
+    }));
+    await claimJobDecision(jobDir, jobId, "cancel");
+    process.env[WORKER_JOB_ENV] = jobDir;
+    supacodeSubagents({
+      on: (event, handler) => handlers.set(event, handler),
+    });
+    await handlers.get("agent_start")();
+    let shutdownRequested = false;
+    await handlers.get("agent_settled")({}, {
+      sessionManager: { getEntries: () => [assistantEntry("ignored", "stop", 1)] },
+      shutdown: () => { shutdownRequested = true; },
+    });
+    assert.equal(shutdownRequested, true);
+    assert.equal(await readWorkerReport(jobDir, jobId, launchNonce), undefined);
+  } finally {
+    if (prior === undefined) delete process.env[WORKER_JOB_ENV];
+    else process.env[WORKER_JOB_ENV] = prior;
+    await rm(jobDir, { recursive: true, force: true });
+  }
 });
 
 test("delegation inputs reject whitespace-only tasks, models, and skills before launch", async () => {
@@ -277,6 +494,7 @@ test("worktree creation is preceded by durable job and lifecycle intent", async 
         assert.equal(jobRecords.length >= 1, true);
         const latest = jobRecords.at(-1);
         assert.equal(latest.job.schemaVersion, 2);
+        assert.equal(latest.job.projectTrusted, false);
         assert.match(latest.job.workspacePlan.branch, /^pi-agent\//);
         assert.equal(latest.lifecycle.schemaVersion, 2);
         observedIntents++;
@@ -576,6 +794,8 @@ test("parallel launch abort verifies earlier worker termination before closing t
         const runnerPath = await checked("/bin/zsh", ["-c", `set -- ${runnerInput}; print -r -- "$2"`]);
         const jobDir = join(runnerPath, "..");
         const job = JSON.parse(await readFile(join(jobDir, "job.json"), "utf8"));
+        assert.equal(job.projectTrusted, false);
+        assert.match(await readFile(runnerPath, "utf8"), /'--no-approve'/);
         const missingIdentity = {
           pid: 999_999_999,
           startSignature: "missing",
@@ -638,7 +858,7 @@ test("parallel launch abort verifies earlier worker termination before closing t
         },
         controller.signal,
         undefined,
-        baseContext(repository, async () => true),
+        baseContext(repository, async () => true, false),
       ),
       /aborted|simulated second launch abort/,
     );

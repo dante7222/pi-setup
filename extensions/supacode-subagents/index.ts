@@ -122,6 +122,7 @@ const PERMISSION_CONFIG_ENV = "PI_PERMISSION_CONFIG";
 const PERMISSION_YOLO_ENV = "VENTRIS_PI_PERMISSION_YOLO";
 const MAX_PARALLEL = 8;
 const DEFAULT_TIMEOUT_SECONDS = 15 * 60;
+const WORKER_STARTUP_TIMEOUT_MS = 60_000;
 const POLL_INTERVAL_MS = 250;
 const TAB_MONITOR_INTERVAL_MS = 1000;
 const TAB_MISSING_CONFIRMATIONS = 2;
@@ -141,7 +142,6 @@ const CODING_TOOLS = "read,bash,edit,write,rg,find,ls";
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const OBJECT_ID_PATTERN = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i;
-const WORKER_OUTPUT_FORMATTER_PATH = fileURLToPath(new URL("./worker-output.mjs", import.meta.url));
 const CREATION_COMPLETION_WRITER_PATH = fileURLToPath(new URL("./creation-complete.mjs", import.meta.url));
 
 class EvaluatorRecoveryFailure extends Error {
@@ -171,6 +171,7 @@ interface WorkerSpec {
   mode: WorkerMode;
   model?: string;
   thinking?: ThinkingLevel;
+  projectTrusted: boolean;
   disableContextFiles?: boolean;
   disableProjectFiles?: boolean;
   disableSkillDiscovery?: boolean;
@@ -202,6 +203,7 @@ interface WorkerJob {
   model?: string;
   thinking: ThinkingLevel;
   yolo: boolean;
+  projectTrusted: boolean;
   permissionConfigPath?: string;
   disableContextFiles?: boolean;
   disableProjectFiles?: boolean;
@@ -269,6 +271,13 @@ type ExtensionAPIWithLaunchTestHook = ExtensionAPI & {
     args: string[],
     options: SupacodeLaunchOptions,
   ) => Promise<SupacodeLaunchResult>;
+  __supacodePublishWorkerReportForTests?: (
+    jobDir: string,
+    jobId: string,
+    launchNonce: string,
+    status: WorkerStatus,
+    output: string,
+  ) => Promise<unknown>;
 };
 
 interface SupacodeCreationCompletion {
@@ -411,6 +420,7 @@ interface LoopWorkspace {
   model?: string;
   thinking: ThinkingLevel;
   yolo: boolean;
+  projectTrusted: boolean;
   permissionConfigPath?: string;
   createdAt: string;
 }
@@ -713,66 +723,136 @@ function registerWorkerCapture(pi: ExtensionAPI, jobDir: string): void {
   let workerIdentity: ProcessIdentity | undefined;
   let jobId: string | undefined;
   let launchNonce: string | undefined;
+  let startupTimer: ReturnType<typeof setTimeout> | undefined;
+  let reportPublication: Promise<unknown> | undefined;
+  let sessionGeneration = 0;
 
-  pi.on("agent_start", async () => {
-    if (finalized) return;
-    const metadata = await readJson<{ id?: string; launchNonce?: string }>(path.join(jobDir, "job.json"));
-    if (!metadata?.id || !metadata.launchNonce) {
-      throw new Error(`Worker lifecycle metadata is incomplete in ${jobDir}.`);
-    }
-    jobId = metadata.id;
-    launchNonce = metadata.launchNonce;
-    workerIdentity = await captureProcessIdentity(process.pid, launchNonce);
-    await atomicWrite(
-      statusPath,
-      JSON.stringify({
-        state: "running",
-        pid: process.pid,
-        processIdentity: workerIdentity,
-        launchNonce,
-        startedAt: isoNow(),
-      } satisfies WorkerStatus),
-    );
-  });
-
-  pi.on("agent_settled", async (_event, ctx) => {
-    if (finalized) return;
-    finalized = true;
+  async function loadJobIdentity(): Promise<{ jobId: string; launchNonce: string }> {
     if (!jobId || !launchNonce) {
       const metadata = await readJson<{ id?: string; launchNonce?: string }>(path.join(jobDir, "job.json"));
       jobId = metadata?.id;
       launchNonce = metadata?.launchNonce;
     }
     if (!jobId || !launchNonce) throw new Error(`Worker lifecycle metadata is incomplete in ${jobDir}.`);
-    const [control, decision] = await Promise.all([
-      readJobControl(jobDir),
-      readJobDecision(jobDir),
-    ]);
-    if (control || decision?.owner === "cancel") return;
+    return { jobId, launchNonce };
+  }
 
-    const entries = ctx.sessionManager.getEntries();
-    const message = finalAssistantMessage(entries);
-    const text = assistantText(message);
-    const stopReason = typeof message?.stopReason === "string" ? message.stopReason : undefined;
-    const errorMessage = typeof message?.errorMessage === "string" ? message.errorMessage : undefined;
-    const completionError = stopReason === "stop"
-      ? undefined
-      : errorMessage || `Worker stopped with ${stopReason ?? "an unknown reason"} before normal completion.`;
-    const failed = !text || completionError !== undefined;
-    const output = text || errorMessage || "Worker settled without an assistant response.";
-    const status = {
-      state: failed ? "failed" : "completed",
-      pid: process.pid,
-      processIdentity: workerIdentity,
-      launchNonce,
-      completedAt: isoNow(),
-      stopReason,
-      errorMessage: failed ? completionError || (!text ? output : undefined) : undefined,
-      model: typeof message?.model === "string" ? message.model : undefined,
-      usage: aggregateSessionUsage(entries),
-    } satisfies WorkerStatus;
+  function clearStartupTimer(): void {
+    if (startupTimer === undefined) return;
+    clearTimeout(startupTimer);
+    startupTimer = undefined;
+  }
 
-    await publishWorkerReport(jobDir, jobId, launchNonce, status, output);
+  async function publishReport(
+    identity: { jobId: string; launchNonce: string },
+    status: WorkerStatus,
+    output: string,
+  ): Promise<void> {
+    const publisher = (pi as ExtensionAPIWithLaunchTestHook).__supacodePublishWorkerReportForTests ?? publishWorkerReport;
+    const publication = publisher(jobDir, identity.jobId, identity.launchNonce, status, output);
+    reportPublication = publication;
+    try {
+      await publication;
+    } finally {
+      if (reportPublication === publication) reportPublication = undefined;
+    }
+  }
+
+  pi.on("session_start", (_event, ctx) => {
+    if (finalized || startupTimer !== undefined) return;
+    const generation = ++sessionGeneration;
+    startupTimer = setTimeout(async () => {
+      startupTimer = undefined;
+      if (finalized || generation !== sessionGeneration) return;
+      finalized = true;
+      try {
+        const identity = await loadJobIdentity();
+        if (generation !== sessionGeneration) return;
+        const [control, decision] = await Promise.all([
+          readJobControl(jobDir),
+          readJobDecision(jobDir),
+        ]);
+        if (generation !== sessionGeneration || control || decision?.owner === "cancel") return;
+        const output = `Worker did not start an agent run within ${WORKER_STARTUP_TIMEOUT_MS / 1000} seconds.`;
+        await publishReport(identity, {
+          state: "failed",
+          launchNonce: identity.launchNonce,
+          completedAt: isoNow(),
+          stopReason: "startup_timeout",
+          errorMessage: output,
+        }, output);
+      } catch (error) {
+        console.error(`supacode-subagent: startup timeout reporting failed: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        if (generation === sessionGeneration) ctx.shutdown();
+      }
+    }, WORKER_STARTUP_TIMEOUT_MS);
+  });
+
+  pi.on("agent_start", async () => {
+    clearStartupTimer();
+    if (finalized) return;
+    const identity = await loadJobIdentity();
+    workerIdentity = await captureProcessIdentity(process.pid, identity.launchNonce);
+    await atomicWrite(
+      statusPath,
+      JSON.stringify({
+        state: "running",
+        pid: process.pid,
+        processIdentity: workerIdentity,
+        launchNonce: identity.launchNonce,
+        startedAt: isoNow(),
+      } satisfies WorkerStatus),
+    );
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    clearStartupTimer();
+    if (finalized) return;
+    finalized = true;
+    const generation = sessionGeneration;
+    try {
+      const identity = await loadJobIdentity();
+      if (generation !== sessionGeneration) return;
+      const [control, decision] = await Promise.all([
+        readJobControl(jobDir),
+        readJobDecision(jobDir),
+      ]);
+      if (generation !== sessionGeneration || control || decision?.owner === "cancel") return;
+
+      const entries = ctx.sessionManager.getEntries();
+      const message = finalAssistantMessage(entries);
+      const text = assistantText(message);
+      const stopReason = typeof message?.stopReason === "string" ? message.stopReason : undefined;
+      const errorMessage = typeof message?.errorMessage === "string" ? message.errorMessage : undefined;
+      const completionError = stopReason === "stop"
+        ? undefined
+        : errorMessage || `Worker stopped with ${stopReason ?? "an unknown reason"} before normal completion.`;
+      const failed = !text || completionError !== undefined;
+      const output = text || errorMessage || "Worker settled without an assistant response.";
+      const status = {
+        state: failed ? "failed" : "completed",
+        pid: process.pid,
+        processIdentity: workerIdentity,
+        launchNonce: identity.launchNonce,
+        completedAt: isoNow(),
+        stopReason,
+        errorMessage: failed ? completionError || (!text ? output : undefined) : undefined,
+        model: typeof message?.model === "string" ? message.model : undefined,
+        usage: aggregateSessionUsage(entries),
+      } satisfies WorkerStatus;
+
+      if (generation !== sessionGeneration) return;
+      await publishReport(identity, status, output);
+    } finally {
+      if (generation === sessionGeneration) ctx.shutdown();
+    }
+  });
+
+  pi.on("session_shutdown", async () => {
+    sessionGeneration++;
+    clearStartupTimer();
+    await reportPublication;
   });
 }
 
@@ -934,9 +1014,6 @@ export function buildRunner(job: PreparedWorkerJob): string {
   const args = [
     "pi",
     "--no-session",
-    "--print",
-    "--mode",
-    "json",
     "--name",
     job.title,
     "--thinking",
@@ -947,7 +1024,7 @@ export function buildRunner(job: PreparedWorkerJob): string {
   if (job.model) args.push("--model", job.model);
   if (job.yolo) args.push("--yolo");
   if (job.disableContextFiles) args.push("--no-context-files");
-  if (job.disableProjectFiles) args.push("--no-approve");
+  args.push(job.disableProjectFiles || !job.projectTrusted ? "--no-approve" : "--approve");
   if (job.disableSkillDiscovery) args.push("--no-skills");
   for (const skillPath of job.skillPaths ?? []) args.push("--skill", skillPath);
   args.push(`@${job.promptPath}`, "Complete the delegated task described in the attached prompt.");
@@ -964,8 +1041,7 @@ touch "$STDERR_PATH"
 node ${shellQuote(job.runnerMetadataPath)} start || exit 73
 printf '\\n[supacode-subagent %s] %s\\n\\n' ${shellQuote(job.batchId.slice(0, 4))} ${shellQuote(job.title)}
 set +e
-setopt pipefail
-${command} 2> >(tee -a "$STDERR_PATH" >&2) | node ${shellQuote(WORKER_OUTPUT_FORMATTER_PATH)}
+${command} 2> >(tee -a "$STDERR_PATH" >&2)
 EXIT_CODE=$?
 node ${shellQuote(job.runnerMetadataPath)} exit "$EXIT_CODE" || true
 exit "$EXIT_CODE"
@@ -1254,6 +1330,9 @@ async function prepareWorker(
   signal: AbortSignal | undefined,
 ): Promise<PreparedWorkerJob> {
   const title = taskTitle(spec.task, spec.title);
+  const projectTrusted = spec.mode === "research" && !spec.disableProjectFiles && spec.workingDirectory === undefined
+    ? spec.projectTrusted
+    : false;
   const jobDir = path.join(getAgentDir(), "subagents", batchId, id);
   await ensureDirectoryDurable(jobDir);
   await fs.promises.chmod(jobDir, 0o700);
@@ -1268,6 +1347,7 @@ async function prepareWorker(
       batchTitle,
       title,
       mode: spec.mode,
+      projectTrusted,
       originalCwd: ctxCwd,
       workerCwd: spec.workingDirectory ?? ctxCwd,
       launchNonce,
@@ -1406,6 +1486,7 @@ async function prepareWorker(
     model: spec.model,
     thinking: spec.thinking ?? "medium",
     yolo,
+    projectTrusted,
     permissionConfigPath,
     disableContextFiles: spec.disableContextFiles,
     disableProjectFiles: spec.disableProjectFiles,
@@ -1475,6 +1556,7 @@ async function writeJobMetadata(
       model: job.model,
       thinking: job.thinking,
       yolo: job.yolo,
+      projectTrusted: job.projectTrusted,
       permissionConfigPath: job.permissionConfigPath,
       disableContextFiles: job.disableContextFiles,
       disableProjectFiles: job.disableProjectFiles,
@@ -2573,6 +2655,7 @@ async function prepareLoopWorkerAttempt(
     model: workspace.model,
     thinking: workspace.thinking,
     yolo: workspace.yolo,
+    projectTrusted: workspace.projectTrusted,
     permissionConfigPath: workspace.permissionConfigPath,
     originalCwd: workspace.originalCwd,
     workerCwd: workspace.workerCwd,
@@ -2600,6 +2683,7 @@ async function prepareLoopWorkerAttempt(
     mode: "coding",
     model: workspace.model,
     thinking: workspace.thinking,
+    projectTrusted: workspace.projectTrusted,
   } satisfies WorkerSpec;
   await atomicWrite(promptPath, buildPrompt(spec, workspace.originalCwd, workspace.workerCwd, workspace.branch));
   await atomicWrite(stderrPath, "");
@@ -3025,6 +3109,7 @@ async function runLoopReviews(
       mode: "research" as const,
       model: reviewer.model,
       thinking: reviewer.thinking,
+      projectTrusted: false,
       disableContextFiles: true,
       disableProjectFiles: true,
       disableSkillDiscovery: true,
@@ -3679,6 +3764,7 @@ async function createLoopWorkspace(
   signal?: AbortSignal,
 ): Promise<LoopWorkspace> {
   await assertCleanLoopParent(pi, ctxCwd, signal);
+  const projectTrusted = false;
   const id = randomUUID();
   const batchId = randomUUID();
   const title = taskTitle(options.task, options.title);
@@ -3706,6 +3792,7 @@ async function createLoopWorkspace(
     workerTimeoutSeconds: options.workerTimeoutSeconds,
     reviewerTimeoutSeconds: options.reviewerTimeoutSeconds,
     keepOpen: options.keepOpen,
+    projectTrusted,
     workspacePlan: worktreePlan,
     worktreeCreationProtocolVersion: 1,
     worktreeLaunchDir: worktreeCreation.launchDir,
@@ -3723,6 +3810,7 @@ async function createLoopWorkspace(
       batchTitle,
       title,
       mode: "coding",
+      projectTrusted,
       originalCwd: ctxCwd,
       branch: worktreePlan.branch,
       baseSha: worktreePlan.baseSha,
@@ -3803,6 +3891,7 @@ async function createLoopWorkspace(
     model: options.model,
     thinking: options.thinking,
     yolo,
+    projectTrusted,
     permissionConfigPath: resolvePermissionConfigPath(process.env[PERMISSION_CONFIG_ENV], ctxCwd),
     createdAt,
   } satisfies LoopWorkspace;
@@ -6673,6 +6762,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
         mode: params.mode ?? "research",
         model: normalizeOptionalText(params.model, "delegate.model") ?? defaultModel(ctx),
         thinking: params.thinking ?? pi.getThinkingLevel(),
+        projectTrusted: ctx.isProjectTrusted(),
       };
       const results = await runWorkers(
         pi,
@@ -6797,6 +6887,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
         mode: task.mode ?? "research",
         model: normalizeOptionalText(task.model, `delegate_parallel.tasks[${index}].model`) ?? parentModel,
         thinking: task.thinking ?? parentThinking,
+        projectTrusted: ctx.isProjectTrusted(),
       }));
       const results = await runWorkers(
         pi,

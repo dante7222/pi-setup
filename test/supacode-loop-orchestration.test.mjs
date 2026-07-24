@@ -179,8 +179,10 @@ test("delegate_loop repairs and accepts one Git tree attested by every check and
         );
         const jobDir = dirname(runnerPath);
         const runner = await readFile(runnerPath, "utf8");
-        assert.match(runner, /'--no-session' '--print'/);
         const job = JSON.parse(await readFile(join(jobDir, "job.json"), "utf8"));
+        assert.match(runner, /'--no-session' '--name'/);
+        assert.doesNotMatch(runner, /'--print'|'--mode' 'json'|worker-output\.mjs/);
+        assert.match(runner, job.disableProjectFiles || !job.projectTrusted ? /'--no-approve'/ : /'--approve'/);
         const lifecycle = JSON.parse(await readFile(join(jobDir, "lifecycle.json"), "utf8"));
         assert.equal(job.tabId, tabId);
         assert.equal(job.surfaceId, surfaceId);
@@ -258,6 +260,7 @@ test("delegate_loop repairs and accepts one Git tree attested by every check and
         cwd: packageDirectory,
         model: undefined,
         hasUI: true,
+        isProjectTrusted: () => true,
         abort() {},
         ui: { confirm: async () => true },
       },
@@ -308,7 +311,7 @@ test("delegate_loop repairs and accepts one Git tree attested by every check and
   }
 });
 
-test("generated worker runner executes quoted paths in non-interactive print mode", async () => {
+test("generated worker runner launches interactive Pi with quoted paths", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi runner-'quoted-"));
   try {
     const workerCwd = join(root, "worker's directory");
@@ -326,10 +329,7 @@ test("generated worker runner executes quoted paths in non-interactive print mod
     await writeFile(fakePiPath, `#!/bin/zsh
 printf '%s\\0' "$@" > "$ARGS_PATH"
 printf '%s\\n' "$PI_PERMISSION_CONFIG" > "$ENVIRONMENT_PATH"
-printf '%s\\n' \\
-  '{"type":"agent_start"}' \\
-  '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"fake worker response"}}' \\
-  '{"type":"agent_end"}'
+printf '%s\\n' 'fake interactive worker response'
 exit "\${FAKE_PI_EXIT:-0}"
 `);
     await chmod(fakePiPath, 0o700);
@@ -356,6 +356,7 @@ fs.appendFileSync(process.env.META_PATH, process.argv.slice(2).join(":") + "\\n"
       model: "openai-codex/gpt-5.6-sol",
       thinking: "high",
       yolo: true,
+      projectTrusted: true,
       originalCwd: workerCwd,
       workerCwd,
       jobDir,
@@ -370,7 +371,7 @@ fs.appendFileSync(process.env.META_PATH, process.argv.slice(2).join(":") + "\\n"
       tabWorktreeId: encodeURIComponent(workerCwd),
       permissionConfigPath,
       disableContextFiles: true,
-      disableProjectFiles: true,
+      disableProjectFiles: false,
       disableSkillDiscovery: true,
       skillPaths: [skillPath],
     });
@@ -390,11 +391,13 @@ fs.appendFileSync(process.env.META_PATH, process.argv.slice(2).join(":") + "\\n"
     });
     assert.equal(executed.code, 0, executed.stderr);
     const args = (await readFile(argsPath)).toString("utf8").split("\0").filter(Boolean);
-    assert.deepEqual(args.slice(0, 5), ["--no-session", "--print", "--mode", "json", "--name"]);
-    assert.match(executed.stdout, /Pi started; waiting for the model/);
-    assert.match(executed.stdout, /fake worker response/);
+    assert.deepEqual(args.slice(0, 3), ["--no-session", "--name", "quoted worker's title"]);
+    assert.equal(args.includes("--print"), false);
+    assert.equal(args.includes("--mode"), false);
+    assert.match(executed.stdout, /fake interactive worker response/);
     assert.equal(args.includes("--no-context-files"), true);
-    assert.equal(args.includes("--no-approve"), true);
+    assert.equal(args.includes("--approve"), true);
+    assert.equal(args.includes("--no-approve"), false);
     assert.equal(args.includes("--no-skills"), true);
     assert.equal(args.includes("--yolo"), true);
     assert.equal(args.includes(`@${promptPath}`), true);
