@@ -55,6 +55,9 @@ test("recovery wins the durable launch claim before closing a surface whose runn
     await writeFile(join(jobDir, "job.json"), `${JSON.stringify({ workerLaunchClaimVersion: 1 })}\n`);
     const result = await terminateWorker({
       exec: async (_command, args) => {
+        if (args[0] === "tab" && args[1] === "list") {
+          return { stdout: `${worker.tabId}\n`, stderr: "", code: 0, killed: false };
+        }
         if (args[0] === "surface" && args[1] === "close") {
           closed = true;
           return { stdout: "", stderr: "", code: 0, killed: false };
@@ -82,6 +85,52 @@ test("recovery wins the durable launch claim before closing a surface whose runn
     assert.equal(typeof claim.claimedAt, "string");
   } finally {
     await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test("worker termination treats an already closed tab or pane as successful cleanup", async () => {
+  for (const missing of ["tab", "surface"]) {
+    const jobDir = await mkdtemp(join(tmpdir(), `pi-worker-missing-${missing}-`));
+    const worker = {
+      id: `missing-${missing}-job`,
+      jobDir,
+      tabWorktreeId: "/worktree",
+      tabId: "eeeeeeee-1111-4222-8333-ffffffffffff",
+      surfaceId: SECOND.surfaceId,
+      launchNonce: `missing-${missing}-nonce`,
+    };
+    const calls = [];
+    try {
+      await writeFile(join(jobDir, "job.json"), `${JSON.stringify({ workerLaunchClaimVersion: 1 })}\n`);
+      const surfaceList = ["surface", "list", "-w", worker.tabWorktreeId, "-t", worker.tabId];
+      const tabList = ["tab", "list", "-w", worker.tabWorktreeId];
+      const result = await terminateWorker({
+        exec: async (command, args) => {
+          assert.equal(command, "supacode");
+          calls.push(args);
+          if (args[0] === "tab" && args[1] === "list") {
+            assert.deepEqual(args, tabList);
+            return { stdout: "", stderr: "", code: 0, killed: false };
+          }
+          if (args[0] === "surface" && args[1] === "list") {
+            assert.deepEqual(args, surfaceList);
+            return missing === "tab"
+              ? { stdout: "", stderr: "tab missing", code: 1, killed: false }
+              : { stdout: "", stderr: "", code: 0, killed: false };
+          }
+          throw new Error(`Unexpected Supacode call: ${args.join(" ")}`);
+        },
+      }, worker);
+
+      assert.equal(result.verified, true);
+      assert.equal(result.surfaceAbsent, true);
+      assert.equal(result.processesAbsent, true);
+      assert.deepEqual(calls, missing === "tab"
+        ? [surfaceList, tabList, surfaceList, tabList]
+        : [surfaceList, surfaceList]);
+    } finally {
+      await rm(jobDir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -118,6 +167,9 @@ test("surface cleanup waits for creator exit and a Supacode barrier before recon
     })}\n`);
     const pi = {
       exec: async (_command, args) => {
+        if (args[0] === "tab" && args[1] === "list") {
+          return { stdout: `${worker.tabId}\n`, stderr: "", code: 0, killed: false };
+        }
         if (args[0] === "surface" && args[1] === "close") {
           closed = true;
           return { stdout: "", stderr: "", code: 0, killed: false };
@@ -185,6 +237,9 @@ test("a runner-owned launch claim authenticates termination before runner metada
     })}\n`);
     const result = await terminateWorker({
       exec: async (_command, args) => {
+        if (args[0] === "tab" && args[1] === "list") {
+          return { stdout: `${worker.tabId}\n`, stderr: "", code: 0, killed: false };
+        }
         if (args[0] === "surface" && args[1] === "close") {
           closed = true;
           return { stdout: "", stderr: "", code: 0, killed: false };
@@ -247,14 +302,35 @@ test("worker termination verifies both exact surface and recorded process group 
 
     let closed = false;
     const calls = [];
+    const expectedSurfaceList = [
+      "surface",
+      "list",
+      "-w",
+      "/worktree",
+      "-t",
+      "eeeeeeee-1111-4222-8333-ffffffffffff",
+    ];
+    const expectedSurfaceClose = [
+      "surface",
+      "close",
+      "-w",
+      "/worktree",
+      "-t",
+      "eeeeeeee-1111-4222-8333-ffffffffffff",
+      "-s",
+      SECOND.surfaceId,
+    ];
     const pi = {
       exec: async (command, args) => {
-        calls.push([command, ...args]);
+        assert.equal(command, "supacode");
+        calls.push(args);
         if (args[0] === "surface" && args[1] === "close") {
+          assert.deepEqual(args, expectedSurfaceClose);
           closed = true;
           return { stdout: "", stderr: "", code: 0, killed: false };
         }
         if (args[0] === "surface" && args[1] === "list") {
+          assert.deepEqual(args, expectedSurfaceList);
           return {
             stdout: closed ? "" : `${SECOND.surfaceId}\n`,
             stderr: "",
@@ -262,7 +338,7 @@ test("worker termination verifies both exact surface and recorded process group 
             killed: false,
           };
         }
-        return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
+        throw new Error(`Unexpected Supacode call: ${args.join(" ")}`);
       },
     };
     const refused = await terminateWorker(pi, {
@@ -290,10 +366,7 @@ test("worker termination verifies both exact surface and recorded process group 
     assert.equal(result.processesAbsent, true);
     assert.equal(result.verified, true);
     assert.equal(await inspectProcessIdentity(identity), "missing");
-    assert.equal(
-      calls.some((call) => call.join(" ").includes(`surface close -w /worktree`) && call.includes(SECOND.surfaceId)),
-      true,
-    );
+    assert.equal(calls.filter((call) => call[0] === "surface" && call[1] === "close").length, 1);
   } finally {
     try {
       process.kill(-child.pid, "SIGKILL");

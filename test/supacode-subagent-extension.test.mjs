@@ -38,7 +38,11 @@ registerHooks({
     return nextResolve(specifier, context);
   },
 });
-const { default: supacodeSubagents } = createRequire(import.meta.url)("../extensions/supacode-subagents/index.ts");
+const {
+  closeBatchAnchor,
+  closeBatchTab,
+  default: supacodeSubagents,
+} = createRequire(import.meta.url)("../extensions/supacode-subagents/index.ts");
 
 const WORKER_JOB_ENV = "PI_SUPACODE_SUBAGENT_JOB_DIR";
 
@@ -68,7 +72,14 @@ async function checked(command, args, options) {
   return result.stdout.trim();
 }
 
-function registerExtension(execute = execResult) {
+async function isolatedExec(command, args, options) {
+  if (command === "supacode") {
+    throw new Error(`Unexpected Supacode test call: ${args.join(" ")}`);
+  }
+  return execResult(command, args, options);
+}
+
+function registerExtension(execute = isolatedExec) {
   const tools = new Map();
   const commands = new Map();
   const pi = {
@@ -184,6 +195,335 @@ test("all delegation tools execute sequentially", () => {
     "delegate-recover",
     "delegate-status",
   ]);
+});
+
+test("batch anchor cleanup closes only one stably present exact surface", async () => {
+  for (const alreadyAbsent of [false, true]) {
+    const root = await mkdtemp(join(tmpdir(), "pi-batch-anchor-"));
+    const agentDir = join(root, "agent");
+    const batch = {
+      id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      title: "anchor batch",
+      worktreeId: encodeURIComponent(join(root, "worktree")),
+      tabId: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+    };
+    const workers = [
+      { surfaceId: "bbbbbbbb-1111-4222-8333-cccccccccccc" },
+      { surfaceId: "dddddddd-1111-4222-8333-eeeeeeeeeeee" },
+    ];
+    const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+    let anchorPresent = !alreadyAbsent;
+    let closeCalls = 0;
+    try {
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      await mkdir(join(agentDir, "subagents", batch.id), { recursive: true });
+      await closeBatchAnchor({
+        exec: async (command, args) => {
+          assert.equal(command, "supacode");
+          if (args[0] === "surface" && args[1] === "list") {
+            assert.deepEqual(args, ["surface", "list", "-w", batch.worktreeId, "-t", batch.tabId]);
+            const surfaces = [
+              ...(anchorPresent ? [batch.tabId] : []),
+              ...workers.map((worker) => worker.surfaceId),
+            ];
+            return { stdout: `${surfaces.join("\n")}\n`, stderr: "", code: 0, killed: false };
+          }
+          if (args[0] === "surface" && args[1] === "close") {
+            assert.deepEqual(args, [
+              "surface",
+              "close",
+              "-w",
+              batch.worktreeId,
+              "-t",
+              batch.tabId,
+              "-s",
+              batch.tabId,
+            ]);
+            closeCalls++;
+            anchorPresent = false;
+            return { stdout: "", stderr: "", code: 0, killed: false };
+          }
+          throw new Error(`Unexpected Supacode call: ${args.join(" ")}`);
+        },
+      }, batch, workers);
+
+      assert.equal(closeCalls, alreadyAbsent ? 0 : 1);
+      assert.equal(
+        JSON.parse(await readFile(join(agentDir, "subagents", batch.id, "batch.json"), "utf8")).anchorSurfaceState,
+        "closed",
+      );
+    } finally {
+      if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("batch anchor cleanup treats an absent whole tab as anchor absence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-absent-batch-anchor-tab-"));
+  const agentDir = join(root, "agent");
+  const batch = {
+    id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    title: "absent anchor tab batch",
+    worktreeId: encodeURIComponent(join(root, "worktree")),
+    tabId: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+  };
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const calls = [];
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    await mkdir(join(agentDir, "subagents", batch.id), { recursive: true });
+    await closeBatchAnchor({
+      exec: async (command, args) => {
+        assert.equal(command, "supacode");
+        calls.push(args);
+        if (args[0] === "surface" && args[1] === "list") {
+          assert.deepEqual(args, ["surface", "list", "-w", batch.worktreeId, "-t", batch.tabId]);
+          return { stdout: "", stderr: "tab missing", code: 1, killed: false };
+        }
+        if (args[0] === "tab" && args[1] === "list") {
+          assert.deepEqual(args, ["tab", "list", "-w", batch.worktreeId]);
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        throw new Error(`Unexpected Supacode call: ${args.join(" ")}`);
+      },
+    }, batch, [{ surfaceId: "bbbbbbbb-1111-4222-8333-cccccccccccc" }]);
+
+    assert.equal(calls.filter((args) => args[0] === "surface" && args[1] === "list").length, 4);
+    assert.equal(calls.filter((args) => args[0] === "tab" && args[1] === "list").length, 4);
+    assert.equal(calls.some((args) => args[1] === "close"), false);
+    assert.equal(
+      JSON.parse(await readFile(join(agentDir, "subagents", batch.id, "batch.json"), "utf8")).anchorSurfaceState,
+      "closed",
+    );
+  } finally {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("batch anchor cleanup rejects whole-tab loss after issuing the anchor close", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-lost-batch-anchor-tab-"));
+  const agentDir = join(root, "agent");
+  const batch = {
+    id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    title: "lost anchor tab batch",
+    worktreeId: encodeURIComponent(join(root, "worktree")),
+    tabId: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+  };
+  const worker = { surfaceId: "bbbbbbbb-1111-4222-8333-cccccccccccc" };
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  let tabPresent = true;
+  let closeCalls = 0;
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    await mkdir(join(agentDir, "subagents", batch.id), { recursive: true });
+    await assert.rejects(closeBatchAnchor({
+      exec: async (command, args) => {
+        assert.equal(command, "supacode");
+        if (args[0] === "surface" && args[1] === "list") {
+          assert.deepEqual(args, ["surface", "list", "-w", batch.worktreeId, "-t", batch.tabId]);
+          return tabPresent
+            ? { stdout: `${batch.tabId}\n${worker.surfaceId}\n`, stderr: "", code: 0, killed: false }
+            : { stdout: "", stderr: "tab missing", code: 1, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "close") {
+          assert.deepEqual(args, [
+            "surface",
+            "close",
+            "-w",
+            batch.worktreeId,
+            "-t",
+            batch.tabId,
+            "-s",
+            batch.tabId,
+          ]);
+          closeCalls++;
+          tabPresent = false;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "tab" && args[1] === "list") {
+          assert.deepEqual(args, ["tab", "list", "-w", batch.worktreeId]);
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        throw new Error(`Unexpected Supacode call: ${args.join(" ")}`);
+      },
+    }, batch, [worker]), /worker-surface preservation could not be verified/);
+
+    assert.equal(closeCalls, 1);
+    assert.equal(
+      JSON.parse(await readFile(join(agentDir, "subagents", batch.id, "batch.json"), "utf8")).anchorSurfaceState,
+      "closing",
+    );
+  } finally {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("batch anchor cleanup suppresses close when resource state is unknown", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-unknown-batch-anchor-"));
+  const agentDir = join(root, "agent");
+  const batch = {
+    id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    title: "unknown anchor batch",
+    worktreeId: encodeURIComponent(join(root, "worktree")),
+    tabId: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+  };
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  let closeCalls = 0;
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    await mkdir(join(agentDir, "subagents", batch.id), { recursive: true });
+    await assert.rejects(closeBatchAnchor({
+      exec: async (command, args) => {
+        assert.equal(command, "supacode");
+        if (args[0] === "surface" && args[1] === "list") {
+          assert.deepEqual(args, ["surface", "list", "-w", batch.worktreeId, "-t", batch.tabId]);
+          return { stdout: "", stderr: "server unavailable", code: 1, killed: false };
+        }
+        if (args[0] === "tab" && args[1] === "list") {
+          assert.deepEqual(args, ["tab", "list", "-w", batch.worktreeId]);
+          return { stdout: "", stderr: "server unavailable", code: 1, killed: false };
+        }
+        if (args[0] === "worktree" && args[1] === "list") {
+          assert.deepEqual(args, ["worktree", "list"]);
+          return { stdout: `${batch.worktreeId}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "close") closeCalls++;
+        throw new Error(`Unexpected Supacode call: ${args.join(" ")}`);
+      },
+    }, batch, [{ surfaceId: "bbbbbbbb-1111-4222-8333-cccccccccccc" }]), /destructive close was not issued/);
+    assert.equal(closeCalls, 0);
+  } finally {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("batch cleanup closes one stably present exact tab", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-present-batch-tab-"));
+  const agentDir = join(root, "agent");
+  const batch = {
+    id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    title: "present batch",
+    worktreeId: encodeURIComponent(join(root, "worktree")),
+    tabId: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+  };
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  let present = true;
+  let closeCalls = 0;
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    await mkdir(join(agentDir, "subagents", batch.id), { recursive: true });
+    const outcome = await closeBatchTab({
+      exec: async (command, args) => {
+        assert.equal(command, "supacode");
+        if (args[0] === "tab" && args[1] === "list") {
+          assert.deepEqual(args, ["tab", "list", "-w", batch.worktreeId]);
+          return { stdout: present ? `${batch.tabId}\n` : "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "tab" && args[1] === "close") {
+          assert.deepEqual(args, ["tab", "close", "-w", batch.worktreeId, "-t", batch.tabId]);
+          closeCalls++;
+          present = false;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        throw new Error(`Unexpected Supacode call: ${args.join(" ")}`);
+      },
+    }, batch);
+
+    assert.deepEqual(outcome, { closed: true });
+    assert.equal(closeCalls, 1);
+  } finally {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("batch cleanup does not close a tab already verified absent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-absent-batch-tab-"));
+  const agentDir = join(root, "agent");
+  const batch = {
+    id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    title: "absent batch",
+    worktreeId: "/worktree",
+    tabId: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+  };
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  let closeCalls = 0;
+  let listCalls = 0;
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    await mkdir(join(agentDir, "subagents", batch.id), { recursive: true });
+    const outcome = await closeBatchTab({
+      exec: async (_command, args) => {
+        if (args[0] === "tab" && args[1] === "list") {
+          listCalls++;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "tab" && args[1] === "close") closeCalls++;
+        return { stdout: "", stderr: "unexpected destructive command", code: 1, killed: false };
+      },
+    }, batch);
+
+    assert.deepEqual(outcome, { closed: true });
+    assert.equal(closeCalls, 0);
+    assert.equal(listCalls, 3);
+    assert.equal(
+      JSON.parse(await readFile(join(agentDir, "subagents", batch.id, "batch.json"), "utf8")).phase,
+      "closed",
+    );
+  } finally {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("batch cleanup treats an absent parent worktree as tab absence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-absent-batch-worktree-"));
+  const agentDir = join(root, "agent");
+  const batch = {
+    id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    title: "absent worktree batch",
+    worktreeId: encodeURIComponent(join(root, "missing-worktree")),
+    tabId: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+  };
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const calls = [];
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    await mkdir(join(agentDir, "subagents", batch.id), { recursive: true });
+    const outcome = await closeBatchTab({
+      exec: async (command, args) => {
+        assert.equal(command, "supacode");
+        calls.push(args);
+        if (args[0] === "tab" && args[1] === "list") {
+          assert.deepEqual(args, ["tab", "list", "-w", batch.worktreeId]);
+          return { stdout: "", stderr: "worktree missing", code: 1, killed: false };
+        }
+        if (args[0] === "worktree" && args[1] === "list") {
+          assert.deepEqual(args, ["worktree", "list"]);
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        throw new Error(`Unexpected Supacode call: ${args.join(" ")}`);
+      },
+    }, batch);
+
+    assert.deepEqual(outcome, { closed: true });
+    assert.equal(calls.filter((args) => args[0] === "tab").length, 3);
+    assert.equal(calls.filter((args) => args[0] === "worktree").length, 3);
+  } finally {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("worker completion requires a normal stop and aggregates all turn usage", async () => {
@@ -552,6 +892,7 @@ test("pre-surface cancellation records durable non-launch settlement", async () 
     process.env.PI_CODING_AGENT_DIR = agentDir;
     process.env.SUPACODE_WORKTREE_ID = encodeURIComponent(canonicalRepository);
     let surfaceLaunched = false;
+    let launchedTabId;
     let tabClosed = false;
     const { tools } = registerExtension(async (command, args, options) => {
       if (command !== "supacode") return execResult(command, args, options);
@@ -567,7 +908,8 @@ test("pre-surface cancellation records durable non-launch settlement", async () 
         const job = JSON.parse(await readFile(join(jobDir, "job.json"), "utf8"));
         await claimJobDecision(jobDir, job.id, "cancel");
         await writeJobControl(jobDir, job.id, "cancel before surface creation");
-        return { stdout: `${args[args.indexOf("-n") + 1]}\n`, stderr: "", code: 0, killed: false };
+        launchedTabId = args[args.indexOf("-n") + 1];
+        return { stdout: `${launchedTabId}\n`, stderr: "", code: 0, killed: false };
       }
       if (args[0] === "surface" && args[1] === "split") {
         surfaceLaunched = true;
@@ -581,7 +923,7 @@ test("pre-surface cancellation records durable non-launch settlement", async () 
         return { stdout: "", stderr: "", code: 0, killed: false };
       }
       if (args[0] === "tab" && args[1] === "list") {
-        return { stdout: tabClosed ? "" : `${args[args.indexOf("-t") + 1]}\n`, stderr: "", code: 0, killed: false };
+        return { stdout: tabClosed ? "" : `${launchedTabId}\n`, stderr: "", code: 0, killed: false };
       }
       return { stdout: "", stderr: `unexpected command: ${args.join(" ")}`, code: 1, killed: false };
     });
@@ -624,6 +966,7 @@ test("a cancellation racing surface creation wins the launch claim and removes t
     process.env.PI_CODING_AGENT_DIR = agentDir;
     process.env.SUPACODE_WORKTREE_ID = encodeURIComponent(canonicalRepository);
     let surfaceLaunched = false;
+    let launchedTabId;
     let launchedSurfaceId;
     let surfaceClosed = false;
     let tabClosed = false;
@@ -633,8 +976,8 @@ test("a cancellation racing surface creation wins the launch claim and removes t
         return { stdout: `${encodeURIComponent(canonicalRepository)}\n`, stderr: "", code: 0, killed: false };
       }
       if (args[0] === "tab" && args[1] === "new") {
-        const tabId = args[args.indexOf("-n") + 1];
-        return { stdout: `${tabId}\n`, stderr: "", code: 0, killed: false };
+        launchedTabId = args[args.indexOf("-n") + 1];
+        return { stdout: `${launchedTabId}\n`, stderr: "", code: 0, killed: false };
       }
       if (args[0] === "surface" && args[1] === "split") {
         surfaceLaunched = true;
@@ -667,7 +1010,7 @@ test("a cancellation racing surface creation wins the launch claim and removes t
         return { stdout: "", stderr: "", code: 0, killed: false };
       }
       if (args[0] === "tab" && args[1] === "list") {
-        return { stdout: tabClosed ? "" : `${args[args.indexOf("-t") + 1]}\n`, stderr: "", code: 0, killed: false };
+        return { stdout: tabClosed ? "" : `${launchedTabId}\n`, stderr: "", code: 0, killed: false };
       }
       return { stdout: "", stderr: `unexpected command: ${args.join(" ")}`, code: 1, killed: false };
     });
@@ -950,6 +1293,9 @@ test("status, cancel, and recover commands reconcile durable worker state", asyn
       }
       if (args[0] === "surface" && args[1] === "list") {
         return { stdout: surfaceClosed ? "" : `${surfaceId}\n`, stderr: "", code: 0, killed: false };
+      }
+      if (args[0] === "tab" && args[1] === "list") {
+        return { stdout: `${tabId}\n`, stderr: "", code: 0, killed: false };
       }
       return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
     });
@@ -2345,7 +2691,6 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
       worktreeLaunchJobId,
       worktreeLaunchNonce,
     });
-    let deleted = false;
     let deleteAttempts = 0;
     let worktreeListed = false;
     let interruptGitRemoval = true;
@@ -2363,13 +2708,9 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
         return { stdout: worktreeListed ? `${encodeURIComponent(canonicalWorktree)}\n` : "", stderr: "", code: 0, killed: false };
       }
       if (args[0] === "worktree" && args[1] === "delete") {
+        assert.deepEqual(args, ["worktree", "delete", "-w", encodeURIComponent(canonicalWorktree)]);
         deleteAttempts++;
-        if (deleteAttempts === 1) {
-          return { stdout: "", stderr: "simulated Supacode deletion failure", code: 1, killed: false };
-        }
-        deleted = true;
-        worktreeListed = false;
-        return { stdout: "", stderr: "", code: 0, killed: false };
+        return { stdout: "", stderr: "simulated Supacode deletion failure", code: 1, killed: false };
       }
       return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
     });
@@ -2384,7 +2725,7 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
       },
     };
     await commands.get("delegate-recover").handler(jobId, context);
-    assert.equal(deleted, false);
+    assert.equal(deleteAttempts, 0);
     assert.equal(await inspectProcessIdentity(creatorIdentity), "alive");
     assert.equal((await readJobLifecycle(jobDir)).phase, "recovery_required");
 
@@ -2397,7 +2738,7 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
       completedAt: new Date().toISOString(),
     })}\n`);
     await commands.get("delegate-recover").handler(jobId, context);
-    assert.equal(deleted, false);
+    assert.equal(deleteAttempts, 0);
     assert.throws(() => process.kill(creator.pid, 0), { code: "ESRCH" });
     assert.equal(await realpath(worktree), canonicalWorktree);
     await assert.rejects(readFile(join(jobDir, "worktree-cleanup.json")));
@@ -2418,7 +2759,7 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
     const cleanupPath = join(jobDir, "worktree-cleanup.json");
     const plannedCleanup = JSON.parse(await readFile(cleanupPath, "utf8"));
     await commands.get("delegate-recover").handler(jobId, context);
-    assert.equal(deleted, false);
+    assert.equal(deleteAttempts, 1);
     const gitRemovedCleanup = JSON.parse(await readFile(cleanupPath, "utf8"));
     assert.equal(gitRemovedCleanup.phase, "git_removed");
     assert.equal(
@@ -2426,10 +2767,21 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
       false,
     );
 
+    await commands.get("delegate-recover").handler(jobId, context);
+    assert.equal(deleteAttempts, 1);
+    assert.deepEqual(JSON.parse(await readFile(cleanupPath, "utf8")), gitRemovedCleanup);
+    assert.equal(
+      notifications.some((notification) =>
+        notification.message.includes("prior Supacode worktree-deletion intent") &&
+        notification.message.includes("was not reissued")
+      ),
+      true,
+    );
+
     await writeFile(cleanupPath, `${JSON.stringify(plannedCleanup, null, 2)}\n`);
     await checked("git", ["-C", repository, "worktree", "add", canonicalWorktree, branch]);
     await commands.get("delegate-recover").handler(jobId, context);
-    assert.equal(deleted, false);
+    assert.equal(deleteAttempts, 1);
     assert.equal(
       notifications.some((notification) => notification.message.includes("identity was replaced")),
       true,
@@ -2443,7 +2795,7 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
       worktreeId: encodeURIComponent(await realpath(repository)),
     }, null, 2)}\n`);
     await commands.get("delegate-recover").handler(jobId, context);
-    assert.equal(deleted, false);
+    assert.equal(deleteAttempts, 1);
     assert.equal(
       notifications.some((notification) => notification.message.includes("Supacode identity do not match")),
       true,
@@ -2452,16 +2804,20 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
 
     await mkdir(worktree);
     await commands.get("delegate-recover").handler(jobId, context);
-    assert.equal(deleted, false);
+    assert.equal(deleteAttempts, 1);
     assert.equal(
       notifications.some((notification) => notification.message.includes("path was recreated")),
       true,
     );
     await rm(worktree, { recursive: true, force: true });
 
+    worktreeListed = false;
     await commands.get("delegate-recover").handler(jobId, context);
-    assert.equal(deleted, true);
-    assert.equal(JSON.parse(await readFile(join(jobDir, "worktree-cleanup.json"), "utf8")).phase, "completed");
+    assert.equal(deleteAttempts, 1);
+    const completedCleanup = JSON.parse(await readFile(join(jobDir, "worktree-cleanup.json"), "utf8"));
+    assert.equal(completedCleanup.phase, "completed");
+    assert.equal(typeof completedCleanup.supacodeDeletionIntentAt, "string");
+    assert.equal(typeof completedCleanup.supacodeDeletionVerifiedAt, "string");
     assert.equal((await readJobLifecycle(jobDir)).phase, "failed");
     assert.equal(notifications.some((notification) => notification.message.includes("Removed untouched worktree")), true);
   } finally {

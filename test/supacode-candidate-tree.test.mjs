@@ -68,7 +68,14 @@ async function createFixture() {
     artifacts,
     baseSha,
     branch,
-    pi: { exec: execResult },
+    pi: {
+      exec: async (command, args, options) => {
+        if (command === "supacode") {
+          throw new Error(`Unexpected Supacode test call: ${args.join(" ")}`);
+        }
+        return execResult(command, args, options);
+      },
+    },
     workspace: {
       id: "11111111-2222-4333-8444-555555555555",
       worktreePath: worker,

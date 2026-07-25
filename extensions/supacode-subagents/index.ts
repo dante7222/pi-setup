@@ -95,6 +95,12 @@ import {
   sameSupacodeUuid,
 } from "./resource-id.ts";
 import {
+  observeSupacodeSurface,
+  observeSupacodeTab,
+  observeSupacodeWorktree,
+  type SupacodeResourcePresence,
+} from "./resource-state.ts";
+import {
   groupWorkersByPlacement,
   researchWorkerSplitPlacement,
   workerTabWorktreeId,
@@ -1719,7 +1725,7 @@ async function createBatchTab(
   return batch;
 }
 
-async function closeBatchAnchor(
+export async function closeBatchAnchor(
   pi: ExtensionAPI,
   batch: WorkerBatch,
   workers: WorkerJob[],
@@ -1736,24 +1742,45 @@ async function closeBatchAnchor(
       anchorCloseIntentAt,
     }, null, 2)}\n`,
   );
-  const closed = await pi.exec(
-    "supacode",
-    [
-      "surface",
-      "close",
-      "-w",
+  let previousPresence: SupacodeResourcePresence | undefined;
+  let stablePresence: Exclude<SupacodeResourcePresence, "unknown"> | undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const presence = await observeSupacodeSurface(
+      pi,
       batch.worktreeId,
-      "-t",
       batch.tabId,
-      "-s",
       batch.tabId,
-    ],
-    { signal, timeout: 5000 },
-  );
-  if (closed.code !== 0) {
-    throw new Error(`Could not close batch anchor surface: ${(closed.stderr || closed.stdout || `exit ${closed.code}`).trim()}`);
+      { signal, timeoutMs: 5000 },
+    );
+    if (presence !== "unknown" && presence === previousPresence) {
+      stablePresence = presence;
+      break;
+    }
+    previousPresence = presence === "unknown" ? undefined : presence;
+    await delay(100, signal);
   }
+  if (!stablePresence) {
+    throw new Error("Batch anchor state is unavailable; destructive close was not issued.");
+  }
+
+  const closed = stablePresence === "present"
+    ? await pi.exec(
+        "supacode",
+        [
+          "surface",
+          "close",
+          "-w",
+          batch.worktreeId,
+          "-t",
+          batch.tabId,
+          "-s",
+          batch.tabId,
+        ],
+        { signal, timeout: 5000 },
+      )
+    : undefined;
   let confirmedMissing = 0;
+  let confirmedTabAbsent = 0;
   for (let attempt = 0; attempt < 20; attempt++) {
     const listed = await pi.exec(
       "supacode",
@@ -1761,30 +1788,43 @@ async function closeBatchAnchor(
       { signal, timeout: 5000 },
     );
     if (listed.code === 0) {
+      confirmedTabAbsent = 0;
       const surfaceIds = listed.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
       const anchorMissing = !surfaceIds.some((surfaceId) => sameSupacodeUuid(surfaceId, batch.tabId));
       const workersPresent = workers.every((worker) =>
         surfaceIds.some((surfaceId) => sameSupacodeUuid(surfaceId, worker.surfaceId))
       );
       confirmedMissing = anchorMissing && workersPresent ? confirmedMissing + 1 : 0;
-      if (confirmedMissing >= 2) {
-        await atomicWrite(
-          batchPath,
-          `${JSON.stringify({
-            ...priorMetadata,
-            anchorSurfaceState: "closed",
-            anchorCloseIntentAt,
-            anchorClosedAt: isoNow(),
-          }, null, 2)}\n`,
-        );
-        return;
-      }
     } else {
       confirmedMissing = 0;
+      const tabPresence = await observeSupacodeTab(
+        pi,
+        batch.worktreeId,
+        batch.tabId,
+        { signal, timeoutMs: 5000 },
+      );
+      confirmedTabAbsent = stablePresence === "absent" && tabPresence === "absent"
+        ? confirmedTabAbsent + 1
+        : 0;
+    }
+    if (confirmedMissing >= 2 || confirmedTabAbsent >= 2) {
+      await atomicWrite(
+        batchPath,
+        `${JSON.stringify({
+          ...priorMetadata,
+          anchorSurfaceState: "closed",
+          anchorCloseIntentAt,
+          anchorClosedAt: isoNow(),
+        }, null, 2)}\n`,
+      );
+      return;
     }
     await delay(100, signal);
   }
-  throw new Error("Batch anchor closure or worker-surface preservation could not be verified.");
+  const closeDiagnostic = closed && closed.code !== 0
+    ? ` Supacode close failed: ${(closed.stderr || closed.stdout || `exit ${closed.code}`).trim()}`
+    : "";
+  throw new Error(`Batch anchor closure or worker-surface preservation could not be verified.${closeDiagnostic}`);
 }
 
 async function createWorkerSurface(
@@ -2131,7 +2171,7 @@ async function markUnlaunchedPreparedWorkers(
   return recoveries;
 }
 
-async function closeBatchTab(
+export async function closeBatchTab(
   pi: ExtensionAPI,
   batch: WorkerBatch,
 ): Promise<{ closed: boolean; error?: string }> {
@@ -2146,22 +2186,35 @@ async function closeBatchTab(
   } catch (error) {
     metadataError = `Could not record tab-closing intent: ${error instanceof Error ? error.message : String(error)}`;
   }
-  const closed = await pi.exec(
-    "supacode",
-    ["tab", "close", "-w", batch.worktreeId, "-t", batch.tabId],
-    { timeout: CLEANUP_TIMEOUT_MS },
-  );
+  let presence = await observeSupacodeTab(pi, batch.worktreeId, batch.tabId, {
+    timeoutMs: TAB_LIST_TIMEOUT_MS,
+  });
+  if (presence === "present") {
+    await delay(100);
+    presence = await observeSupacodeTab(pi, batch.worktreeId, batch.tabId, {
+      timeoutMs: TAB_LIST_TIMEOUT_MS,
+    });
+  }
+  const closed = presence === "present"
+    ? await pi.exec(
+        "supacode",
+        ["tab", "close", "-w", batch.worktreeId, "-t", batch.tabId],
+        { timeout: CLEANUP_TIMEOUT_MS },
+      )
+    : {
+        stdout: "",
+        stderr: presence === "unknown"
+          ? "Supacode tab state is unavailable; destructive close was not issued."
+          : "",
+        code: presence === "unknown" ? 1 : 0,
+        killed: false,
+      };
   let missing = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const listed = await pi.exec(
-      "supacode",
-      ["tab", "list", "-w", batch.worktreeId],
-      { timeout: TAB_LIST_TIMEOUT_MS },
-    );
-    if (
-      listed.code === 0 &&
-      !listed.stdout.split(/\r?\n/).some((listedId) => sameSupacodeUuid(listedId, batch.tabId))
-    ) {
+    const observed = await observeSupacodeTab(pi, batch.worktreeId, batch.tabId, {
+      timeoutMs: TAB_LIST_TIMEOUT_MS,
+    });
+    if (observed === "absent") {
       missing++;
       if (missing >= 2) {
         try {
@@ -2170,8 +2223,9 @@ async function closeBatchTab(
             batchPath,
             `${JSON.stringify({ ...metadata, schemaVersion: SUBAGENT_SCHEMA_VERSION, ...batch, phase: "closed", closedAt: isoNow() }, null, 2)}\n`,
           );
+          metadataError = undefined;
         } catch (error) {
-          metadataError = `${metadataError ? `${metadataError} ` : ""}Tab closed, but final metadata failed: ${error instanceof Error ? error.message : String(error)}`;
+          metadataError = `Tab closed, but final metadata failed: ${error instanceof Error ? error.message : String(error)}`;
         }
         return metadataError ? { closed: false, error: metadataError } : { closed: true };
       }
@@ -2259,15 +2313,11 @@ async function batchTabExists(
   signal: AbortSignal,
 ): Promise<boolean | undefined> {
   try {
-    const listed = await execChecked(
-      pi,
-      "supacode",
-      ["tab", "list", "-w", batch.worktreeId],
-      { signal, timeout: TAB_LIST_TIMEOUT_MS },
-    );
-    return listed
-      .split(/\r?\n/)
-      .some((listedTabId) => sameSupacodeUuid(listedTabId, batch.tabId));
+    const presence = await observeSupacodeTab(pi, batch.worktreeId, batch.tabId, {
+      signal,
+      timeoutMs: TAB_LIST_TIMEOUT_MS,
+    });
+    return presence === "unknown" ? undefined : presence === "present";
   } catch (error) {
     if (signal.aborted) throw error;
     return undefined;
@@ -4960,12 +5010,23 @@ async function batchTabClosureSafety(
       return { safe: false, reason: `Sibling worker ${siblingId} process state is ${processes.states.join(", ")}.` };
     }
   }
+  const tabPresence = await observeSupacodeTab(pi, worktreeId, tabId, {
+    timeoutMs: TAB_LIST_TIMEOUT_MS,
+  });
+  if (tabPresence === "absent") return { safe: true };
+  if (tabPresence === "unknown") {
+    return { safe: false, reason: "Could not verify batch-tab presence before cleanup." };
+  }
   const listed = await pi.exec(
     "supacode",
     ["surface", "list", "-w", worktreeId, "-t", tabId],
     { timeout: TAB_LIST_TIMEOUT_MS },
   );
-  if (listed.code !== 0) return { safe: false, reason: "Could not enumerate batch surfaces before tab cleanup." };
+  if (listed.code !== 0) {
+    return await observeSupacodeTab(pi, worktreeId, tabId, { timeoutMs: TAB_LIST_TIMEOUT_MS }) === "absent"
+      ? { safe: true }
+      : { safe: false, reason: "Could not enumerate batch surfaces before tab cleanup." };
+  }
   const unknownSurface = listed.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)
     .find((surfaceId) => !knownSurfaces.has(surfaceId.toLowerCase()));
   return unknownSurface
@@ -5019,40 +5080,15 @@ async function recoverInterruptedBatchTab(
   if (!closureSafety.safe) {
     return `Shared batch tab ${tabId} was retained: ${closureSafety.reason ?? "sibling cleanup is not verified"}`;
   }
-  await pi.exec(
-    "supacode",
-    ["tab", "close", "-w", worktreeId, "-t", tabId],
-    { timeout: CLEANUP_TIMEOUT_MS },
-  );
-  let missing = 0;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const listed = await pi.exec(
-      "supacode",
-      ["tab", "list", "-w", worktreeId],
-      { timeout: TAB_LIST_TIMEOUT_MS },
-    );
-    if (
-      listed.code === 0 &&
-      !listed.stdout.split(/\r?\n/).some((listedId) => sameSupacodeUuid(listedId, tabId))
-    ) {
-      missing++;
-      if (missing >= 2) {
-        await atomicWrite(
-          batchPath,
-          `${JSON.stringify({ ...batch, phase: "closed", recoveredAt: isoNow() }, null, 2)}\n`,
-        );
-        return `Closed interrupted batch tab ${tabId}.`;
-      }
-    } else {
-      missing = 0;
-    }
-    await delay(100);
-  }
-  await atomicWrite(
-    batchPath,
-    `${JSON.stringify({ ...batch, phase: "recovery_required", recoveryError: "Tab absence was not verified.", updatedAt: isoNow() }, null, 2)}\n`,
-  );
-  return `Batch tab ${tabId} could not be verified absent.`;
+  const cleanup = await closeBatchTab(pi, {
+    id: job.batchId,
+    title: metadataString(batch, "title") ?? `agents ${job.batchId.slice(0, 4)}`,
+    worktreeId,
+    tabId,
+  });
+  return cleanup.closed
+    ? `Closed interrupted batch tab ${tabId}.`
+    : `Batch tab ${tabId} could not be verified absent: ${cleanup.error ?? "unknown cleanup error"}`;
 }
 
 interface WorktreeRecoveryOutcome {
@@ -5070,6 +5106,8 @@ interface WorktreeCleanupRecord {
   gitDirInode: string;
   branch: string;
   phase: "planned" | "git_removed" | "completed";
+  supacodeDeletionIntentAt?: string;
+  supacodeDeletionVerifiedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -5198,45 +5236,63 @@ async function finishRecordedWorktreeCleanup(
     await atomicWrite(cleanupPath, `${JSON.stringify(current, null, 2)}\n`);
   }
   if (current.phase === "git_removed" && current.worktreeId) {
+    const worktreeId = current.worktreeId;
     let absentConfirmations = 0;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const listed = await pi.exec("supacode", ["worktree", "list"], { timeout: 30_000 });
-      if (listed.code !== 0) {
-        const reason = `Could not verify Supacode worktree cleanup for ${current.worktreeId}.`;
+    let previousPresence: SupacodeResourcePresence | undefined;
+    let deletionIssued = current.supacodeDeletionIntentAt !== undefined;
+    let deletionError: string | undefined;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const presence = await observeSupacodeWorktree(pi, worktreeId, { timeoutMs: 30_000 });
+      if (presence === "unknown") {
+        const reason = `Could not verify Supacode worktree cleanup for ${worktreeId}.`;
         await updateJobLifecycle(job.jobDir, "recovery_required", reason, {
           worktreePath: current.worktreePath,
-          worktreeId: current.worktreeId,
+          worktreeId,
         });
         return { message: reason, complete: false };
       }
-      const present = listed.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)
-        .includes(current.worktreeId);
-      if (!present) {
+      if (presence === "absent") {
         absentConfirmations++;
         if (absentConfirmations >= 2) break;
       } else {
         absentConfirmations = 0;
-        const deleted = await pi.exec(
-          "supacode",
-          ["worktree", "delete", "-w", current.worktreeId],
-          { timeout: 190_000 },
-        );
-        if (deleted.code !== 0) {
-          const reason = `Supacode resource cleanup failed for ${current.worktreeId}: ${(deleted.stderr || deleted.stdout).trim()}`;
-          await updateJobLifecycle(job.jobDir, "recovery_required", reason, {
-            worktreePath: current.worktreePath,
-            worktreeId: current.worktreeId,
-          });
-          return { message: reason, complete: false };
+        if (!deletionIssued && previousPresence === "present") {
+          const intentAt = isoNow();
+          current = {
+            ...current,
+            supacodeDeletionIntentAt: intentAt,
+            updatedAt: intentAt,
+          };
+          await atomicWrite(cleanupPath, `${JSON.stringify(current, null, 2)}\n`);
+          deletionIssued = true;
+          const deleted = await pi.exec(
+            "supacode",
+            ["worktree", "delete", "-w", worktreeId],
+            { timeout: 190_000 },
+          );
+          if (deleted.code !== 0) {
+            deletionError = (deleted.stderr || deleted.stdout || `exit ${deleted.code}`).trim();
+          }
         }
       }
+      previousPresence = presence;
       await delay(100);
     }
     if (absentConfirmations < 2) {
-      const reason = `Supacode worktree ${current.worktreeId} could not be verified absent.`;
+      const reason = deletionError
+        ? `Supacode resource cleanup failed for ${worktreeId}: ${deletionError}`
+        : current.supacodeDeletionIntentAt
+        ? `A prior Supacode worktree-deletion intent for ${worktreeId} remains unsettled; deletion was not reissued.`
+        : `Supacode worktree ${worktreeId} could not be verified absent.`;
       await updateJobLifecycle(job.jobDir, "recovery_required", reason);
       return { message: reason, complete: false };
     }
+    current = {
+      ...current,
+      supacodeDeletionVerifiedAt: isoNow(),
+      updatedAt: isoNow(),
+    };
+    await atomicWrite(cleanupPath, `${JSON.stringify(current, null, 2)}\n`);
   }
   current = { ...current, phase: "completed", updatedAt: isoNow() };
   await atomicWrite(cleanupPath, `${JSON.stringify(current, null, 2)}\n`);
@@ -5322,6 +5378,12 @@ async function recoverUnlaunchedCodingWorktree(
       !/^\d+$/.test(cleanupRecord.gitDirInode) ||
       (cleanupRecord.worktreeId !== undefined &&
         (typeof cleanupRecord.worktreeId !== "string" || !cleanupRecord.worktreeId.trim())) ||
+      (cleanupRecord.supacodeDeletionIntentAt !== undefined &&
+        (typeof cleanupRecord.supacodeDeletionIntentAt !== "string" ||
+          !cleanupRecord.supacodeDeletionIntentAt.trim())) ||
+      (cleanupRecord.supacodeDeletionVerifiedAt !== undefined &&
+        (typeof cleanupRecord.supacodeDeletionVerifiedAt !== "string" ||
+          !cleanupRecord.supacodeDeletionVerifiedAt.trim())) ||
       !["planned", "git_removed", "completed"].includes(cleanupRecord.phase)
     ) {
       const reason = "Persisted worktree cleanup transaction does not match job identity.";
@@ -5636,23 +5698,14 @@ async function recoverReviewerSurfaceBeforeProcess(
   ) return { recovered: false };
   let missing = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const listed = await pi.exec(
-      "supacode",
-      ["surface", "list", "-w", worktreeId, "-t", tabId],
-      { timeout: TAB_LIST_TIMEOUT_MS },
+    const presence = await observeSupacodeSurface(
+      pi,
+      worktreeId,
+      tabId,
+      surfaceId,
+      { timeoutMs: TAB_LIST_TIMEOUT_MS },
     );
-    let absent = listed.code === 0 &&
-      !listed.stdout.split(/\r?\n/).some((listedId) => sameSupacodeUuid(listedId, surfaceId));
-    if (listed.code !== 0) {
-      const tabs = await pi.exec(
-        "supacode",
-        ["tab", "list", "-w", worktreeId],
-        { timeout: TAB_LIST_TIMEOUT_MS },
-      );
-      absent = tabs.code === 0 &&
-        !tabs.stdout.split(/\r?\n/).some((listedId) => sameSupacodeUuid(listedId, tabId));
-    }
-    missing = absent ? missing + 1 : 0;
+    missing = presence === "absent" ? missing + 1 : 0;
     if (missing >= 2) {
       return {
         recovered: true,

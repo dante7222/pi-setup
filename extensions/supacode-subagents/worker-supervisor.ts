@@ -9,6 +9,7 @@ import {
 } from "./process-identity.ts";
 import { readRunnerProcess } from "./lifecycle.ts";
 import { sameSupacodeUuid } from "./resource-id.ts";
+import { observeSupacodeSurface } from "./resource-state.ts";
 import { validationGateProvesCommandNeverLaunched } from "./validation-process.ts";
 
 export interface SupervisedWorker {
@@ -240,10 +241,13 @@ async function listedSurfaceIds(
 }
 
 async function surfaceAbsent(pi: ExtensionAPI, worker: SupervisedWorker): Promise<boolean | undefined> {
-  const surfaces = await listedSurfaceIds(pi, worker);
-  return surfaces
-    ? !surfaces.some((surfaceId) => sameSupacodeUuid(surfaceId, worker.surfaceId))
-    : undefined;
+  const presence = await observeSupacodeSurface(
+    pi,
+    worker.tabWorktreeId,
+    worker.tabId,
+    worker.surfaceId,
+  );
+  return presence === "unknown" ? undefined : presence === "absent";
 }
 
 async function waitForSurfaceAbsence(
@@ -494,24 +498,44 @@ export async function terminateWorker(
 
   let surfaceIsAbsent = false;
   if (processMetadataValid && processes.absent) {
-    const closed = await pi.exec(
-      "supacode",
-      [
-        "surface",
-        "close",
-        "-w",
-        worker.tabWorktreeId,
-        "-t",
-        worker.tabId,
-        "-s",
-        worker.surfaceId,
-      ],
-      { timeout: 5000 },
+    let presence = await observeSupacodeSurface(
+      pi,
+      worker.tabWorktreeId,
+      worker.tabId,
+      worker.surfaceId,
     );
-    if (closed.code !== 0) {
-      errors.push(`Supacode surface close failed: ${(closed.stderr || closed.stdout || `exit ${closed.code}`).trim()}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const confirmation = await observeSupacodeSurface(
+      pi,
+      worker.tabWorktreeId,
+      worker.tabId,
+      worker.surfaceId,
+    );
+    if (confirmation !== presence) presence = "unknown";
+    if (presence === "absent") {
+      surfaceIsAbsent = true;
+    } else if (presence === "unknown") {
+      errors.push("Worker surface state is unavailable; destructive close was not issued.");
+    } else {
+      const closed = await pi.exec(
+        "supacode",
+        [
+          "surface",
+          "close",
+          "-w",
+          worker.tabWorktreeId,
+          "-t",
+          worker.tabId,
+          "-s",
+          worker.surfaceId,
+        ],
+        { timeout: 5000 },
+      );
+      surfaceIsAbsent = await waitForSurfaceAbsence(pi, worker, 3000);
+      if (closed.code !== 0 && !surfaceIsAbsent) {
+        errors.push(`Supacode surface close failed: ${(closed.stderr || closed.stdout || `exit ${closed.code}`).trim()}`);
+      }
     }
-    surfaceIsAbsent = await waitForSurfaceAbsence(pi, worker, 3000);
   } else {
     const observedAbsent = await surfaceAbsent(pi, worker);
     surfaceIsAbsent = observedAbsent === true;

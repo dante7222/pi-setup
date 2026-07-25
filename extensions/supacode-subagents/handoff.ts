@@ -23,10 +23,12 @@ import {
   readWorkerTerminal,
 } from "./lifecycle.ts";
 import { inspectProcessIdentity, type ProcessIdentity } from "./process-identity.ts";
+import { decodeSupacodeResourceId } from "./resource-id.ts";
 import {
-  decodeSupacodeResourceId,
-  sameSupacodeUuid,
-} from "./resource-id.ts";
+  observeSupacodeSurface,
+  observeSupacodeWorktree,
+  type SupacodeResourcePresence,
+} from "./resource-state.ts";
 import {
   recordValidationGateIntent,
   runValidationProcess,
@@ -114,6 +116,8 @@ interface HandoffCleanupResult {
   recoveryRef?: string;
   preservedHead?: string;
   worktreeId?: string;
+  supacodeWorktreeDeletionIntentAt?: string;
+  supacodeWorktreeDeletionVerifiedAt?: string;
   errors: string[];
 }
 
@@ -1459,40 +1463,42 @@ async function currentPreflightBlockers(
   return { blockers, blockedPaths: uniqueSortedPaths([...blockedPaths, ...ignoredBlockedPaths]) };
 }
 
-async function tabExists(
+async function workerPanePresence(
   pi: ExtensionAPI,
   job: StoredCodingJob,
-): Promise<boolean | undefined> {
-  const result = await pi.exec(
-    "supacode",
-    ["tab", "list", "-w", job.tabWorktreeId],
-    { timeout: GIT_TIMEOUT_MS },
+): Promise<SupacodeResourcePresence> {
+  return observeSupacodeSurface(
+    pi,
+    job.tabWorktreeId,
+    job.tabId,
+    job.surfaceId,
+    { timeoutMs: GIT_TIMEOUT_MS },
   );
-  if (result.code !== 0) return undefined;
-  return result.stdout.split(/\r?\n/).some((id) => sameSupacodeUuid(id, job.tabId));
-}
-
-async function workerPaneExists(
-  pi: ExtensionAPI,
-  job: StoredCodingJob,
-): Promise<boolean | undefined> {
-  const listed = await pi.exec(
-    "supacode",
-    ["surface", "list", "-w", job.tabWorktreeId, "-t", job.tabId],
-    { timeout: GIT_TIMEOUT_MS },
-  );
-  if (listed.code === 0) {
-    return listed.stdout
-      .split(/\r?\n/)
-      .some((id) => sameSupacodeUuid(id, job.surfaceId));
-  }
-  return await tabExists(pi, job) === false ? false : undefined;
 }
 
 async function closeWorkerPane(
   pi: ExtensionAPI,
   job: StoredCodingJob,
 ): Promise<{ closed: boolean; error?: string }> {
+  let previousPresence: SupacodeResourcePresence | undefined;
+  let confirmedPresent = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const presence = await workerPanePresence(pi, job);
+    if (presence !== "unknown" && presence === previousPresence) {
+      if (presence === "absent") return { closed: true };
+      confirmedPresent = true;
+      break;
+    }
+    previousPresence = presence === "unknown" ? undefined : presence;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  if (!confirmedPresent) {
+    return {
+      closed: false,
+      error: "Could not establish stable worker-pane presence; destructive close was not issued.",
+    };
+  }
+
   const closed = await pi.exec(
     "supacode",
     [
@@ -1509,8 +1515,8 @@ async function closeWorkerPane(
   );
   let consecutiveMissingChecks = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const exists = await workerPaneExists(pi, job);
-    if (exists === false) {
+    const presence = await workerPanePresence(pi, job);
+    if (presence === "absent") {
       consecutiveMissingChecks++;
       if (consecutiveMissingChecks >= 2) return { closed: true };
     } else {
@@ -1730,21 +1736,154 @@ async function listedSourceWorktreeId(
     : { error: "Supacode no longer lists the snapshotted source worktree; deletion was stopped." };
 }
 
+type SupacodeWorktreeRemovalOutcome =
+  | { removed: true; intentAt?: string; verifiedAt: string }
+  | { removed: false; intentAt?: string; error: string };
+
+interface AppliedWorktreeCleanupProtocol {
+  onRecoveryRef?: (recoveryRef: string) => Promise<void>;
+  onWorktreeIdentity?: (worktreeId: string, preservedHead: string) => Promise<void>;
+  priorDeletionIntent?: { worktreeId: string; intentAt: string };
+  onDeletionIntent?: (
+    worktreeId: string,
+    preservedHead: string,
+    intentAt: string,
+  ) => Promise<void>;
+}
+
+async function removeSupacodeWorktreeResource(
+  pi: ExtensionAPI,
+  worktreeId: string,
+  priorIntentAt?: string,
+  onDeletionIntent?: (intentAt: string) => Promise<void>,
+): Promise<SupacodeWorktreeRemovalOutcome> {
+  const verifyAbsence = async (): Promise<string | undefined> => {
+    let consecutiveAbsence = 0;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const presence = await observeSupacodeWorktree(pi, worktreeId, { timeoutMs: GIT_TIMEOUT_MS });
+      if (presence === "absent") {
+        consecutiveAbsence++;
+        if (consecutiveAbsence >= 2) return new Date().toISOString();
+      } else {
+        consecutiveAbsence = 0;
+      }
+      if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return undefined;
+  };
+
+  if (priorIntentAt) {
+    const verifiedAt = await verifyAbsence();
+    return verifiedAt
+      ? { removed: true, intentAt: priorIntentAt, verifiedAt }
+      : {
+          removed: false,
+          intentAt: priorIntentAt,
+          error: "A prior Supacode worktree-deletion intent remains unsettled; deletion was not reissued.",
+        };
+  }
+
+  let previousPresence: SupacodeResourcePresence | undefined;
+  let confirmedPresent = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const presence = await observeSupacodeWorktree(pi, worktreeId, { timeoutMs: GIT_TIMEOUT_MS });
+    if (presence !== "unknown" && presence === previousPresence) {
+      if (presence === "absent") {
+        return { removed: true, verifiedAt: new Date().toISOString() };
+      }
+      confirmedPresent = true;
+      break;
+    }
+    previousPresence = presence === "unknown" ? undefined : presence;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  if (!confirmedPresent) {
+    return {
+      removed: false,
+      error: "Could not establish stable Supacode worktree presence; destructive deletion was not issued.",
+    };
+  }
+  if (!onDeletionIntent) {
+    return {
+      removed: false,
+      error: "Supacode worktree-deletion intent could not be made durable; destructive deletion was not issued.",
+    };
+  }
+
+  const intentAt = new Date().toISOString();
+  try {
+    await onDeletionIntent(intentAt);
+  } catch (error) {
+    return {
+      removed: false,
+      error: `Supacode worktree-deletion intent could not be made durable; destructive deletion was not issued: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  const deleted = await pi.exec(
+    "supacode",
+    ["worktree", "delete", "-w", worktreeId],
+    { timeout: SUPACODE_DELETE_TIMEOUT_MS },
+  );
+  const verifiedAt = await verifyAbsence();
+  if (verifiedAt) return { removed: true, intentAt, verifiedAt };
+  return {
+    removed: false,
+    intentAt,
+    error: deleted.code === 0
+      ? "Supacode acknowledged worktree deletion, but resource absence was not verified."
+      : diagnosticText(deleted),
+  };
+}
+
 async function cleanupAppliedWorktree(
   pi: ExtensionAPI,
   prepared: PreparedDelegateHandoff,
-  onRecoveryRef?: (recoveryRef: string) => Promise<void>,
-  onWorktreeIdentity?: (worktreeId: string, preservedHead: string) => Promise<void>,
+  protocol: AppliedWorktreeCleanupProtocol = {},
 ): Promise<HandoffCleanupResult> {
   const errors: string[] = [];
+  const removeSupacodeResource = async (
+    worktreeId: string,
+    preservedHead: string,
+  ): Promise<SupacodeWorktreeRemovalOutcome> => {
+    if (
+      protocol.priorDeletionIntent &&
+      protocol.priorDeletionIntent.worktreeId !== worktreeId
+    ) {
+      return {
+        removed: false,
+        intentAt: protocol.priorDeletionIntent.intentAt,
+        error: "Durable Supacode worktree-deletion intent does not match the authenticated cleanup identity; deletion was refused.",
+      };
+    }
+    const onDeletionIntent = protocol.onDeletionIntent;
+    return removeSupacodeWorktreeResource(
+      pi,
+      worktreeId,
+      protocol.priorDeletionIntent?.intentAt,
+      onDeletionIntent
+        ? async (intentAt) => onDeletionIntent(worktreeId, preservedHead, intentAt)
+        : undefined,
+    );
+  };
+  const removalMetadata = (
+    outcome: SupacodeWorktreeRemovalOutcome,
+  ): Pick<
+    HandoffCleanupResult,
+    "supacodeWorktreeDeletionIntentAt" | "supacodeWorktreeDeletionVerifiedAt"
+  > => ({
+    ...(outcome.intentAt ? { supacodeWorktreeDeletionIntentAt: outcome.intentAt } : {}),
+    ...("verifiedAt" in outcome
+      ? { supacodeWorktreeDeletionVerifiedAt: outcome.verifiedAt }
+      : {}),
+  });
   const backup = await createBranchBackup(pi, prepared);
   if (!backup.ref) {
     if (backup.error) errors.push(backup.error);
     return { paneClosed: false, worktreeRemoved: false, branchPreserved: false, errors };
   }
-  if (onRecoveryRef) {
+  if (protocol.onRecoveryRef) {
     try {
-      await onRecoveryRef(backup.ref);
+      await protocol.onRecoveryRef(backup.ref);
     } catch (error) {
       errors.push(`Cleanup stopped because its recovery state could not be recorded: ${error instanceof Error ? error.message : String(error)}`);
       errors.push(`Worker recovery ref retained at ${backup.ref}.`);
@@ -1791,16 +1930,12 @@ async function cleanupAppliedWorktree(
   if (!await pathExists(prepared.sourceRoot)) {
     const backupHeadResult = await gitResult(pi, prepared.targetRoot, ["rev-parse", "--verify", backup.ref]);
     const backupHead = backupHeadResult.code === 0 ? backupHeadResult.stdout.trim() : prepared.sourceHead;
-    const removedBySupacode = await pi.exec(
-      "supacode",
-      ["worktree", "delete", "-w", prepared.job.codeWorktreeId],
-      { timeout: SUPACODE_DELETE_TIMEOUT_MS },
+    const removedBySupacode = await removeSupacodeResource(
+      prepared.job.codeWorktreeId,
+      backupHead,
     );
-    if (removedBySupacode.code !== 0) {
-      const listed = await pi.exec("supacode", ["worktree", "list"], { timeout: GIT_TIMEOUT_MS });
-      const stillPresent = listed.code !== 0 || listed.stdout.split(/\r?\n/).map((value) => value.trim())
-        .includes(prepared.job.codeWorktreeId);
-      if (stillPresent) errors.push(`Supacode resource cleanup failed: ${diagnosticText(removedBySupacode)}`);
+    if (!removedBySupacode.removed) {
+      errors.push(`Supacode resource cleanup failed: ${removedBySupacode.error}`);
     }
     const branch = await restoreWorkerBranch(
       pi,
@@ -1817,6 +1952,7 @@ async function cleanupAppliedWorktree(
       recoveryRef: branch.preserved && !branch.error ? undefined : backup.ref,
       preservedHead: backupHead,
       worktreeId: prepared.job.codeWorktreeId,
+      ...removalMetadata(removedBySupacode),
       errors,
     };
   }
@@ -1878,9 +2014,9 @@ async function cleanupAppliedWorktree(
     errors.push(`Worker recovery ref retained at ${backup.ref}.`);
     return retained(true, preservation.head);
   }
-  if (onWorktreeIdentity) {
+  if (protocol.onWorktreeIdentity) {
     try {
-      await onWorktreeIdentity(identity.id, preservation.head);
+      await protocol.onWorktreeIdentity(identity.id, preservation.head);
     } catch (error) {
       errors.push(`Cleanup stopped because worktree-removal intent could not be recorded: ${error instanceof Error ? error.message : String(error)}`);
       errors.push(`Worker recovery ref retained at ${backup.ref}.`);
@@ -1900,13 +2036,9 @@ async function cleanupAppliedWorktree(
     return retained(true, preservation.head);
   }
 
-  const removedBySupacode = await pi.exec(
-    "supacode",
-    ["worktree", "delete", "-w", identity.id],
-    { timeout: SUPACODE_DELETE_TIMEOUT_MS },
-  );
-  if (removedBySupacode.code !== 0) {
-    errors.push(`Worker files were removed safely, but Supacode resource cleanup failed: ${diagnosticText(removedBySupacode)}`);
+  const removedBySupacode = await removeSupacodeResource(identity.id, preservation.head);
+  if (!removedBySupacode.removed) {
+    errors.push(`Worker files were removed safely, but Supacode resource cleanup failed: ${removedBySupacode.error}`);
   }
 
   const branch = await restoreWorkerBranch(
@@ -1924,6 +2056,7 @@ async function cleanupAppliedWorktree(
     recoveryRef: branch.preserved && !branch.error ? undefined : backup.ref,
     preservedHead: preservation.head,
     worktreeId: identity.id,
+    ...removalMetadata(removedBySupacode),
     errors,
   };
 }
@@ -2262,34 +2395,55 @@ export async function applyPreparedDelegateHandoff(
     };
   }
   let cleanupRecoveryRef: string | undefined;
+  let deletionIntent: { worktreeId: string; preservedHead: string; intentAt: string } | undefined;
   try {
-    cleanupResult = await cleanupAppliedWorktree(pi, prepared, async (recoveryRef) => {
-      cleanupRecoveryRef = recoveryRef;
-      const pendingCleanup: HandoffCleanupResult = {
-        paneClosed: false,
-        worktreeRemoved: false,
-        branchPreserved: true,
-        recoveryRef,
-        errors: ["Cleanup pending; the verified recovery ref preserves the source HEAD."],
-      };
-      await writeManifest(
-        result.manifestPath,
-        manifestFor(prepared, "applied", apply, pendingCleanup),
-      );
-    }, async (worktreeId, preservedHead) => {
-      const pendingRemoval: HandoffCleanupResult = {
-        paneClosed: true,
-        worktreeRemoved: false,
-        branchPreserved: true,
-        recoveryRef: cleanupRecoveryRef,
-        preservedHead,
-        worktreeId,
-        errors: ["Worktree removal pending; exact source identity is durable."],
-      };
-      await writeManifest(
-        result.manifestPath,
-        manifestFor(prepared, "applied", apply, pendingRemoval),
-      );
+    cleanupResult = await cleanupAppliedWorktree(pi, prepared, {
+      onRecoveryRef: async (recoveryRef) => {
+        cleanupRecoveryRef = recoveryRef;
+        const pendingCleanup: HandoffCleanupResult = {
+          paneClosed: false,
+          worktreeRemoved: false,
+          branchPreserved: true,
+          recoveryRef,
+          errors: ["Cleanup pending; the verified recovery ref preserves the source HEAD."],
+        };
+        await writeManifest(
+          result.manifestPath,
+          manifestFor(prepared, "applied", apply, pendingCleanup),
+        );
+      },
+      onWorktreeIdentity: async (worktreeId, preservedHead) => {
+        const pendingRemoval: HandoffCleanupResult = {
+          paneClosed: true,
+          worktreeRemoved: false,
+          branchPreserved: true,
+          recoveryRef: cleanupRecoveryRef,
+          preservedHead,
+          worktreeId,
+          errors: ["Worktree removal pending; exact source identity is durable."],
+        };
+        await writeManifest(
+          result.manifestPath,
+          manifestFor(prepared, "applied", apply, pendingRemoval),
+        );
+      },
+      onDeletionIntent: async (worktreeId, preservedHead, intentAt) => {
+        const pendingDeletion: HandoffCleanupResult = {
+          paneClosed: true,
+          worktreeRemoved: true,
+          branchPreserved: true,
+          recoveryRef: cleanupRecoveryRef,
+          preservedHead,
+          worktreeId,
+          supacodeWorktreeDeletionIntentAt: intentAt,
+          errors: ["Supacode worktree deletion may have started; absence verification is pending."],
+        };
+        await writeManifest(
+          result.manifestPath,
+          manifestFor(prepared, "applied", apply, pendingDeletion),
+        );
+        deletionIntent = { worktreeId, preservedHead, intentAt };
+      },
     });
   } catch (error) {
     cleanupResult = {
@@ -2297,6 +2451,18 @@ export async function applyPreparedDelegateHandoff(
       worktreeRemoved: false,
       branchPreserved: false,
       errors: [`Cleanup ended unexpectedly; inspect the source worktree: ${error instanceof Error ? error.message : String(error)}`],
+    };
+  }
+  if (deletionIntent && !cleanupResult.supacodeWorktreeDeletionIntentAt) {
+    cleanupResult = {
+      ...cleanupResult,
+      paneClosed: true,
+      worktreeRemoved: true,
+      branchPreserved: true,
+      recoveryRef: cleanupRecoveryRef,
+      preservedHead: deletionIntent.preservedHead,
+      worktreeId: deletionIntent.worktreeId,
+      supacodeWorktreeDeletionIntentAt: deletionIntent.intentAt,
     };
   }
   try {
@@ -2388,21 +2554,44 @@ async function recoverAppliedHandoffCleanup(
     prepared.targetCommonGitDir !== observedCommonGitDir || prepared.targetHead !== observedHead ||
     prepared.targetBranch !== observedBranch
   ) return "destination identity changed; applied handoff cleanup was not resumed.";
+  const cleanupRecord = isRecord(manifest.cleanup) ? manifest.cleanup : undefined;
+  let durableWorktreeId = cleanupRecord && stringValue(cleanupRecord, "worktreeId");
+  let durablePreservedHead = cleanupRecord && stringValue(cleanupRecord, "preservedHead");
+  let durableDeletionIntentAt = cleanupRecord && stringValue(
+    cleanupRecord,
+    "supacodeWorktreeDeletionIntentAt",
+  );
+  let durableDeletionVerifiedAt = cleanupRecord && stringValue(
+    cleanupRecord,
+    "supacodeWorktreeDeletionVerifiedAt",
+  );
   if (
     manifest.cleanup?.paneClosed && manifest.cleanup.worktreeRemoved &&
     manifest.cleanup.branchPreserved && !manifest.cleanup.recoveryRef &&
-    manifest.cleanup.errors.length === 0
+    manifest.cleanup.errors.length === 0 &&
+    (!durableDeletionIntentAt || durableDeletionVerifiedAt)
   ) return "applied handoff cleanup is already complete.";
   const apply = manifest.apply ?? {
     appliedPaths: prepared.touchedPaths,
     conflictedPaths: [],
     blockedPaths: [],
   };
+  const durableDeletionMetadata = (): Partial<HandoffCleanupResult> => ({
+    ...(durableWorktreeId ? { worktreeId: durableWorktreeId } : {}),
+    ...(durablePreservedHead ? { preservedHead: durablePreservedHead } : {}),
+    ...(durableDeletionIntentAt
+      ? { supacodeWorktreeDeletionIntentAt: durableDeletionIntentAt }
+      : {}),
+    ...(durableDeletionVerifiedAt
+      ? { supacodeWorktreeDeletionVerifiedAt: durableDeletionVerifiedAt }
+      : {}),
+  });
   let recoveryRef = manifest.cleanup?.recoveryRef;
-  const cleanup = await cleanupAppliedWorktree(
-    pi,
-    prepared,
-    async (nextRecoveryRef) => {
+  let cleanup = await cleanupAppliedWorktree(pi, prepared, {
+    priorDeletionIntent: durableWorktreeId && durableDeletionIntentAt
+      ? { worktreeId: durableWorktreeId, intentAt: durableDeletionIntentAt }
+      : undefined,
+    onRecoveryRef: async (nextRecoveryRef) => {
       recoveryRef = nextRecoveryRef;
       await writeManifest(
         manifestPath,
@@ -2411,11 +2600,17 @@ async function recoverAppliedHandoffCleanup(
           worktreeRemoved: false,
           branchPreserved: true,
           recoveryRef: nextRecoveryRef,
+          ...durableDeletionMetadata(),
           errors: ["Cleanup recovery is in progress."],
         }),
       );
     },
-    async (worktreeId, preservedHead) => {
+    onWorktreeIdentity: async (worktreeId, preservedHead) => {
+      if (durableDeletionIntentAt && durableWorktreeId !== worktreeId) {
+        throw new Error("Durable Supacode worktree-deletion intent does not match the recovered cleanup identity.");
+      }
+      durableWorktreeId = worktreeId;
+      durablePreservedHead = preservedHead;
       await writeManifest(
         manifestPath,
         manifestFor(prepared, "applied", apply, {
@@ -2423,13 +2618,46 @@ async function recoverAppliedHandoffCleanup(
           worktreeRemoved: false,
           branchPreserved: true,
           recoveryRef,
-          preservedHead,
-          worktreeId,
+          ...durableDeletionMetadata(),
           errors: ["Worktree removal recovery is in progress."],
         }),
       );
     },
-  );
+    onDeletionIntent: async (worktreeId, preservedHead, intentAt) => {
+      if (durableDeletionIntentAt) {
+        throw new Error("A durable Supacode worktree-deletion intent already exists; deletion was not reissued.");
+      }
+      await writeManifest(
+        manifestPath,
+        manifestFor(prepared, "applied", apply, {
+          paneClosed: true,
+          worktreeRemoved: true,
+          branchPreserved: true,
+          recoveryRef,
+          preservedHead,
+          worktreeId,
+          supacodeWorktreeDeletionIntentAt: intentAt,
+          errors: ["Supacode worktree deletion may have started; absence verification is pending."],
+        }),
+      );
+      durableWorktreeId = worktreeId;
+      durablePreservedHead = preservedHead;
+      durableDeletionIntentAt = intentAt;
+    },
+  });
+  if (durableDeletionIntentAt && !cleanup.supacodeWorktreeDeletionIntentAt) {
+    cleanup = {
+      ...cleanup,
+      paneClosed: true,
+      worktreeRemoved: true,
+      branchPreserved: true,
+      recoveryRef,
+      ...durableDeletionMetadata(),
+    };
+  }
+  if (cleanup.supacodeWorktreeDeletionVerifiedAt) {
+    durableDeletionVerifiedAt = cleanup.supacodeWorktreeDeletionVerifiedAt;
+  }
   await writeManifest(manifestPath, manifestFor(prepared, "applied", apply, cleanup));
   return cleanup.paneClosed && cleanup.worktreeRemoved && cleanup.branchPreserved && cleanup.errors.length === 0
     ? "applied handoff cleanup recovered."

@@ -140,14 +140,23 @@ async function createFixture(setupBase) {
     baseSha,
     branch,
     pi: {
-      exec: (command, args, options) => command === "supacode" && args[0] === "worktree" && args[1] === "list"
-        ? Promise.resolve({
+      exec: (command, args, options) => {
+        if (command !== "supacode") return execResult(command, args, options);
+        if (args[0] === "worktree" && args[1] === "list") {
+          return Promise.resolve({
             stdout: `${encodeURIComponent(parent)}\n${encodeURIComponent(worker)}\n`,
             stderr: "",
             code: 0,
             killed: false,
-          })
-        : execResult(command, args, options),
+          });
+        }
+        return Promise.resolve({
+          stdout: "",
+          stderr: `Unexpected Supacode test call: ${args.join(" ")}`,
+          code: 1,
+          killed: false,
+        });
+      },
     },
   };
 }
@@ -1119,7 +1128,14 @@ test("cleanup checks source Git operations before closing the worker pane", asyn
           return result;
         }
         if (args[0] === "worktree" && args[1] === "list") {
-          return { stdout: `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`, stderr: "", code: 0, killed: false };
+          return {
+            stdout: worktreeDeleted
+              ? `${encodeURIComponent(fixture.parent)}\n`
+              : `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`,
+            stderr: "",
+            code: 0,
+            killed: false,
+          };
         }
         if (args[0] === "surface" && args[1] === "close") {
           paneClosed = true;
@@ -1183,7 +1199,14 @@ test("cleanup recovery accepts its authenticated preservation commit after inter
             failRemovalIdentity = false;
             return { stdout: "", stderr: "simulated list failure", code: 1, killed: false };
           }
-          return { stdout: `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`, stderr: "", code: 0, killed: false };
+          return {
+            stdout: worktreeDeleted
+              ? `${encodeURIComponent(fixture.parent)}\n`
+              : `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`,
+            stderr: "",
+            code: 0,
+            killed: false,
+          };
         }
         if (args[0] === "worktree" && args[1] === "delete") {
           worktreeDeleted = true;
@@ -1248,7 +1271,129 @@ test("cleanup does not delete after a transient missing-surface snapshot", async
     assert.equal(result.cleanup.paneClosed, false);
     assert.equal(result.cleanup.worktreeRemoved, false);
     assert.equal(deleteCalled, false);
-    assert.equal(result.cleanup.errors.some((error) => error.includes("Could not close")), true);
+    assert.equal(result.cleanup.errors.some((error) => error.includes("stable worker-pane presence")), true);
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
+test("cleanup skips pane closure for an absent surface, tab, or worktree", async () => {
+  for (const missing of ["surface", "tab", "worktree"]) {
+    const fixture = await createFixture();
+    try {
+      await writeFile(join(fixture.worker, "a.txt"), "one\napplied\nthree\n");
+      const paneWorktreeId = encodeURIComponent(fixture.worker);
+      let cleanupObservationStarted = false;
+      let surfaceListCalls = 0;
+      let tabListCalls = 0;
+      let cleanupWorktreeListCalls = 0;
+      let destructiveCalls = 0;
+      const pi = {
+        exec: async (command, args, options) => {
+          if (command !== "supacode") return execResult(command, args, options);
+          if (args[0] === "surface" && args[1] === "list") {
+            assert.deepEqual(args, ["surface", "list", "-w", paneWorktreeId, "-t", TAB_ID]);
+            cleanupObservationStarted = true;
+            surfaceListCalls++;
+            return missing === "surface"
+              ? { stdout: "", stderr: "", code: 0, killed: false }
+              : { stdout: "", stderr: `${missing} missing`, code: 1, killed: false };
+          }
+          if (args[0] === "tab" && args[1] === "list") {
+            assert.deepEqual(args, ["tab", "list", "-w", paneWorktreeId]);
+            tabListCalls++;
+            return missing === "tab"
+              ? { stdout: "", stderr: "", code: 0, killed: false }
+              : { stdout: "", stderr: "worktree missing", code: 1, killed: false };
+          }
+          if (args[0] === "worktree" && args[1] === "list") {
+            assert.deepEqual(args, ["worktree", "list"]);
+            if (cleanupObservationStarted) cleanupWorktreeListCalls++;
+            return {
+              stdout: cleanupObservationStarted
+                ? `${encodeURIComponent(fixture.parent)}\n`
+                : `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`,
+              stderr: "",
+              code: 0,
+              killed: false,
+            };
+          }
+          if (["close", "delete"].includes(args[1])) destructiveCalls++;
+          return { stdout: "", stderr: "unexpected destructive command", code: 1, killed: false };
+        },
+      };
+
+      const prepared = await prepareDelegateHandoff(pi, JOB_ID, undefined, fixture.agentDir);
+      const result = await applyPreparedDelegateHandoff(pi, prepared);
+
+      assert.equal(result.state, "applied", missing);
+      assert.equal(result.cleanup.paneClosed, true, `${missing}: ${JSON.stringify(result.cleanup)}`);
+      assert.equal(result.cleanup.worktreeRemoved, false, missing);
+      assert.equal(destructiveCalls, 0, missing);
+      assert.equal(surfaceListCalls, 2, missing);
+      assert.equal(tabListCalls, missing === "surface" ? 0 : 2, missing);
+      assert.equal(cleanupWorktreeListCalls, missing === "worktree" ? 3 : 1, missing);
+      assert.equal(
+        result.cleanup.errors.some((error) => error.includes("no longer lists the snapshotted source worktree")),
+        true,
+        missing,
+      );
+    } finally {
+      await removeFixture(fixture);
+    }
+  }
+});
+
+test("cleanup skips worktree deletion when the source and Supacode resource disappear", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeFile(join(fixture.worker, "a.txt"), "one\napplied\nthree\n");
+    await git(fixture.worker, "add", "a.txt");
+    await git(fixture.worker, "commit", "-m", "worker change");
+    let paneClosed = false;
+    let missingSurfaceObservations = 0;
+    let worktreeRemovedExternally = false;
+    let worktreeDeleteCalls = 0;
+    const pi = {
+      exec: async (command, args, options) => {
+        if (command !== "supacode") return execResult(command, args, options);
+        if (args[0] === "surface" && args[1] === "list") {
+          if (!paneClosed) return { stdout: `${SURFACE_ID}\n`, stderr: "", code: 0, killed: false };
+          missingSurfaceObservations++;
+          if (missingSurfaceObservations === 2) {
+            await checked("git", ["-C", fixture.parent, "worktree", "remove", fixture.worker]);
+            worktreeRemovedExternally = true;
+          }
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "close") {
+          paneClosed = true;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "worktree" && args[1] === "list") {
+          return {
+            stdout: worktreeRemovedExternally
+              ? `${encodeURIComponent(fixture.parent)}\n`
+              : `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`,
+            stderr: "",
+            code: 0,
+            killed: false,
+          };
+        }
+        if (args[0] === "worktree" && args[1] === "delete") worktreeDeleteCalls++;
+        return { stdout: "", stderr: "unexpected destructive command", code: 1, killed: false };
+      },
+    };
+
+    const prepared = await prepareDelegateHandoff(pi, JOB_ID, undefined, fixture.agentDir);
+    const result = await applyPreparedDelegateHandoff(pi, prepared);
+
+    assert.equal(result.state, "applied");
+    assert.equal(result.cleanup.paneClosed, true);
+    assert.equal(result.cleanup.worktreeRemoved, true);
+    assert.equal(worktreeRemovedExternally, true);
+    assert.equal(worktreeDeleteCalls, 0);
+    assert.deepEqual(result.cleanup.errors, []);
   } finally {
     await removeFixture(fixture);
   }
@@ -1358,6 +1503,7 @@ test("branch restoration never overwrites a concurrently created branch", async 
     const branchRef = `refs/heads/${fixture.branch}`;
     let injectConcurrentBranch = false;
     let paneClosed = false;
+    let worktreeDeleted = false;
     const pi = {
       exec: async (command, args, options) => {
         if (
@@ -1369,7 +1515,14 @@ test("branch restoration never overwrites a concurrently created branch", async 
         }
         if (command !== "supacode") return execResult(command, args, options);
         if (args[0] === "worktree" && args[1] === "list") {
-          return { stdout: `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`, stderr: "", code: 0, killed: false };
+          return {
+            stdout: worktreeDeleted
+              ? `${encodeURIComponent(fixture.parent)}\n`
+              : `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`,
+            stderr: "",
+            code: 0,
+            killed: false,
+          };
         }
         if (args[0] === "surface" && args[1] === "close") {
           paneClosed = true;
@@ -1379,6 +1532,7 @@ test("branch restoration never overwrites a concurrently created branch", async 
           return { stdout: paneClosed ? "" : `${SURFACE_ID}\n`, stderr: "", code: 0, killed: false };
         }
         if (args[0] === "worktree" && args[1] === "delete") {
+          worktreeDeleted = true;
           await git(fixture.parent, "branch", "-D", fixture.branch);
           injectConcurrentBranch = true;
           return { stdout: "", stderr: "", code: 0, killed: false };
@@ -1403,6 +1557,85 @@ test("branch restoration never overwrites a concurrently created branch", async 
   }
 });
 
+test("handoff recovery never reissues an unsettled worktree deletion", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeFile(join(fixture.worker, "a.txt"), "one\napplied\nthree\n");
+    await git(fixture.worker, "add", "a.txt");
+    await git(fixture.worker, "commit", "-m", "worker change");
+    const workerId = encodeURIComponent(fixture.worker);
+    let paneClosed = false;
+    let worktreeListed = true;
+    let deleteCalls = 0;
+    const pi = {
+      exec: async (command, args, options) => {
+        if (command !== "supacode") return execResult(command, args, options);
+        if (args[0] === "surface" && args[1] === "list") {
+          assert.deepEqual(args, ["surface", "list", "-w", workerId, "-t", TAB_ID]);
+          return { stdout: paneClosed ? "" : `${SURFACE_ID}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "close") {
+          assert.deepEqual(args, ["surface", "close", "-w", workerId, "-t", TAB_ID, "-s", SURFACE_ID]);
+          paneClosed = true;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "worktree" && args[1] === "list") {
+          assert.deepEqual(args, ["worktree", "list"]);
+          return {
+            stdout: worktreeListed
+              ? `${encodeURIComponent(fixture.parent)}\n${workerId}\n`
+              : `${encodeURIComponent(fixture.parent)}\n`,
+            stderr: "",
+            code: 0,
+            killed: false,
+          };
+        }
+        if (args[0] === "worktree" && args[1] === "delete") {
+          assert.deepEqual(args, ["worktree", "delete", "-w", workerId]);
+          deleteCalls++;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        throw new Error(`Unexpected Supacode call: ${args.join(" ")}`);
+      },
+    };
+
+    const prepared = await prepareDelegateHandoff(pi, JOB_ID, undefined, fixture.agentDir);
+    const applied = await applyPreparedDelegateHandoff(pi, prepared);
+
+    assert.equal(applied.state, "applied");
+    assert.equal(applied.cleanup.worktreeRemoved, true);
+    assert.equal(deleteCalls, 1);
+    assert.equal(typeof applied.cleanup.supacodeWorktreeDeletionIntentAt, "string");
+    assert.equal(applied.cleanup.supacodeWorktreeDeletionVerifiedAt, undefined);
+    assert.equal(
+      applied.cleanup.errors.some((error) => error.includes("absence was not verified")),
+      true,
+    );
+
+    const unsettled = await recoverDelegateApplyState(pi, fixture.parent);
+    assert.equal(
+      unsettled.transactions.some((message) => message.includes("remains incomplete")),
+      true,
+      JSON.stringify(unsettled),
+    );
+    assert.equal(deleteCalls, 1);
+
+    worktreeListed = false;
+    const settled = await recoverDelegateApplyState(pi, fixture.parent);
+    assert.equal(
+      settled.transactions.some((message) => message.includes("cleanup recovered")),
+      true,
+      JSON.stringify(settled),
+    );
+    assert.equal(deleteCalls, 1);
+    const manifest = JSON.parse(await readFile(applied.manifestPath, "utf8"));
+    assert.equal(typeof manifest.cleanup.supacodeWorktreeDeletionVerifiedAt, "string");
+    assert.deepEqual(manifest.cleanup.errors, []);
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
 test("successful cleanup closes the pane, removes the worktree, and restores a deleted branch", async () => {
   const fixture = await createFixture();
   try {
@@ -1411,26 +1644,40 @@ test("successful cleanup closes the pane, removes the worktree, and restores a d
     await git(fixture.worker, "commit", "-m", "worker change");
     const sourceHead = await git(fixture.worker, "rev-parse", "HEAD");
     const supacodeCalls = [];
+    const workerId = encodeURIComponent(fixture.worker);
     let paneClosed = false;
+    let worktreeDeleted = false;
     const pi = {
       exec: async (command, args, options) => {
         if (command !== "supacode") return execResult(command, args, options);
-        supacodeCalls.push(args.join(" "));
+        supacodeCalls.push(args);
         if (args[0] === "surface" && args[1] === "list") {
+          assert.deepEqual(args, ["surface", "list", "-w", workerId, "-t", TAB_ID]);
           return { stdout: paneClosed ? "" : `${SURFACE_ID}\n`, stderr: "", code: 0, killed: false };
         }
         if (args[0] === "surface" && args[1] === "close") {
+          assert.deepEqual(args, ["surface", "close", "-w", workerId, "-t", TAB_ID, "-s", SURFACE_ID]);
           paneClosed = true;
           return { stdout: "", stderr: "", code: 0, killed: false };
         }
         if (args[0] === "worktree" && args[1] === "list") {
-          return { stdout: `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`, stderr: "", code: 0, killed: false };
+          assert.deepEqual(args, ["worktree", "list"]);
+          return {
+            stdout: worktreeDeleted
+              ? `${encodeURIComponent(fixture.parent)}\n`
+              : `${encodeURIComponent(fixture.parent)}\n${workerId}\n`,
+            stderr: "",
+            code: 0,
+            killed: false,
+          };
         }
         if (args[0] === "worktree" && args[1] === "delete") {
+          assert.deepEqual(args, ["worktree", "delete", "-w", workerId]);
+          worktreeDeleted = true;
           await git(fixture.parent, "branch", "-D", fixture.branch);
           return { stdout: "", stderr: "", code: 0, killed: false };
         }
-        return { stdout: "", stderr: "unexpected Supacode call", code: 1, killed: false };
+        throw new Error(`Unexpected Supacode call: ${args.join(" ")}`);
       },
     };
 
@@ -1450,10 +1697,10 @@ test("successful cleanup closes the pane, removes the worktree, and restores a d
       0,
     );
     assert.equal(await git(fixture.parent, "for-each-ref", "--format=%(refname)", "refs/pi-agent-handoffs"), "");
-    const closeCall = supacodeCalls.find((call) => call.startsWith("surface close"));
-    assert.ok(closeCall);
-    assert.equal(closeCall.includes(`-w ${encodeURIComponent(fixture.worker)}`), true);
-    assert.equal(supacodeCalls.some((call) => call.startsWith("worktree delete")), true);
+    assert.equal(supacodeCalls.filter((args) => args[0] === "surface" && args[1] === "close").length, 1);
+    assert.equal(supacodeCalls.filter((args) => args[0] === "worktree" && args[1] === "delete").length, 1);
+    assert.equal(typeof result.cleanup.supacodeWorktreeDeletionIntentAt, "string");
+    assert.equal(typeof result.cleanup.supacodeWorktreeDeletionVerifiedAt, "string");
   } finally {
     await removeFixture(fixture);
   }
