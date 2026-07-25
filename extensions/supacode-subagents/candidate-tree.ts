@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { durableAtomicWrite, ensureDirectoryDurable, readJsonStrict } from "./durable-state.ts";
+import { execRejectKilled } from "./exec-result.ts";
 import {
   gitlinkPathsForTree,
   repositoryOperationBlockers,
@@ -49,7 +50,9 @@ export interface CandidateAttestation {
   tree: string;
   unchanged: boolean;
   statusPaths: string[];
+  statusPathCount?: number;
   gitlinkPaths: string[];
+  gitlinkPathCount?: number;
   observedAt: string;
 }
 
@@ -59,7 +62,7 @@ async function gitResult(
   args: string[],
   signal?: AbortSignal,
 ): Promise<GitResult> {
-  return pi.exec("git", ["-C", cwd, ...args], { signal, timeout: GIT_TIMEOUT_MS });
+  return execRejectKilled(pi, "git", ["-C", cwd, ...args], { signal, timeout: GIT_TIMEOUT_MS });
 }
 
 async function gitStdout(
@@ -367,8 +370,10 @@ export async function attestCandidateCheckout(
     tree,
     unchanged: head === candidate.commit && tree === candidate.tree &&
       statusPaths.length === 0 && gitlinkPaths.length === 0,
-    statusPaths,
-    gitlinkPaths,
+    statusPaths: statusPaths.slice(0, 1_000),
+    statusPathCount: statusPaths.length,
+    gitlinkPaths: gitlinkPaths.slice(0, 1_000),
+    gitlinkPathCount: gitlinkPaths.length,
     observedAt: new Date().toISOString(),
   };
 }

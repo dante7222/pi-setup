@@ -42,17 +42,17 @@ export function parseReviewVerdict(output: string): ReviewVerdict | undefined {
 }
 
 export function decideLoopTransition(input: LoopTransitionInput): LoopTransition {
-  const repairOrExhaust = (repairReason: string, exhaustedReason: string): LoopTransition => {
-    if (input.previousCandidateFingerprints.has(input.candidateFingerprint)) {
-      return {
-        state: "exhausted",
-        reason: "Candidate state repeated without measurable progress.",
-      };
-    }
-    return input.attempt < input.maxAttempts
+  if (input.previousCandidateFingerprints.has(input.candidateFingerprint)) {
+    return {
+      state: "exhausted",
+      reason: "Candidate state repeated without measurable progress; prior gate results cannot be retried as a new acceptance.",
+    };
+  }
+
+  const repairOrExhaust = (repairReason: string, exhaustedReason: string): LoopTransition =>
+    input.attempt < input.maxAttempts
       ? { state: "repairing", reason: repairReason }
       : { state: "exhausted", reason: exhaustedReason };
-  };
 
   if (!input.checksPassed) {
     return repairOrExhaust(

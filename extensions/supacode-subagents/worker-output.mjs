@@ -3,9 +3,15 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 
 function safeTerminalText(value) {
-  return String(value)
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
-    .replace(/\u001b/g, "");
+  return String(value).replace(
+    /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g,
+    (character) => {
+      if (character === "\t") return "\\t";
+      if (character === "\r") return "\\r";
+      const codePoint = character.codePointAt(0);
+      return `\\u${codePoint.toString(16).padStart(4, "0")}`;
+    },
+  );
 }
 
 export function formatWorkerEvent(event) {

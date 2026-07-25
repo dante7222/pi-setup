@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { execRejectKilled } from "./exec-result.ts";
 import {
   decodeSupacodeResourceId,
   findSupacodePathId,
@@ -17,7 +18,8 @@ export async function observeSupacodeWorktree(
   worktreeId: string,
   options: SupacodeResourceObservationOptions = {},
 ): Promise<SupacodeResourcePresence> {
-  const listed = await pi.exec(
+  const listed = await execRejectKilled(
+    pi,
     "supacode",
     ["worktree", "list"],
     { signal: options.signal, timeout: options.timeoutMs ?? 5000 },
@@ -34,7 +36,8 @@ export async function observeSupacodeTab(
   tabId: string,
   options: SupacodeResourceObservationOptions = {},
 ): Promise<SupacodeResourcePresence> {
-  const listed = await pi.exec(
+  const listed = await execRejectKilled(
+    pi,
     "supacode",
     ["tab", "list", "-w", worktreeId],
     { signal: options.signal, timeout: options.timeoutMs ?? 5000 },
@@ -58,7 +61,8 @@ export async function observeSupacodeSurface(
   surfaceId: string,
   options: SupacodeResourceObservationOptions = {},
 ): Promise<SupacodeResourcePresence> {
-  const listed = await pi.exec(
+  const listed = await execRejectKilled(
+    pi,
     "supacode",
     ["surface", "list", "-w", worktreeId, "-t", tabId],
     { signal: options.signal, timeout: options.timeoutMs ?? 5000 },

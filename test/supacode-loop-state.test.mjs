@@ -59,7 +59,7 @@ test("reviews pass, request repair, or block explicitly", () => {
   );
 });
 
-test("a repeated candidate state stops repair but not a newly passing evaluation", () => {
+test("a repeated candidate state cannot be retried into acceptance", () => {
   const transition = decideLoopTransition({
     attempt: 2,
     maxAttempts: 3,
@@ -70,7 +70,7 @@ test("a repeated candidate state stops repair but not a newly passing evaluation
   });
   assert.deepEqual(transition, {
     state: "exhausted",
-    reason: "Candidate state repeated without measurable progress.",
+    reason: "Candidate state repeated without measurable progress; prior gate results cannot be retried as a new acceptance.",
   });
   assert.equal(
     decideLoopTransition({
@@ -81,6 +81,6 @@ test("a repeated candidate state stops repair but not a newly passing evaluation
       candidateFingerprint: "same-tree",
       previousCandidateFingerprints: new Set(["same-tree"]),
     }).state,
-    "awaiting_apply",
+    "exhausted",
   );
 });

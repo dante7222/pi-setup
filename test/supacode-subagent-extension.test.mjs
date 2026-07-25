@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire, registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,7 @@ import {
   writeRunnerExit,
   writeRunnerProcess,
 } from "../extensions/supacode-subagents/lifecycle.ts";
+import { acquireOrchestratorLease } from "../extensions/supacode-subagents/orchestrator-lease.ts";
 import { captureProcessIdentity, inspectProcessIdentity } from "../extensions/supacode-subagents/process-identity.ts";
 
 const projectRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -41,6 +43,7 @@ registerHooks({
 const {
   closeBatchAnchor,
   closeBatchTab,
+  runSupacodeCreation,
   default: supacodeSubagents,
 } = createRequire(import.meta.url)("../extensions/supacode-subagents/index.ts");
 
@@ -192,9 +195,220 @@ test("all delegation tools execute sequentially", () => {
   assert.deepEqual([...commands.keys()].sort(), [
     "delegate-apply",
     "delegate-cancel",
+    "delegate-prune",
     "delegate-recover",
     "delegate-status",
   ]);
+});
+
+test("delegate-prune revalidates retention and lifecycle after confirmation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-delegate-prune-"));
+  const agentDir = join(root, "agent");
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const batchId = randomUUID();
+  const jobs = [];
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    for (let index = 0; index < 102; index++) {
+      const id = randomUUID();
+      const jobDir = join(agentDir, "subagents", batchId, id);
+      const createdAt = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000 + index * 1_000).toISOString();
+      await mkdir(jobDir, { recursive: true });
+      await writeFile(join(jobDir, "job.json"), `${JSON.stringify({
+        schemaVersion: 2,
+        id,
+        batchId,
+        title: `research ${index}`,
+        mode: "research",
+        createdAt,
+      }, null, 2)}\n`);
+      await initializeJobLifecycle(jobDir, id, batchId, "completed");
+      await claimWorkerTerminal(jobDir, id, "recovery", { state: "completed" }, "done");
+      jobs.push({ id, jobDir });
+    }
+    const protectedReviewer = jobs[0];
+    const oldest = jobs[1];
+    const loopId = randomUUID();
+    const loopDir = join(agentDir, "subagents", batchId, loopId);
+    await mkdir(join(loopDir, "iterations", "001"), { recursive: true });
+    await writeFile(join(loopDir, "job.json"), `${JSON.stringify({
+      schemaVersion: 2,
+      id: loopId,
+      batchId,
+      title: "retained loop evidence",
+      mode: "coding",
+      delegateLoop: true,
+      createdAt: new Date().toISOString(),
+    }, null, 2)}\n`);
+    await initializeJobLifecycle(loopDir, loopId, batchId, "failed");
+    await writeFile(
+      join(loopDir, "iterations", "001", "reviews.json"),
+      `${JSON.stringify([{ process: { jobDir: protectedReviewer.jobDir } }], null, 2)}\n`,
+    );
+    const { commands } = registerExtension();
+    const notifications = [];
+    let raceInjected = false;
+    const context = {
+      hasUI: true,
+      waitForIdle: async () => undefined,
+      ui: {
+        confirm: async () => {
+          if (!raceInjected) {
+            raceInjected = true;
+            await updateJobLifecycle(oldest.jobDir, "running", "became active during confirmation");
+          }
+          return true;
+        },
+        notify: (message, level) => notifications.push({ message, level }),
+        setStatus() {},
+      },
+    };
+    await commands.get("delegate-prune").handler("", context);
+    assert.equal((await lstat(oldest.jobDir)).isDirectory(), true);
+    assert.equal(notifications.some(({ message }) =>
+      /Retained.*eligibility changed|not authoritatively terminal/s.test(message)), true);
+
+    await updateJobLifecycle(oldest.jobDir, "completed");
+    context.ui.confirm = async () => true;
+    await commands.get("delegate-prune").handler("", context);
+    await assert.rejects(lstat(oldest.jobDir), { code: "ENOENT" });
+    assert.equal((await lstat(protectedReviewer.jobDir)).isDirectory(), true);
+  } finally {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("registered delegate and delegate_parallel happy paths preserve bounded ordered results", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-delegate-happy-path-"));
+  const agentDir = join(root, "agent");
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const priorWorktreeId = process.env.SUPACODE_WORKTREE_ID;
+  const worktreeId = encodeURIComponent(root);
+  const tabs = new Map();
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.SUPACODE_WORKTREE_ID = worktreeId;
+    const settleSurface = async (surfaceId) => {
+      const batches = await readdir(join(agentDir, "subagents"));
+      for (const batch of batches) {
+        const batchDir = join(agentDir, "subagents", batch);
+        for (const entry of await readdir(batchDir, { withFileTypes: true })) {
+          if (!entry.isDirectory() || entry.name === "tab-launches") continue;
+          const jobDir = join(batchDir, entry.name);
+          let job;
+          try {
+            job = JSON.parse(await readFile(join(jobDir, "job.json"), "utf8"));
+          } catch {
+            continue;
+          }
+          if (job.surfaceId !== surfaceId) continue;
+          const missingIdentity = {
+            pid: 999_999_999,
+            startSignature: "missing",
+            processGroup: 999_999_999,
+            command: "missing",
+            launchNonce: job.launchNonce,
+          };
+          await writeRunnerProcess(jobDir, {
+            schemaVersion: 2,
+            jobId: job.id,
+            launchNonce: job.launchNonce,
+            wrapper: missingIdentity,
+            startedAt: new Date().toISOString(),
+          });
+          await publishWorkerReport(jobDir, job.id, job.launchNonce, {
+            state: "completed",
+            launchNonce: job.launchNonce,
+            completedAt: new Date().toISOString(),
+            stopReason: "stop",
+          }, `completed ${job.title}`);
+          await writeRunnerExit(jobDir, {
+            schemaVersion: 2,
+            jobId: job.id,
+            launchNonce: job.launchNonce,
+            wrapperPid: missingIdentity.pid,
+            exitCode: 0,
+            exitedAt: new Date().toISOString(),
+          });
+          return;
+        }
+      }
+      throw new Error(`No job metadata found for surface ${surfaceId}`);
+    };
+    const execute = async (command, args, options) => {
+      if (command !== "supacode") return execResult(command, args, options);
+      if (args[0] === "tab" && args[1] === "new") {
+        const tabId = args[args.indexOf("-n") + 1];
+        tabs.set(tabId, new Set([tabId]));
+        return { stdout: `${tabId}\n`, stderr: "", code: 0, killed: false };
+      }
+      if (args[0] === "tab" && args[1] === "list") {
+        return { stdout: `${[...tabs.keys()].join("\n")}\n`, stderr: "", code: 0, killed: false };
+      }
+      if (args[0] === "tab" && args[1] === "close") {
+        tabs.delete(args[args.indexOf("-t") + 1]);
+        return { stdout: "", stderr: "", code: 0, killed: false };
+      }
+      if (args[0] === "surface" && args[1] === "split") {
+        const tabId = args[args.indexOf("-t") + 1];
+        const surfaceId = args[args.indexOf("-n") + 1];
+        tabs.get(tabId)?.add(surfaceId);
+        await settleSurface(surfaceId);
+        return { stdout: `${surfaceId}\n`, stderr: "", code: 0, killed: false };
+      }
+      if (args[0] === "surface" && args[1] === "list") {
+        const tabId = args[args.indexOf("-t") + 1];
+        return {
+          stdout: `${[...(tabs.get(tabId) ?? [])].join("\n")}\n`,
+          stderr: "",
+          code: 0,
+          killed: false,
+        };
+      }
+      if (args[0] === "surface" && args[1] === "close") {
+        const tabId = args[args.indexOf("-t") + 1];
+        tabs.get(tabId)?.delete(args[args.indexOf("-s") + 1]);
+        return { stdout: "", stderr: "", code: 0, killed: false };
+      }
+      if (args[0] === "surface" && args[1] === "focus") {
+        return { stdout: "", stderr: "", code: 0, killed: false };
+      }
+      return { stdout: "", stderr: `unexpected command: ${args.join(" ")}`, code: 1, killed: false };
+    };
+    const { tools } = registerExtension(execute);
+    const context = baseContext(root, async () => true);
+    const parallel = await tools.get("delegate_parallel").execute(
+      "parallel",
+      {
+        tasks: [{ task: "first result" }, { task: "second result" }],
+        keepOpen: false,
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.deepEqual(parallel.details.results.map((result) => result.title), ["first result", "second result"]);
+    assert.equal(parallel.details.results.every((result) => result.state === "completed"), true);
+    assert.match(parallel.content[0].text, /2\/2 delegated tasks completed successfully/);
+
+    const single = await tools.get("delegate").execute(
+      "single",
+      { task: "single result", keepOpen: false },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(single.details.results[0].title, "single result");
+    assert.equal(single.details.results[0].state, "completed");
+  } finally {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    if (priorWorktreeId === undefined) delete process.env.SUPACODE_WORKTREE_ID;
+    else process.env.SUPACODE_WORKTREE_ID = priorWorktreeId;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("batch anchor cleanup closes only one stably present exact surface", async () => {
@@ -793,6 +1007,60 @@ test("delegation inputs reject whitespace-only tasks, models, and skills before 
     ),
     /empty skill path/,
   );
+});
+
+test("production Supacode creation wrapper publishes authenticated settlement metadata", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-production-creator-"));
+  const binDir = join(root, "bin");
+  const launchDir = join(root, "launch");
+  const executable = join(binDir, "supacode");
+  const priorPath = process.env.PATH;
+  try {
+    await mkdir(binDir, { recursive: true });
+    await writeFile(executable, `#!/bin/zsh\nprintf '%s\\n' 'created-resource-id'\n`);
+    await chmod(executable, 0o700);
+    process.env.PATH = `${binDir}:${priorPath ?? ""}`;
+    const output = await runSupacodeCreation(
+      { __supacodeExecutableForTests: executable },
+      ["fake", "create"],
+      root,
+      launchDir,
+      "creator-job",
+      "creator-nonce",
+      undefined,
+      10_000,
+    );
+    assert.equal(output.trim(), "created-resource-id");
+    const completion = JSON.parse(await readFile(join(launchDir, "creation-complete.json"), "utf8"));
+    assert.equal(completion.commandStarted, true);
+    assert.equal(completion.exitCode, 0);
+    assert.equal(completion.jobId, "creator-job");
+    assert.equal(completion.launchNonce, "creator-nonce");
+    const runner = JSON.parse(await readFile(join(launchDir, "runner-process.json"), "utf8"));
+    const exit = JSON.parse(await readFile(join(launchDir, "runner-exit.json"), "utf8"));
+    assert.equal(runner.launchNonce, exit.launchNonce);
+    assert.equal(runner.wrapper.pid, exit.wrapperPid);
+
+    const noisyLaunchDir = join(root, "noisy-launch");
+    await writeFile(executable, `#!/bin/zsh\nnode -e 'process.stdout.write("x".repeat(2 * 1024 * 1024)); process.stderr.write("y".repeat(6 * 1024 * 1024))'\n`);
+    const noisyOutput = await runSupacodeCreation(
+      { __supacodeExecutableForTests: executable },
+      ["fake", "noisy"],
+      root,
+      noisyLaunchDir,
+      "noisy-creator-job",
+      "noisy-creator-nonce",
+      undefined,
+      10_000,
+    );
+    assert.equal(Buffer.byteLength(noisyOutput) <= 1024 * 1024, true);
+    assert.equal((await lstat(join(noisyLaunchDir, "stdout.log"))).size <= 1024 * 1024, true);
+    assert.equal((await lstat(join(noisyLaunchDir, "stderr.log"))).size <= 5 * 1024 * 1024, true);
+  } finally {
+    if (priorPath === undefined) delete process.env.PATH;
+    else process.env.PATH = priorPath;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("worktree creation is preceded by durable job and lifecycle intent", async () => {
@@ -1510,7 +1778,67 @@ test("recovery never terminalizes an unknown process identity", async () => {
   }
 });
 
-test("accepted delegate-loop recovery reconstructs canonical metadata from durable intent", async () => {
+test("recovery refuses to race an active authenticated orchestrator", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-active-orchestrator-recovery-"));
+  const agentDir = join(root, "agent");
+  const batchId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const jobId = "11111111-2222-4333-8444-555555555555";
+  const jobDir = join(agentDir, "subagents", batchId, jobId);
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  let lease;
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    await mkdir(jobDir, { recursive: true });
+    lease = await acquireOrchestratorLease(jobDir, jobId);
+    await writeFile(join(jobDir, "job.json"), `${JSON.stringify({
+      schemaVersion: 2,
+      id: jobId,
+      batchId,
+      batchTitle: "agents: active owner",
+      title: "active owner",
+      mode: "research",
+      originalCwd: root,
+      workerCwd: root,
+      launchNonce: "worker-nonce",
+      orchestratorLeaseVersion: 1,
+      orchestratorOwnerToken: lease.ownerToken,
+      workerLaunchClaimVersion: 1,
+      tabWorktreeId: "/worktree",
+      tabId: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+      surfaceId: "cccccccc-1111-4222-8333-dddddddddddd",
+      createdAt: new Date().toISOString(),
+    }, null, 2)}\n`);
+    await initializeJobLifecycle(jobDir, jobId, batchId, "running", {
+      orchestratorLeaseVersion: 1,
+      orchestratorOwnerToken: lease.ownerToken,
+    });
+    let execCalls = 0;
+    const notifications = [];
+    const { commands } = registerExtension(async () => {
+      execCalls++;
+      return { stdout: "", stderr: "", code: 0, killed: false };
+    });
+    await commands.get("delegate-recover").handler(jobId, {
+      hasUI: true,
+      waitForIdle: async () => {},
+      ui: {
+        confirm: async () => true,
+        notify: (message) => notifications.push(message),
+        setStatus() {},
+      },
+    });
+    assert.equal(execCalls, 0);
+    assert.equal((await readJobLifecycle(jobDir)).phase, "running");
+    assert.equal(notifications.some((message) => message.includes("still owns")), true);
+  } finally {
+    await lease?.release();
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("delegate-loop recovery rejects acceptance without bound gate evidence", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-loop-acceptance-recovery-"));
   const repository = join(root, "repository");
   const agentDir = join(root, "agent");
@@ -1604,20 +1932,23 @@ test("accepted delegate-loop recovery reconstructs canonical metadata from durab
         gitlinkPaths: [],
       },
     }, null, 2)}\n`);
+    const notifications = [];
     const { commands } = registerExtension();
     await commands.get("delegate-recover").handler(jobId, {
       hasUI: true,
       waitForIdle: async () => {},
-      ui: { confirm: async () => true, notify() {}, setStatus() {} },
+      ui: {
+        confirm: async () => true,
+        notify: (message) => notifications.push(message),
+        setStatus() {},
+      },
     });
 
-    assert.equal((await readJobLifecycle(jobDir)).phase, "completed");
+    assert.equal((await readJobLifecycle(jobDir)).phase, "recovery_required");
     const recoveredJob = JSON.parse(await readFile(join(jobDir, "job.json"), "utf8"));
-    assert.equal(recoveredJob.loopState, "awaiting_apply");
-    assert.equal(recoveredJob.acceptedTree, tree);
-    assert.equal(recoveredJob.acceptedCommit, head);
-    assert.equal(recoveredJob.acceptedRef, candidateRef);
-    assert.equal((await readJobDecision(jobDir)).owner, "accept");
+    assert.equal(recoveredJob.loopState, undefined);
+    assert.equal(await readJobDecision(jobDir), undefined);
+    assert.equal(notifications.some((message) => message.includes("evidence is invalid")), true);
   } finally {
     if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
@@ -2627,7 +2958,7 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
   const batchId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
   const jobId = "11111111-2222-4333-8444-555555555555";
   const jobDir = join(agentDir, "subagents", batchId, jobId);
-  const branch = "pi-agent/aaaaaa/111111";
+  const branch = `pi-agent/${batchId}/${jobId}`;
   const worktreeLaunchDir = join(jobDir, "worktree-launch");
   const worktreeLaunchJobId = `${jobId}-worktree-launch`;
   const worktreeLaunchNonce = "worktree-launch-nonce";
@@ -2645,7 +2976,11 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
     const canonicalWorktree = await realpath(worktree);
     process.env.PI_CODING_AGENT_DIR = agentDir;
     await mkdir(jobDir, { recursive: true });
+    const provenanceToken = "worktree-provenance-token";
     const workspacePlan = {
+      jobId,
+      batchId,
+      provenanceToken,
       repoRoot: await realpath(repository),
       relativeCwd: "",
       branch,
@@ -2675,10 +3010,10 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
       mode: "coding",
       originalCwd: repository,
       workerCwd: repository,
-      observedCodeWorktreeId: encodeURIComponent(await realpath(repository)),
-      observedWorktreePath: canonicalWorktree,
       workspacePlan,
       worktreeCreationProtocolVersion: 1,
+      worktreeProvenanceVersion: 1,
+      worktreeProvenanceToken: provenanceToken,
       worktreeLaunchDir,
       worktreeLaunchJobId,
       worktreeLaunchNonce,
@@ -2687,6 +3022,8 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
     await initializeJobLifecycle(jobDir, jobId, batchId, "provisioning_worktree", {
       workspacePlan,
       worktreeCreationProtocolVersion: 1,
+      worktreeProvenanceVersion: 1,
+      worktreeProvenanceToken: provenanceToken,
       worktreeLaunchDir,
       worktreeLaunchJobId,
       worktreeLaunchNonce,
@@ -2737,21 +3074,14 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
       exitCode: 0,
       completedAt: new Date().toISOString(),
     })}\n`);
+    await writeFile(
+      join(worktreeLaunchDir, "stdout.log"),
+      `${encodeURIComponent(canonicalWorktree)}\n`,
+    );
+    worktreeListed = true;
     await commands.get("delegate-recover").handler(jobId, context);
     assert.equal(deleteAttempts, 0);
     assert.throws(() => process.kill(creator.pid, 0), { code: "ESRCH" });
-    assert.equal(await realpath(worktree), canonicalWorktree);
-    await assert.rejects(readFile(join(jobDir, "worktree-cleanup.json")));
-    assert.equal(
-      notifications.some((notification) => notification.message.includes("ID does not match authenticated path")),
-      true,
-    );
-
-    const repairedJob = JSON.parse(await readFile(join(jobDir, "job.json"), "utf8"));
-    repairedJob.observedCodeWorktreeId = encodeURIComponent(canonicalWorktree);
-    await writeFile(join(jobDir, "job.json"), `${JSON.stringify(repairedJob, null, 2)}\n`);
-    worktreeListed = true;
-    await commands.get("delegate-recover").handler(jobId, context);
     await assert.rejects(realpath(worktree), undefined, JSON.stringify(notifications));
     assert.equal(JSON.parse(await readFile(join(jobDir, "worktree-cleanup.json"), "utf8")).phase, "planned");
     assert.equal((await readJobLifecycle(jobDir)).phase, "recovery_required");
@@ -2824,6 +3154,99 @@ test("recover removes an untouched worktree left by interrupted provisioning", a
     if (creator?.pid) {
       try { process.kill(-creator.pid, "SIGKILL"); } catch {}
     }
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("worktree recovery never infers ownership from a matching full branch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktree-provenance-collision-"));
+  const repository = join(root, "repository");
+  const unrelated = join(root, "unrelated");
+  const agentDir = join(root, "agent");
+  const batchId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const jobId = "11111111-2222-4333-8444-555555555555";
+  const branch = `pi-agent/${batchId}/${jobId}`;
+  const jobDir = join(agentDir, "subagents", batchId, jobId);
+  const launchDir = join(jobDir, "worktree-launch");
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  try {
+    await checked("git", ["init", repository]);
+    await checked("git", ["-C", repository, "config", "user.name", "Test User"]);
+    await checked("git", ["-C", repository, "config", "user.email", "test@example.com"]);
+    await writeFile(join(repository, "tracked.txt"), "base\n");
+    await checked("git", ["-C", repository, "add", "."]);
+    await checked("git", ["-C", repository, "commit", "-m", "base"]);
+    const baseSha = await checked("git", ["-C", repository, "rev-parse", "HEAD"]);
+    await checked("git", ["-C", repository, "worktree", "add", "-b", branch, unrelated, baseSha]);
+    const provenanceToken = "collision-provenance-token";
+    const launchJobId = `${jobId}-worktree-launch`;
+    const launchNonce = "collision-launch-nonce";
+    const workspacePlan = {
+      jobId,
+      batchId,
+      provenanceToken,
+      repoRoot: await realpath(repository),
+      relativeCwd: "",
+      branch,
+      folderName: "planned-worker",
+      baseSha,
+    };
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    await mkdir(launchDir, { recursive: true });
+    await writeFile(join(jobDir, "job.json"), `${JSON.stringify({
+      schemaVersion: 2,
+      id: jobId,
+      batchId,
+      batchTitle: "agents: collision",
+      title: "collision",
+      mode: "coding",
+      originalCwd: repository,
+      workerCwd: repository,
+      workspacePlan,
+      worktreeCreationProtocolVersion: 1,
+      worktreeProvenanceVersion: 1,
+      worktreeProvenanceToken: provenanceToken,
+      worktreeLaunchDir: launchDir,
+      worktreeLaunchJobId: launchJobId,
+      worktreeLaunchNonce: launchNonce,
+      createdAt: new Date().toISOString(),
+    }, null, 2)}\n`);
+    await writeFile(join(launchDir, "creation-complete.json"), `${JSON.stringify({
+      schemaVersion: 2,
+      jobId: launchJobId,
+      launchNonce,
+      commandStarted: false,
+      exitCode: 74,
+      completedAt: new Date().toISOString(),
+    }, null, 2)}\n`);
+    await initializeJobLifecycle(jobDir, jobId, batchId, "provisioning_worktree", {
+      workspacePlan,
+      worktreeCreationProtocolVersion: 1,
+      worktreeProvenanceVersion: 1,
+      worktreeProvenanceToken: provenanceToken,
+      worktreeLaunchDir: launchDir,
+      worktreeLaunchJobId: launchJobId,
+      worktreeLaunchNonce: launchNonce,
+    });
+    let destructiveCalls = 0;
+    const { commands } = registerExtension(async (command, args, options) => {
+      if (command === "git" && args.includes("remove")) destructiveCalls++;
+      if (command === "supacode" && args.includes("delete")) destructiveCalls++;
+      return command === "supacode"
+        ? { stdout: "", stderr: "", code: 0, killed: false }
+        : execResult(command, args, options);
+    });
+    await commands.get("delegate-recover").handler(jobId, {
+      hasUI: true,
+      waitForIdle: async () => {},
+      ui: { confirm: async () => true, notify() {}, setStatus() {} },
+    });
+    assert.equal(destructiveCalls, 0);
+    assert.equal((await lstat(join(unrelated, "tracked.txt"))).isFile(), true);
+    assert.equal((await readJobLifecycle(jobDir)).phase, "failed");
+  } finally {
     if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
     await rm(root, { recursive: true, force: true });

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { boundedArtifactText } from "./artifact-limits.ts";
 import {
   createExclusiveJson,
   durableAppendJsonLine,
@@ -417,7 +418,7 @@ export async function publishWorkerReport<TStatus>(
   const reportToken = randomUUID();
   const resultsDir = path.join(jobDir, "worker-reports");
   const resultFile = path.join(resultsDir, `${reportToken}.md`);
-  const normalizedOutput = `${output.trim()}\n`;
+  const normalizedOutput = boundedArtifactText(output);
   await durableAtomicWrite(resultFile, normalizedOutput);
   const record = {
     schemaVersion: SUBAGENT_SCHEMA_VERSION,
@@ -492,7 +493,7 @@ export async function claimWorkerTerminal<TStatus>(
   const ownerToken = randomUUID();
   const resultsDir = path.join(jobDir, "terminal-results");
   const resultFile = path.join(resultsDir, `${owner}-${ownerToken}.md`);
-  const normalizedOutput = `${output.trim()}\n`;
+  const normalizedOutput = boundedArtifactText(output);
   await durableAtomicWrite(resultFile, normalizedOutput);
   const record = {
     schemaVersion: SUBAGENT_SCHEMA_VERSION,
@@ -510,6 +511,7 @@ export async function claimWorkerTerminal<TStatus>(
     await fs.promises.rm(resultFile, { force: true });
     const existing = await readWorkerTerminal<TStatus>(jobDir);
     if (!existing) throw new Error(`Terminal claim disappeared for ${jobId}.`);
+    await restoreWorkerTerminalProjection(jobDir, existing);
     return { won: false, record: existing };
   }
   await restoreWorkerTerminalProjection(jobDir, record);

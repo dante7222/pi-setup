@@ -14,6 +14,7 @@ import {
   ensureDirectoryDurable,
   syncDirectory,
 } from "./durable-state.ts";
+import { execRejectKilled } from "./exec-result.ts";
 import {
   authenticateRunnerExit,
   readJobDecision,
@@ -22,10 +23,14 @@ import {
   readRunnerProcess,
   readWorkerTerminal,
 } from "./lifecycle.ts";
+import {
+  readVerifiedLoopAcceptance,
+  type LoopAcceptanceIntent,
+} from "./loop-acceptance.ts";
 import { inspectProcessIdentity, type ProcessIdentity } from "./process-identity.ts";
 import { decodeSupacodeResourceId } from "./resource-id.ts";
+import { escapeTerminalText } from "./terminal-text.ts";
 import {
-  observeSupacodeSurface,
   observeSupacodeWorktree,
   type SupacodeResourcePresence,
 } from "./resource-state.ts";
@@ -34,7 +39,7 @@ import {
   runValidationProcess,
   validationGateProvesCommandNeverLaunched,
 } from "./validation-process.ts";
-import { verifyWorkerProcessesAbsent } from "./worker-supervisor.ts";
+import { terminateWorker, verifyWorkerProcessesAbsent } from "./worker-supervisor.ts";
 
 const HANDOFF_VERSION = 1;
 const GIT_TIMEOUT_MS = 60_000;
@@ -221,6 +226,7 @@ interface DestinationTransaction {
 
 interface ExtensionAPIWithHandoffTestHook extends ExtensionAPI {
   __beforeConflictIndexPublicationForTests?: () => Promise<void>;
+  __beforeSupacodeWorktreeDeletionForTests?: () => Promise<void>;
 }
 
 interface CommandResult {
@@ -286,6 +292,32 @@ async function pathExists(filePath: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function lexicalPathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.promises.lstat(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function canonicalizeMissingPath(filePath: string): Promise<string> {
+  const suffix: string[] = [];
+  let cursor = path.resolve(filePath);
+  while (true) {
+    try {
+      return path.join(await fs.promises.realpath(cursor), ...suffix.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw error;
+      suffix.push(path.basename(cursor));
+      cursor = parent;
+    }
   }
 }
 
@@ -373,7 +405,7 @@ async function gitResult(
   const commandArgs = indexPath
     ? [`GIT_INDEX_FILE=${indexPath}`, "git", "-C", cwd, ...args]
     : ["-C", cwd, ...args];
-  return pi.exec(command, commandArgs, { signal, timeout: GIT_TIMEOUT_MS });
+  return execRejectKilled(pi, command, commandArgs, { signal, timeout: GIT_TIMEOUT_MS });
 }
 
 async function gitStdout(
@@ -477,7 +509,7 @@ async function parseStoredJob(jobDir: string): Promise<StoredCodingJob | undefin
   ) {
     throw new Error(`Coding worker metadata does not match its job and batch directories: ${jobDir}`);
   }
-  const expectedBranch = `pi-agent/${batchId.slice(0, 6).toLowerCase()}/${id.slice(0, 6).toLowerCase()}`;
+  const expectedBranch = `pi-agent/${batchId.toLowerCase()}/${id.toLowerCase()}`;
   if (branch !== expectedBranch) throw new Error(`Coding worker branch identity is malformed: ${jobDir}`);
   const lifecycle = await readJobLifecycle(jobDir);
   if (!lifecycle || lifecycle.jobId !== id || lifecycle.batchId !== batchId) {
@@ -849,7 +881,7 @@ export function formatDelegateHandoffPreview(prepared: PreparedDelegateHandoff):
     lines.push("", "Warnings:", ...prepared.warnings.map((warning) => `- ${warning}`));
   }
   lines.push("", "Paths:", pathListPreview(prepared.touchedPaths));
-  return lines.join("\n");
+  return escapeTerminalText(lines.join("\n"));
 }
 
 export function formatDelegateHandoffResult(result: DelegateHandoffResult): string {
@@ -873,7 +905,7 @@ export function formatDelegateHandoffResult(result: DelegateHandoffResult): stri
   }
   if (result.diagnostic) lines.push(`Git: ${result.diagnostic}`);
   lines.push(`Manifest: ${result.manifestPath}`);
-  return lines.join("\n");
+  return escapeTerminalText(lines.join("\n"));
 }
 
 export async function prepareDelegateHandoff(
@@ -944,7 +976,7 @@ export async function prepareDelegateHandoff(
     canonicalCommonGitDir(pi, targetRoot, signal),
     canonicalGitDir(pi, targetRoot, signal),
     currentBranch(pi, sourceRoot, signal),
-    pi.exec("supacode", ["worktree", "list"], { signal, timeout: GIT_TIMEOUT_MS }),
+    execRejectKilled(pi, "supacode", ["worktree", "list"], { signal, timeout: GIT_TIMEOUT_MS }),
   ]);
   if (sourceCommonDir !== targetCommonDir) {
     throw new Error("Worker and destination are not worktrees of the same Git repository.");
@@ -981,6 +1013,7 @@ export async function prepareDelegateHandoff(
   const draftDir = await fs.promises.mkdtemp(path.join(job.jobDir, `.handoff-${id}-`));
   const indexPath = path.join(draftDir, "source.index");
   const draftPatchPath = path.join(draftDir, "changes.patch");
+  let verifiedLoopAcceptance: LoopAcceptanceIntent | undefined;
 
   try {
     const sourceHead = await gitOutput(pi, sourceRoot, ["rev-parse", "HEAD"], signal);
@@ -995,6 +1028,14 @@ export async function prepareDelegateHandoff(
       if (job.loopState !== "awaiting_apply") {
         throw new Error(`Delegate loop is ${job.loopState ?? "missing its terminal state"}; only accepted loops can be applied.`);
       }
+      const acceptance = await readVerifiedLoopAcceptance(job.jobDir, job.id);
+      if (!acceptance) throw new Error("Accepted delegate loop has no verified gate-evidence manifest.");
+      verifiedLoopAcceptance = acceptance;
+      if (
+        acceptance.delegation.baseSha !== job.baseSha ||
+        acceptance.delegation.destinationRoot !== targetRoot ||
+        acceptance.delegation.branch !== job.branch
+      ) throw new Error("Accepted delegate-loop base, destination, or branch does not match job metadata.");
       if (
         !job.acceptedTree || !OBJECT_ID_PATTERN.test(job.acceptedTree) ||
         !job.acceptedCommit || !OBJECT_ID_PATTERN.test(job.acceptedCommit) ||
@@ -1002,6 +1043,11 @@ export async function prepareDelegateHandoff(
       ) {
         throw new Error("Accepted delegate loop is missing valid reviewed tree, commit, or ref identities.");
       }
+      if (
+        acceptance.candidate.tree !== job.acceptedTree ||
+        acceptance.candidate.commit !== job.acceptedCommit ||
+        acceptance.candidate.ref !== job.acceptedRef
+      ) throw new Error("Accepted delegate-loop metadata does not match its gate-evidence manifest.");
       const [acceptedCommit, acceptedTree] = await Promise.all([
         gitOutput(pi, sourceRoot, ["rev-parse", "--verify", job.acceptedRef], signal),
         gitOutput(pi, sourceRoot, ["rev-parse", `${job.acceptedRef}^{tree}`], signal),
@@ -1014,32 +1060,46 @@ export async function prepareDelegateHandoff(
       }
     }
 
-    const patch = await gitResult(
-      pi,
-      sourceRoot,
-      [
-        "diff",
-        "--binary",
-        "--full-index",
-        "--no-renames",
-        `--output=${draftPatchPath}`,
-        job.baseSha,
-        sourceTree,
-        "--",
-      ],
-      signal,
-    );
-    if (patch.code !== 0) throw new Error(`Could not construct worker patch: ${diagnosticText(patch)}`);
+    if (verifiedLoopAcceptance) {
+      await fs.promises.copyFile(verifiedLoopAcceptance.candidate.patchPath, draftPatchPath);
+    } else {
+      const patch = await gitResult(
+        pi,
+        sourceRoot,
+        [
+          "diff",
+          "--binary",
+          "--full-index",
+          "--no-renames",
+          `--output=${draftPatchPath}`,
+          job.baseSha,
+          sourceTree,
+          "--",
+        ],
+        signal,
+      );
+      if (patch.code !== 0) throw new Error(`Could not construct worker patch: ${diagnosticText(patch)}`);
+    }
     const patchBuffer = await fs.promises.readFile(draftPatchPath);
     if (patchBuffer.length === 0) throw new Error("Worker has no changes relative to its delegation base.");
+    const patchSha256 = createHash("sha256").update(patchBuffer).digest("hex");
+    if (verifiedLoopAcceptance && (
+      patchBuffer.length !== verifiedLoopAcceptance.candidate.patchBytes ||
+      patchSha256 !== verifiedLoopAcceptance.candidate.patchSha256
+    )) throw new Error("Prepared loop patch does not match the immutable accepted patch.");
     await fs.promises.chmod(draftPatchPath, 0o400);
 
+    const effectiveBaseSha = verifiedLoopAcceptance?.delegation.baseSha ?? job.baseSha;
     const touchedPaths = uniqueSortedPaths(parseNulPaths(await gitStdout(
       pi,
       sourceRoot,
-      ["diff", "--name-only", "-z", "--no-renames", job.baseSha, sourceTree, "--"],
+      ["diff", "--name-only", "-z", "--no-renames", effectiveBaseSha, sourceTree, "--"],
       signal,
     )));
+    if (verifiedLoopAcceptance &&
+        JSON.stringify(touchedPaths) !== JSON.stringify(uniqueSortedPaths(verifiedLoopAcceptance.candidate.changedPaths))) {
+      throw new Error("Accepted loop changed-path evidence does not match its immutable tree.");
+    }
     if (touchedPaths.length === 0) throw new Error("Worker patch contains no changed paths.");
 
     const [sourceStatus, targetHead, targetBranch, targetStatus, targetDirtyPaths, targetIgnoredPaths, operationBlockers] = await Promise.all([
@@ -1079,7 +1139,6 @@ export async function prepareDelegateHandoff(
       if (Number.isInteger(count)) commitCount = count;
     }
 
-    const patchSha256 = createHash("sha256").update(patchBuffer).digest("hex");
     if (await priorSnapshotApplied(targetGitDir, patchSha256, targetRoot)) {
       blockers.push("This exact worker snapshot was already applied to this destination.");
     }
@@ -1088,7 +1147,7 @@ export async function prepareDelegateHandoff(
     if (job.workerState !== "completed") warnings.push(`Worker state is ${job.workerState}; changes may be incomplete.`);
     if (!baseIsAncestor) warnings.push("Delegation base is not an ancestor of the worker HEAD.");
     if (sourceStatus) warnings.push("The patch includes the worker's final uncommitted filesystem state.");
-    if (targetHead !== job.baseSha) {
+    if (targetHead !== effectiveBaseSha) {
       if (job.delegateLoop) {
         blockers.push("Destination HEAD changed since the loop was reviewed; rerun the loop against the current destination.");
       } else {
@@ -1106,7 +1165,7 @@ export async function prepareDelegateHandoff(
       sourceHead,
       sourceTree,
       sourceStatus,
-      baseSha: job.baseSha,
+      baseSha: effectiveBaseSha,
       baseIsAncestor,
       commitCount,
       targetRoot,
@@ -1415,19 +1474,68 @@ async function rollbackDestination(
   }
 }
 
+async function currentLoopAcceptanceBlockers(
+  pi: ExtensionAPI,
+  prepared: PreparedDelegateHandoff,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  if (!prepared.job.delegateLoop) return [];
+  try {
+    const [acceptance, decision] = await Promise.all([
+      readVerifiedLoopAcceptance(prepared.job.jobDir, prepared.job.id),
+      readJobDecision(prepared.job.jobDir),
+    ]);
+    if (!acceptance || decision?.owner !== "accept") {
+      return ["Delegate-loop acceptance or its exclusive accept decision is no longer valid."];
+    }
+    if (
+      acceptance.delegation.baseSha !== prepared.baseSha ||
+      acceptance.delegation.destinationRoot !== prepared.targetRoot ||
+      acceptance.delegation.branch !== prepared.job.branch ||
+      acceptance.candidate.tree !== prepared.sourceTree ||
+      acceptance.candidate.commit !== prepared.job.acceptedCommit ||
+      acceptance.candidate.ref !== prepared.job.acceptedRef ||
+      acceptance.candidate.patchSha256 !== prepared.patchSha256 ||
+      acceptance.candidate.patchBytes !== prepared.patchBytes
+    ) return ["Prepared handoff no longer matches the immutable accepted loop evidence."];
+    const [acceptedCommit, acceptedTree] = await Promise.all([
+      gitOutput(pi, prepared.sourceRoot, ["rev-parse", "--verify", acceptance.candidate.ref], signal),
+      gitOutput(pi, prepared.sourceRoot, ["rev-parse", `${acceptance.candidate.ref}^{tree}`], signal),
+    ]);
+    return acceptedCommit === acceptance.candidate.commit && acceptedTree === acceptance.candidate.tree
+      ? []
+      : ["Accepted candidate ref changed after the apply preview."];
+  } catch (error) {
+    return [`Delegate-loop acceptance revalidation failed: ${error instanceof Error ? error.message : String(error)}`];
+  }
+}
+
 async function currentPreflightBlockers(
   pi: ExtensionAPI,
   prepared: PreparedDelegateHandoff,
   signal?: AbortSignal,
 ): Promise<{ blockers: string[]; blockedPaths: string[] }> {
-  const [destinationBlockers, sourceBlockers, currentRoot, currentGitDir, currentCommonGitDir] = await Promise.all([
+  const [
+    destinationBlockers,
+    sourceBlockers,
+    currentRoot,
+    currentGitDir,
+    currentCommonGitDir,
+    loopAcceptanceBlockers,
+  ] = await Promise.all([
     repositoryOperationBlockers(pi, prepared.targetRoot, signal),
     repositoryOperationBlockers(pi, prepared.sourceRoot, signal, "Source checkout"),
     canonicalGitRoot(pi, prepared.targetRoot, signal),
     canonicalGitDir(pi, prepared.targetRoot, signal),
     canonicalCommonGitDir(pi, prepared.targetRoot, signal),
+    currentLoopAcceptanceBlockers(pi, prepared, signal),
   ]);
-  const blockers = [...prepared.blockers, ...destinationBlockers, ...sourceBlockers];
+  const blockers = [
+    ...prepared.blockers,
+    ...destinationBlockers,
+    ...sourceBlockers,
+    ...loopAcceptanceBlockers,
+  ];
   if (
     currentRoot !== prepared.targetRoot ||
     currentGitDir !== prepared.targetGitDir ||
@@ -1463,73 +1571,28 @@ async function currentPreflightBlockers(
   return { blockers, blockedPaths: uniqueSortedPaths([...blockedPaths, ...ignoredBlockedPaths]) };
 }
 
-async function workerPanePresence(
-  pi: ExtensionAPI,
-  job: StoredCodingJob,
-): Promise<SupacodeResourcePresence> {
-  return observeSupacodeSurface(
-    pi,
-    job.tabWorktreeId,
-    job.tabId,
-    job.surfaceId,
-    { timeoutMs: GIT_TIMEOUT_MS },
-  );
-}
-
 async function closeWorkerPane(
   pi: ExtensionAPI,
   job: StoredCodingJob,
 ): Promise<{ closed: boolean; error?: string }> {
-  let previousPresence: SupacodeResourcePresence | undefined;
-  let confirmedPresent = false;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const presence = await workerPanePresence(pi, job);
-    if (presence !== "unknown" && presence === previousPresence) {
-      if (presence === "absent") return { closed: true };
-      confirmedPresent = true;
-      break;
-    }
-    previousPresence = presence === "unknown" ? undefined : presence;
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  if (!confirmedPresent) {
-    return {
-      closed: false,
-      error: "Could not establish stable worker-pane presence; destructive close was not issued.",
-    };
-  }
-
-  const closed = await pi.exec(
-    "supacode",
-    [
-      "surface",
-      "close",
-      "-w",
-      job.tabWorktreeId,
-      "-t",
-      job.tabId,
-      "-s",
-      job.surfaceId,
-    ],
-    { timeout: GIT_TIMEOUT_MS },
+  const terminal = await readWorkerTerminal<{ processIdentity?: ProcessIdentity }>(job.activeWorkerJobDir);
+  if (!terminal) return { closed: false, error: "Worker has no authoritative terminal claim for cleanup." };
+  const termination = await terminateWorker(
+    pi,
+    {
+      id: job.id,
+      jobDir: job.activeWorkerJobDir,
+      tabWorktreeId: job.tabWorktreeId,
+      tabId: job.tabId,
+      surfaceId: job.surfaceId,
+      launchNonce: job.launchNonce,
+    },
+    terminal.status.processIdentity,
+    { owner: "apply_cleanup", reason: "Closing a terminal worker after an applied handoff." },
   );
-  let consecutiveMissingChecks = 0;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const presence = await workerPanePresence(pi, job);
-    if (presence === "absent") {
-      consecutiveMissingChecks++;
-      if (consecutiveMissingChecks >= 2) return { closed: true };
-    } else {
-      consecutiveMissingChecks = 0;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  return {
-    closed: false,
-    error: closed.code === 0
-      ? "Supacode acknowledged worker pane closure, but surface absence was not verified."
-      : `Could not close worker pane: ${diagnosticText(closed)}`,
-  };
+  return termination.verified
+    ? { closed: true }
+    : { closed: false, error: termination.errors.join(" ") || "Worker cleanup termination is indeterminate." };
 }
 
 function workerRecoveryRef(prepared: PreparedDelegateHandoff): string {
@@ -1726,7 +1789,7 @@ async function listedSourceWorktreeId(
   pi: ExtensionAPI,
   prepared: PreparedDelegateHandoff,
 ): Promise<{ id?: string; error?: string }> {
-  const listed = await pi.exec("supacode", ["worktree", "list"], { timeout: GIT_TIMEOUT_MS });
+  const listed = await execRejectKilled(pi, "supacode", ["worktree", "list"], { timeout: GIT_TIMEOUT_MS });
   if (listed.code !== 0) {
     return { error: `Could not verify Supacode worktrees before deletion: ${diagnosticText(listed)}` };
   }
@@ -1756,6 +1819,7 @@ async function removeSupacodeWorktreeResource(
   worktreeId: string,
   priorIntentAt?: string,
   onDeletionIntent?: (intentAt: string) => Promise<void>,
+  validateDeletionTarget?: () => Promise<string | undefined>,
 ): Promise<SupacodeWorktreeRemovalOutcome> {
   const verifyAbsence = async (): Promise<string | undefined> => {
     let consecutiveAbsence = 0;
@@ -1809,6 +1873,15 @@ async function removeSupacodeWorktreeResource(
       error: "Supacode worktree-deletion intent could not be made durable; destructive deletion was not issued.",
     };
   }
+  if (!validateDeletionTarget) {
+    return {
+      removed: false,
+      error: "Supacode worktree deletion has no immediate path-ownership validation; deletion was not issued.",
+    };
+  }
+  await (pi as ExtensionAPIWithHandoffTestHook).__beforeSupacodeWorktreeDeletionForTests?.();
+  const validationError = await validateDeletionTarget();
+  if (validationError) return { removed: false, error: validationError };
 
   const intentAt = new Date().toISOString();
   try {
@@ -1819,7 +1892,8 @@ async function removeSupacodeWorktreeResource(
       error: `Supacode worktree-deletion intent could not be made durable; destructive deletion was not issued: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
-  const deleted = await pi.exec(
+  const deleted = await execRejectKilled(
+    pi,
     "supacode",
     ["worktree", "delete", "-w", worktreeId],
     { timeout: SUPACODE_DELETE_TIMEOUT_MS },
@@ -1863,6 +1937,36 @@ async function cleanupAppliedWorktree(
       onDeletionIntent
         ? async (intentAt) => onDeletionIntent(worktreeId, preservedHead, intentAt)
         : undefined,
+      async () => {
+        let idPath: string;
+        try {
+          idPath = await canonicalizeMissingPath(decodeSupacodeResourceId(worktreeId));
+        } catch (error) {
+          return `Supacode worktree identity is invalid: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        if (idPath !== prepared.sourceRoot) {
+          return "Supacode worktree identity no longer maps to the authenticated source path.";
+        }
+        if (await lexicalPathExists(prepared.sourceRoot)) {
+          return "Worker source path was recreated before Supacode deletion; deletion was refused.";
+        }
+        const registered = await gitStdout(
+          pi,
+          prepared.targetRoot,
+          ["worktree", "list", "--porcelain", "-z"],
+        );
+        const registeredPaths = registered.split("\0\0").flatMap((entry) =>
+          entry.split("\0")
+            .filter((line) => line.startsWith("worktree "))
+            .map((line) => line.slice("worktree ".length))
+        );
+        const canonicalPaths = await Promise.all(
+          registeredPaths.map((registeredPath) => canonicalizeMissingPath(registeredPath)),
+        );
+        return canonicalPaths.includes(prepared.sourceRoot)
+          ? "Git registered a worktree at the removed source path before Supacode deletion; deletion was refused."
+          : undefined;
+      },
     );
   };
   const removalMetadata = (
@@ -2151,6 +2255,24 @@ async function applyPreparedDelegateHandoffUnlocked(
       cleanup: emptyCleanup,
     };
   }
+  const finalLoopAcceptanceBlockers = await currentLoopAcceptanceBlockers(pi, prepared, signal);
+  if (finalLoopAcceptanceBlockers.length > 0) {
+    const diagnostic = finalLoopAcceptanceBlockers.join("\n");
+    const apply = { appliedPaths: [], conflictedPaths: [], blockedPaths: [], diagnostic };
+    await writeManifest(manifestPath, manifestFor(prepared, "blocked", apply, emptyCleanup));
+    await writeDestinationTransaction(prepared, manifestPath, "blocked", baseline, diagnostic);
+    return {
+      id: prepared.id,
+      state: "blocked",
+      appliedPaths: [],
+      conflictedPaths: [],
+      blockedPaths: [],
+      diagnostic,
+      manifestPath,
+      patchPath,
+      cleanup: emptyCleanup,
+    };
+  }
   const applyProcess = {
     jobDir: path.join(finalDir, "apply-process"),
     jobId: `${prepared.id}-apply`,
@@ -2359,121 +2481,120 @@ export async function applyPreparedDelegateHandoff(
     prepared.id,
     prepared.targetRoot,
   );
-  let result: DelegateHandoffResult;
   try {
-    result = await applyPreparedDelegateHandoffUnlocked(pi, prepared, signal);
-  } finally {
-    await releaseDestinationApplyLock(lock);
-  }
-  if (result.state !== "applied" || !cleanup) return result;
+    const result = await applyPreparedDelegateHandoffUnlocked(pi, prepared, signal);
+    if (result.state !== "applied" || !cleanup) return result;
 
-  const apply = {
-    appliedPaths: result.appliedPaths,
-    conflictedPaths: result.conflictedPaths,
-    blockedPaths: result.blockedPaths,
-    diagnostic: result.diagnostic,
-  };
-  let cleanupResult: HandoffCleanupResult;
-  const cleanupIntent: HandoffCleanupResult = {
-    paneClosed: false,
-    worktreeRemoved: false,
-    branchPreserved: false,
-    errors: [`Cleanup intent recorded before creating ${workerRecoveryRef(prepared)}.`],
-  };
-  try {
-    await writeManifest(
-      result.manifestPath,
-      manifestFor(prepared, "applied", apply, cleanupIntent),
-    );
-  } catch (error) {
-    return {
-      ...result,
-      cleanup: {
-        ...cleanupIntent,
-        errors: [`Cleanup was skipped because its write-ahead intent could not be recorded: ${error instanceof Error ? error.message : String(error)}`],
-      },
+    const apply = {
+      appliedPaths: result.appliedPaths,
+      conflictedPaths: result.conflictedPaths,
+      blockedPaths: result.blockedPaths,
+      diagnostic: result.diagnostic,
     };
-  }
-  let cleanupRecoveryRef: string | undefined;
-  let deletionIntent: { worktreeId: string; preservedHead: string; intentAt: string } | undefined;
-  try {
-    cleanupResult = await cleanupAppliedWorktree(pi, prepared, {
-      onRecoveryRef: async (recoveryRef) => {
-        cleanupRecoveryRef = recoveryRef;
-        const pendingCleanup: HandoffCleanupResult = {
-          paneClosed: false,
-          worktreeRemoved: false,
-          branchPreserved: true,
-          recoveryRef,
-          errors: ["Cleanup pending; the verified recovery ref preserves the source HEAD."],
-        };
-        await writeManifest(
-          result.manifestPath,
-          manifestFor(prepared, "applied", apply, pendingCleanup),
-        );
-      },
-      onWorktreeIdentity: async (worktreeId, preservedHead) => {
-        const pendingRemoval: HandoffCleanupResult = {
-          paneClosed: true,
-          worktreeRemoved: false,
-          branchPreserved: true,
-          recoveryRef: cleanupRecoveryRef,
-          preservedHead,
-          worktreeId,
-          errors: ["Worktree removal pending; exact source identity is durable."],
-        };
-        await writeManifest(
-          result.manifestPath,
-          manifestFor(prepared, "applied", apply, pendingRemoval),
-        );
-      },
-      onDeletionIntent: async (worktreeId, preservedHead, intentAt) => {
-        const pendingDeletion: HandoffCleanupResult = {
-          paneClosed: true,
-          worktreeRemoved: true,
-          branchPreserved: true,
-          recoveryRef: cleanupRecoveryRef,
-          preservedHead,
-          worktreeId,
-          supacodeWorktreeDeletionIntentAt: intentAt,
-          errors: ["Supacode worktree deletion may have started; absence verification is pending."],
-        };
-        await writeManifest(
-          result.manifestPath,
-          manifestFor(prepared, "applied", apply, pendingDeletion),
-        );
-        deletionIntent = { worktreeId, preservedHead, intentAt };
-      },
-    });
-  } catch (error) {
-    cleanupResult = {
+    let cleanupResult: HandoffCleanupResult;
+    const cleanupIntent: HandoffCleanupResult = {
       paneClosed: false,
       worktreeRemoved: false,
       branchPreserved: false,
-      errors: [`Cleanup ended unexpectedly; inspect the source worktree: ${error instanceof Error ? error.message : String(error)}`],
+      errors: [`Cleanup intent recorded before creating ${workerRecoveryRef(prepared)}.`],
     };
+    try {
+      await writeManifest(
+        result.manifestPath,
+        manifestFor(prepared, "applied", apply, cleanupIntent),
+      );
+    } catch (error) {
+      return {
+        ...result,
+        cleanup: {
+          ...cleanupIntent,
+          errors: [`Cleanup was skipped because its write-ahead intent could not be recorded: ${error instanceof Error ? error.message : String(error)}`],
+        },
+      };
+    }
+    let cleanupRecoveryRef: string | undefined;
+    let deletionIntent: { worktreeId: string; preservedHead: string; intentAt: string } | undefined;
+    try {
+      cleanupResult = await cleanupAppliedWorktree(pi, prepared, {
+        onRecoveryRef: async (recoveryRef) => {
+          cleanupRecoveryRef = recoveryRef;
+          const pendingCleanup: HandoffCleanupResult = {
+            paneClosed: false,
+            worktreeRemoved: false,
+            branchPreserved: true,
+            recoveryRef,
+            errors: ["Cleanup pending; the verified recovery ref preserves the source HEAD."],
+          };
+          await writeManifest(
+            result.manifestPath,
+            manifestFor(prepared, "applied", apply, pendingCleanup),
+          );
+        },
+        onWorktreeIdentity: async (worktreeId, preservedHead) => {
+          const pendingRemoval: HandoffCleanupResult = {
+            paneClosed: true,
+            worktreeRemoved: false,
+            branchPreserved: true,
+            recoveryRef: cleanupRecoveryRef,
+            preservedHead,
+            worktreeId,
+            errors: ["Worktree removal pending; exact source identity is durable."],
+          };
+          await writeManifest(
+            result.manifestPath,
+            manifestFor(prepared, "applied", apply, pendingRemoval),
+          );
+        },
+        onDeletionIntent: async (worktreeId, preservedHead, intentAt) => {
+          const pendingDeletion: HandoffCleanupResult = {
+            paneClosed: true,
+            worktreeRemoved: true,
+            branchPreserved: true,
+            recoveryRef: cleanupRecoveryRef,
+            preservedHead,
+            worktreeId,
+            supacodeWorktreeDeletionIntentAt: intentAt,
+            errors: ["Supacode worktree deletion may have started; absence verification is pending."],
+          };
+          await writeManifest(
+            result.manifestPath,
+            manifestFor(prepared, "applied", apply, pendingDeletion),
+          );
+          deletionIntent = { worktreeId, preservedHead, intentAt };
+        },
+      });
+    } catch (error) {
+      cleanupResult = {
+        paneClosed: false,
+        worktreeRemoved: false,
+        branchPreserved: false,
+        errors: [`Cleanup ended unexpectedly; inspect the source worktree: ${error instanceof Error ? error.message : String(error)}`],
+      };
+    }
+    if (deletionIntent && !cleanupResult.supacodeWorktreeDeletionIntentAt) {
+      cleanupResult = {
+        ...cleanupResult,
+        paneClosed: true,
+        worktreeRemoved: true,
+        branchPreserved: true,
+        recoveryRef: cleanupRecoveryRef,
+        preservedHead: deletionIntent.preservedHead,
+        worktreeId: deletionIntent.worktreeId,
+        supacodeWorktreeDeletionIntentAt: deletionIntent.intentAt,
+      };
+    }
+    try {
+      await writeManifest(
+        result.manifestPath,
+        manifestFor(prepared, "applied", apply, cleanupResult),
+      );
+    } catch (error) {
+      cleanupResult.errors.push(`Could not record final cleanup state: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return { ...result, cleanup: cleanupResult };
+  } finally {
+    await releaseDestinationApplyLock(lock);
   }
-  if (deletionIntent && !cleanupResult.supacodeWorktreeDeletionIntentAt) {
-    cleanupResult = {
-      ...cleanupResult,
-      paneClosed: true,
-      worktreeRemoved: true,
-      branchPreserved: true,
-      recoveryRef: cleanupRecoveryRef,
-      preservedHead: deletionIntent.preservedHead,
-      worktreeId: deletionIntent.worktreeId,
-      supacodeWorktreeDeletionIntentAt: deletionIntent.intentAt,
-    };
-  }
-  try {
-    await writeManifest(
-      result.manifestPath,
-      manifestFor(prepared, "applied", apply, cleanupResult),
-    );
-  } catch (error) {
-    cleanupResult.errors.push(`Could not record final cleanup state: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  return { ...result, cleanup: cleanupResult };
 }
 
 async function preparedFromAppliedManifest(
@@ -2693,6 +2814,7 @@ export async function recoverDelegateApplyState(
   destinationCwd: string,
   signal?: AbortSignal,
   acceptResolvedConflicts = false,
+  expectedJobId?: string,
 ): Promise<{ recovered: boolean; message: string; transactions: string[] }> {
   const root = await canonicalGitRoot(pi, destinationCwd, signal);
   const gitDir = await canonicalGitDir(pi, root, signal);
@@ -2734,6 +2856,8 @@ export async function recoverDelegateApplyState(
         transactions.push(`${entry.name}: corrupt transaction metadata; manual recovery required.`);
         continue;
       }
+      const recordJobId = stringValue(record, "jobId");
+      if (expectedJobId && recordJobId !== expectedJobId) continue;
       let state = stringValue(record, "state");
       if (state === "applied") {
         const manifestPath = stringValue(record, "jobManifestPath");

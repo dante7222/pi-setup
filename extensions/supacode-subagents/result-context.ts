@@ -1,3 +1,5 @@
+import { escapeTerminalText } from "./terminal-text.ts";
+
 export interface ResultGitContext {
   baseSha?: string;
   commit?: string;
@@ -106,6 +108,23 @@ export function formatWorkerResults(
   positiveInteger(maxBytes, "maxBytes");
   positiveInteger(maxLines, "maxLines");
   if (results.length === 0) return "0/0 delegated tasks completed successfully.";
+  results = results.map((result) => ({
+    ...result,
+    batchTitle: result.batchTitle && escapeTerminalText(result.batchTitle),
+    title: escapeTerminalText(result.title),
+    output: escapeTerminalText(result.output),
+    resultPath: result.resultPath && escapeTerminalText(result.resultPath),
+    stderrPath: result.stderrPath && escapeTerminalText(result.stderrPath),
+    worktreePath: result.worktreePath && escapeTerminalText(result.worktreePath),
+    branch: result.branch && escapeTerminalText(result.branch),
+    git: result.git
+      ? {
+          ...result.git,
+          status: result.git.status && escapeTerminalText(result.git.status),
+          changedFiles: result.git.changedFiles?.map(escapeTerminalText),
+        }
+      : undefined,
+  }));
 
   const successful = results.filter((result) => result.state === "completed").length;
   const batches = new Map<string, string>();

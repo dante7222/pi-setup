@@ -11,15 +11,15 @@ test("worker JSON events render visible progress without terminal control sequen
     { type: "line", text: "Pi started; waiting for the model…" },
   );
   assert.deepEqual(
-    formatWorkerEvent({ type: "tool_execution_start", toolName: "read\u001b[2J" }),
-    { type: "line", text: "→ read[2J" },
+    formatWorkerEvent({ type: "tool_execution_start", toolName: "read\u001b[2J\u200f" }),
+    { type: "line", text: "→ read\\u001b[2J\\u200f" },
   );
   assert.deepEqual(
     formatWorkerEvent({
       type: "message_update",
       assistantMessageEvent: { type: "text_delta", delta: "review\u0000 result" },
     }),
-    { type: "text", text: "review result" },
+    { type: "text", text: "review\\u0000 result" },
   );
   assert.deepEqual(formatWorkerEvent({ type: "agent_end" }), { type: "end" });
   assert.equal(formatWorkerEvent({ type: "thinking" }), undefined);

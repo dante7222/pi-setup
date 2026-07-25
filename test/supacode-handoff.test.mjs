@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, lstat, mkdtemp, mkdir, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
@@ -22,6 +23,13 @@ import {
   prepareDelegateHandoff,
   recoverDelegateApplyState,
 } from "../extensions/supacode-subagents/handoff.ts";
+import {
+  captureReviewerProcessEvidence,
+  captureValidationProcessEvidence,
+  loopCheckFingerprint,
+  publishLoopAcceptance,
+  writeLoopPolicy,
+} from "../extensions/supacode-subagents/loop-acceptance.ts";
 
 const JOB_ID = "11111111-2222-4333-8444-555555555555";
 const BATCH_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -76,7 +84,7 @@ async function createFixture(setupBase) {
   await git(parent, "add", ".");
   await git(parent, "commit", "-m", "base");
   const baseSha = await git(parent, "rev-parse", "HEAD");
-  const branch = "pi-agent/aaaaaa/111111";
+  const branch = "pi-agent/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/11111111-2222-4333-8444-555555555555";
   await git(parent, "worktree", "add", "-b", branch, worker, baseSha);
 
   await mkdir(jobDir, { recursive: true });
@@ -328,6 +336,7 @@ test("handoff binds declared job identities to directory paths and rejects dupli
     await writeFile(join(duplicateDir, "job.json"), `${JSON.stringify({
       ...job,
       batchId: duplicateBatchId,
+      branch: `pi-agent/${duplicateBatchId}/${JOB_ID}`,
     }, null, 2)}\n`);
     await initializeJobLifecycle(duplicateDir, JOB_ID, duplicateBatchId, "completed");
     await assert.rejects(
@@ -582,6 +591,140 @@ test("handoff applies only the immutable tree accepted by a delegate loop", asyn
       acceptedRef,
     });
     await writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`);
+    const iterationDir = join(fixture.jobDir, "iterations", "001");
+    await mkdir(iterationDir, { recursive: true });
+    const patchPath = join(iterationDir, "candidate.patch");
+    await checked("git", [
+      "-C",
+      fixture.worker,
+      "diff",
+      "--binary",
+      "--full-index",
+      "--no-renames",
+      `--output=${patchPath}`,
+      job.baseSha,
+      acceptedTree,
+      "--",
+    ]);
+    const patch = await readFile(patchPath);
+    const candidate = {
+      attempt: 1,
+      tree: acceptedTree,
+      commit: acceptedCommit,
+      ref: acceptedRef,
+      head: snapshot.sourceHead,
+      branch: job.branch,
+      patchPath,
+      patchSha256: createHash("sha256").update(patch).digest("hex"),
+      patchBytes: patch.length,
+      patchPreview: patch.toString("utf8"),
+      patchPreviewTruncated: false,
+      changedPaths: ["a.txt"],
+      gitlinkPaths: [],
+    };
+    const attestation = {
+      candidateTree: acceptedTree,
+      candidateCommit: acceptedCommit,
+      checkoutPath: join(iterationDir, "evidence-checkout"),
+      head: acceptedCommit,
+      tree: acceptedTree,
+      unchanged: true,
+      statusPaths: [],
+      gitlinkPaths: [],
+      observedAt: new Date().toISOString(),
+    };
+    const writeProcessEvidence = async (processDir, processJobId, launchNonce) => {
+      const wrapper = {
+        pid: 999_992,
+        startSignature: "fixture process",
+        processGroup: 999_992,
+        command: "fixture",
+        launchNonce,
+      };
+      await writeRunnerProcess(processDir, {
+        schemaVersion: 2,
+        jobId: processJobId,
+        launchNonce,
+        wrapper,
+        startedAt: new Date().toISOString(),
+      });
+      await writeRunnerExit(processDir, {
+        schemaVersion: 2,
+        jobId: processJobId,
+        launchNonce,
+        wrapperPid: wrapper.pid,
+        exitCode: 0,
+        exitedAt: new Date().toISOString(),
+      });
+    };
+    const checkDir = join(iterationDir, "checks", "01");
+    const checkJobId = `${JOB_ID}-check-1-1`;
+    const checkNonce = "check-launch-nonce";
+    await writeProcessEvidence(checkDir, checkJobId, checkNonce);
+    const checkInput = {
+      command: "npm test",
+      candidateTree: acceptedTree,
+      candidateCommit: acceptedCommit,
+      before: attestation,
+      after: attestation,
+      passed: true,
+      exitCode: 0,
+      killed: false,
+      timedOut: false,
+      terminationVerified: true,
+      process: await captureValidationProcessEvidence(checkDir, checkJobId, checkNonce, 0),
+    };
+    const checks = [{ ...checkInput, fingerprint: loopCheckFingerprint(checkInput) }];
+    const reviewDir = join(fixture.jobDir, "test-reviewer");
+    const reviewJobId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    const reviewNonce = "review-launch-nonce";
+    await writeProcessEvidence(reviewDir, reviewJobId, reviewNonce);
+    await claimWorkerTerminal(
+      reviewDir,
+      reviewJobId,
+      "worker",
+      { state: "completed" },
+      "VERDICT: PASS",
+    );
+    const reviews = [{
+      profileId: "test-review",
+      title: "test review",
+      verdict: "pass",
+      state: "completed",
+      output: "VERDICT: PASS",
+      before: attestation,
+      after: attestation,
+      process: await captureReviewerProcessEvidence(reviewDir, reviewJobId, reviewNonce),
+    }];
+    await writeFile(join(iterationDir, "checks.json"), `${JSON.stringify(checks, null, 2)}\n`);
+    await writeFile(join(iterationDir, "reviews.json"), `${JSON.stringify(reviews, null, 2)}\n`);
+    await writeFile(join(iterationDir, "iteration.json"), `${JSON.stringify({
+      attempt: 1,
+      checks,
+      reviews,
+      evidence: candidate,
+      candidateFingerprint: candidate.tree,
+      transition: { state: "awaiting_apply", reason: "test acceptance" },
+    }, null, 2)}\n`);
+    const policy = await writeLoopPolicy(fixture.jobDir, JOB_ID, {
+      objective: "test accepted handoff",
+      checks: [{ command: "npm test", timeoutSeconds: 60 }],
+      reviewers: [{ id: "test-review" }],
+      maxAttempts: 3,
+      delegation: {
+        baseSha: job.baseSha,
+        destinationRoot: await realpath(fixture.parent),
+        branch: job.branch,
+      },
+    });
+    await publishLoopAcceptance(
+      fixture.jobDir,
+      JOB_ID,
+      policy,
+      candidate,
+      checks,
+      reviews,
+    );
     await claimJobDecision(fixture.jobDir, JOB_ID, "accept");
 
     const accepted = await prepareDelegateHandoff(
@@ -592,6 +735,24 @@ test("handoff applies only the immutable tree accepted by a delegate loop", asyn
     );
     assert.equal(accepted.sourceTree, acceptedTree);
     await discardPreparedDelegateHandoff(accepted);
+
+    const revalidationPrepared = await prepareDelegateHandoff(
+      fixture.pi,
+      JOB_ID,
+      undefined,
+      fixture.agentDir,
+    );
+    await writeFile(join(iterationDir, "checks.json"), "[]\n");
+    const rejectedAfterPreview = await applyPreparedDelegateHandoff(
+      fixture.pi,
+      revalidationPrepared,
+      undefined,
+      false,
+    );
+    assert.equal(rejectedAfterPreview.state, "blocked");
+    assert.match(rejectedAfterPreview.diagnostic, /acceptance revalidation failed|gate evidence changed/i);
+    assert.equal(await readFile(join(fixture.parent, "a.txt"), "utf8"), "one\ntwo\nthree\n");
+    await writeFile(join(iterationDir, "checks.json"), `${JSON.stringify(checks, null, 2)}\n`);
 
     await writeFile(join(fixture.parent, "parent-advanced.txt"), "new destination\n");
     await git(fixture.parent, "add", "parent-advanced.txt");
@@ -607,6 +768,16 @@ test("handoff applies only the immutable tree accepted by a delegate loop", asyn
       true,
     );
     await discardPreparedDelegateHandoff(drifted);
+
+    const originalBaseSha = job.baseSha;
+    job.baseSha = await git(fixture.parent, "rev-parse", "HEAD");
+    await writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`);
+    await assert.rejects(
+      prepareDelegateHandoff(fixture.pi, JOB_ID, undefined, fixture.agentDir),
+      /accepted delegate-loop base/i,
+    );
+    job.baseSha = originalBaseSha;
+    await writeFile(jobPath, `${JSON.stringify(job, null, 2)}\n`);
 
     await writeFile(join(fixture.worker, "after-review.txt"), "unreviewed\n");
     await assert.rejects(
@@ -1177,6 +1348,114 @@ test("cleanup checks source Git operations before closing the worker pane", asyn
   }
 });
 
+test("destination apply lock remains held through destructive worker cleanup", async () => {
+  const fixture = await createFixture();
+  let releaseDeletion;
+  const deletionGate = new Promise((resolveGate) => { releaseDeletion = resolveGate; });
+  let deletionReached;
+  const deletionStarted = new Promise((resolveStarted) => { deletionReached = resolveStarted; });
+  try {
+    await writeFile(join(fixture.worker, "a.txt"), "one\napplied\nthree\n");
+    let surfacePresent = true;
+    let worktreePresent = true;
+    const pi = {
+      __beforeSupacodeWorktreeDeletionForTests: async () => {
+        deletionReached();
+        await deletionGate;
+      },
+      exec: async (command, args, options) => {
+        if (command !== "supacode") return execResult(command, args, options);
+        if (args[0] === "worktree" && args[1] === "list") {
+          return {
+            stdout: `${encodeURIComponent(fixture.parent)}\n${worktreePresent ? `${encodeURIComponent(fixture.worker)}\n` : ""}`,
+            stderr: "",
+            code: 0,
+            killed: false,
+          };
+        }
+        if (args[0] === "surface" && args[1] === "list") {
+          return { stdout: surfacePresent ? `${SURFACE_ID}\n` : "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "tab" && args[1] === "list") {
+          return { stdout: `${TAB_ID}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "close") {
+          surfacePresent = false;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "worktree" && args[1] === "delete") {
+          worktreePresent = false;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        return { stdout: "", stderr: `unexpected Supacode call: ${args.join(" ")}`, code: 1, killed: false };
+      },
+    };
+    const prepared = await prepareDelegateHandoff(pi, JOB_ID, undefined, fixture.agentDir);
+    const applying = applyPreparedDelegateHandoff(pi, prepared);
+    await deletionStarted;
+    await assert.rejects(
+      recoverDelegateApplyState(pi, fixture.parent),
+      /lock owner is alive/i,
+    );
+    releaseDeletion();
+    const result = await applying;
+    assert.equal(result.state, "applied");
+    assert.equal(result.cleanup.worktreeRemoved, true);
+  } finally {
+    releaseDeletion?.();
+    await removeFixture(fixture);
+  }
+});
+
+test("cleanup refuses Supacode deletion when the removed worktree path is reused", async () => {
+  const fixture = await createFixture();
+  try {
+    await writeFile(join(fixture.worker, "a.txt"), "one\napplied\nthree\n");
+    let surfacePresent = true;
+    let worktreeDeleteCalled = false;
+    const pi = {
+      __beforeSupacodeWorktreeDeletionForTests: async () => {
+        await mkdir(fixture.worker, { recursive: true });
+        await writeFile(join(fixture.worker, "replacement.txt"), "unrelated replacement\n");
+      },
+      exec: async (command, args, options) => {
+        if (command !== "supacode") return execResult(command, args, options);
+        if (args[0] === "worktree" && args[1] === "list") {
+          return {
+            stdout: `${encodeURIComponent(fixture.parent)}\n${encodeURIComponent(fixture.worker)}\n`,
+            stderr: "",
+            code: 0,
+            killed: false,
+          };
+        }
+        if (args[0] === "surface" && args[1] === "list") {
+          return { stdout: surfacePresent ? `${SURFACE_ID}\n` : "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "tab" && args[1] === "list") {
+          return { stdout: `${TAB_ID}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "close") {
+          surfacePresent = false;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "worktree" && args[1] === "delete") {
+          worktreeDeleteCalled = true;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        return { stdout: "", stderr: `unexpected Supacode call: ${args.join(" ")}`, code: 1, killed: false };
+      },
+    };
+    const prepared = await prepareDelegateHandoff(pi, JOB_ID, undefined, fixture.agentDir);
+    const result = await applyPreparedDelegateHandoff(pi, prepared);
+    assert.equal(result.state, "applied");
+    assert.equal(worktreeDeleteCalled, false);
+    assert.equal(result.cleanup.errors.some((message) => message.includes("recreated")), true);
+    assert.equal(await readFile(join(fixture.worker, "replacement.txt"), "utf8"), "unrelated replacement\n");
+  } finally {
+    await removeFixture(fixture);
+  }
+});
+
 test("cleanup recovery accepts its authenticated preservation commit after interruption", async () => {
   const fixture = await createFixture();
   try {
@@ -1271,7 +1550,7 @@ test("cleanup does not delete after a transient missing-surface snapshot", async
     assert.equal(result.cleanup.paneClosed, false);
     assert.equal(result.cleanup.worktreeRemoved, false);
     assert.equal(deleteCalled, false);
-    assert.equal(result.cleanup.errors.some((error) => error.includes("stable worker-pane presence")), true);
+    assert.equal(result.cleanup.errors.some((error) => error.toLowerCase().includes("surface")), true);
   } finally {
     await removeFixture(fixture);
   }

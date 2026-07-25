@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createExclusiveJson, durableAtomicWrite, readJsonStrict } from "./durable-state.ts";
+import { execRejectKilled } from "./exec-result.ts";
 import {
   currentProcessGroup,
   inspectProcessIdentity,
@@ -21,11 +23,34 @@ export interface SupervisedWorker {
   launchNonce: string;
 }
 
+export type WorkerTerminationOwner =
+  | "manual"
+  | "timeout"
+  | "cancel"
+  | "abort"
+  | "launch_failure"
+  | "batch_failure"
+  | "recovery"
+  | "apply_cleanup";
+
+export interface WorkerTerminationIntent {
+  schemaVersion: 2;
+  jobId: string;
+  launchNonce: string;
+  owner: WorkerTerminationOwner;
+  ownerToken: string;
+  reason: string;
+  claimedAt: string;
+}
+
 export interface WorkerTerminationResult {
   surfaceAbsent: boolean;
   processesAbsent: boolean;
   verified: boolean;
   errors: string[];
+  terminationOwner?: WorkerTerminationOwner;
+  terminationReason?: string;
+  terminationClaimWon?: boolean;
 }
 
 export interface SurfaceObservationState {
@@ -63,6 +88,55 @@ function validProcessIdentity(value: unknown, launchNonce: string): value is Pro
     typeof record.processGroup === "number" && Number.isSafeInteger(record.processGroup) && record.processGroup > 1 &&
     typeof record.command === "string" &&
     record.launchNonce === launchNonce;
+}
+
+function validTerminationOwner(value: unknown): value is WorkerTerminationOwner {
+  return typeof value === "string" && [
+    "manual",
+    "timeout",
+    "cancel",
+    "abort",
+    "launch_failure",
+    "batch_failure",
+    "recovery",
+    "apply_cleanup",
+  ].includes(value);
+}
+
+export async function readWorkerTerminationIntent(
+  worker: Pick<SupervisedWorker, "id" | "jobDir" | "launchNonce">,
+): Promise<WorkerTerminationIntent | undefined> {
+  const filePath = path.join(worker.jobDir, "termination-intent.json");
+  const intent = await readJsonStrict<WorkerTerminationIntent>(filePath);
+  if (!intent) return undefined;
+  if (
+    intent.schemaVersion !== 2 || intent.jobId !== worker.id ||
+    intent.launchNonce !== worker.launchNonce || !validTerminationOwner(intent.owner) ||
+    typeof intent.ownerToken !== "string" || intent.ownerToken.length === 0 ||
+    typeof intent.reason !== "string" || typeof intent.claimedAt !== "string"
+  ) throw new Error(`Unsupported worker termination intent at ${filePath}.`);
+  return intent;
+}
+
+export async function claimWorkerTerminationIntent(
+  worker: Pick<SupervisedWorker, "id" | "jobDir" | "launchNonce">,
+  owner: WorkerTerminationOwner,
+  reason: string,
+): Promise<{ won: boolean; record: WorkerTerminationIntent }> {
+  const record = {
+    schemaVersion: 2,
+    jobId: worker.id,
+    launchNonce: worker.launchNonce,
+    owner,
+    ownerToken: randomUUID(),
+    reason,
+    claimedAt: new Date().toISOString(),
+  } satisfies WorkerTerminationIntent;
+  const won = await createExclusiveJson(path.join(worker.jobDir, "termination-intent.json"), record);
+  if (won) return { won: true, record };
+  const existing = await readWorkerTerminationIntent(worker);
+  if (!existing) throw new Error(`Worker termination intent disappeared for ${worker.id}.`);
+  return { won: false, record: existing };
 }
 
 async function resolveWorkerLaunchClaim(worker: SupervisedWorker): Promise<{
@@ -177,7 +251,7 @@ export async function reconcileWorkerSurfaceCreation(
         return { verified: false, error: "Surface-creation process group is still present." };
       }
       for (let attempt = 0; attempt < 2; attempt++) {
-        const barrier = await pi.exec("supacode", ["worktree", "list"], { timeout: 30_000 });
+        const barrier = await execRejectKilled(pi, "supacode", ["worktree", "list"], { timeout: 30_000 });
         if (barrier.code !== 0) {
           return { verified: false, error: "Supacode server reconciliation barrier failed." };
         }
@@ -230,7 +304,8 @@ async function listedSurfaceIds(
   pi: ExtensionAPI,
   worker: SupervisedWorker,
 ): Promise<string[] | undefined> {
-  const result = await pi.exec(
+  const result = await execRejectKilled(
+    pi,
     "supacode",
     ["surface", "list", "-w", worker.tabWorktreeId, "-t", worker.tabId],
     { timeout: 5000 },
@@ -403,8 +478,13 @@ export async function terminateWorker(
   pi: ExtensionAPI,
   worker: SupervisedWorker,
   workerIdentity?: ProcessIdentity,
+  request: { owner: WorkerTerminationOwner; reason: string } = {
+    owner: "recovery",
+    reason: "Recovering delegated worker resources.",
+  },
 ): Promise<WorkerTerminationResult> {
   const errors: string[] = [];
+  let terminationIntent: { won: boolean; record: WorkerTerminationIntent } | undefined;
   try {
     const launchBarrier = await resolveWorkerLaunchClaim(worker);
     if (launchBarrier.protocolEnabled && !launchBarrier.valid) {
@@ -415,6 +495,54 @@ export async function terminateWorker(
         errors: [launchBarrier.error ?? "Worker launch prevention could not be claimed."],
       };
     }
+    const preflightRunner = await readRunnerProcess(worker.jobDir);
+    if (preflightRunner && (
+      preflightRunner.jobId !== worker.id || preflightRunner.launchNonce !== worker.launchNonce ||
+      preflightRunner.wrapper.launchNonce !== worker.launchNonce
+    )) {
+      return {
+        surfaceAbsent: false,
+        processesAbsent: false,
+        verified: false,
+        errors: ["Runner process identity does not match the requested worker termination."],
+      };
+    }
+    if (workerIdentity && workerIdentity.launchNonce !== worker.launchNonce) {
+      return {
+        surfaceAbsent: false,
+        processesAbsent: false,
+        verified: false,
+        errors: ["Worker process identity launch nonce does not match lifecycle intent."],
+      };
+    }
+    terminationIntent = await claimWorkerTerminationIntent(worker, request.owner, request.reason);
+    // The recovery command authenticates the orchestrator lease before reaching this
+    // path. It may resume an abandoned idempotent cleanup, but the original owner
+    // remains the authoritative terminal decision.
+    if (
+      !terminationIntent.won && terminationIntent.record.owner !== request.owner &&
+      request.owner !== "recovery"
+    ) {
+      const [processes, surfaceIsAbsent] = await Promise.all([
+        verifyWorkerProcessesAbsent(pi, worker, workerIdentity, 3_000),
+        waitForSurfaceAbsence(pi, worker, 3_000),
+      ]);
+      if (!processes.absent) {
+        errors.push(`Termination is owned by ${terminationIntent.record.owner}; process absence is ${processes.states.join(", ")}.`);
+      }
+      if (!surfaceIsAbsent) {
+        errors.push(`Termination is owned by ${terminationIntent.record.owner}; surface absence was not verified.`);
+      }
+      return {
+        surfaceAbsent: surfaceIsAbsent,
+        processesAbsent: processes.absent,
+        verified: surfaceIsAbsent && processes.absent,
+        errors,
+        terminationOwner: terminationIntent.record.owner,
+        terminationReason: terminationIntent.record.reason,
+        terminationClaimWon: false,
+      };
+    }
     if (launchBarrier.runnerIdentity) {
       const stopped = await terminateRecordedProcess(launchBarrier.runnerIdentity, worker.launchNonce);
       if (!stopped.verified) {
@@ -423,6 +551,9 @@ export async function terminateWorker(
           processesAbsent: false,
           verified: false,
           errors: [stopped.error ?? "Runner launch claim process could not be terminated."],
+          terminationOwner: terminationIntent.record.owner,
+          terminationReason: terminationIntent.record.reason,
+          terminationClaimWon: terminationIntent.won,
         };
       }
     }
@@ -432,6 +563,9 @@ export async function terminateWorker(
       processesAbsent: false,
       verified: false,
       errors: [`Could not claim worker launch prevention: ${error instanceof Error ? error.message : String(error)}`],
+      terminationOwner: terminationIntent?.record.owner,
+      terminationReason: terminationIntent?.record.reason,
+      terminationClaimWon: terminationIntent?.won,
     };
   }
   const creation = await reconcileWorkerSurfaceCreation(pi, worker);
@@ -441,6 +575,9 @@ export async function terminateWorker(
       processesAbsent: false,
       verified: false,
       errors: [creation.error ?? "Surface-creation process is not verified absent."],
+      terminationOwner: terminationIntent?.record.owner,
+      terminationReason: terminationIntent?.record.reason,
+      terminationClaimWon: terminationIntent?.won,
     };
   }
   let runnerIdentity: ProcessIdentity | undefined;
@@ -517,7 +654,8 @@ export async function terminateWorker(
     } else if (presence === "unknown") {
       errors.push("Worker surface state is unavailable; destructive close was not issued.");
     } else {
-      const closed = await pi.exec(
+      const closed = await execRejectKilled(
+        pi,
         "supacode",
         [
           "surface",
@@ -554,5 +692,8 @@ export async function terminateWorker(
     processesAbsent: processes.absent,
     verified: surfaceIsAbsent && processes.absent && processMetadataValid,
     errors,
+    terminationOwner: terminationIntent?.record.owner,
+    terminationReason: terminationIntent?.record.reason,
+    terminationClaimWon: terminationIntent?.won,
   };
 }

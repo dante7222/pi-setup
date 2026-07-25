@@ -184,6 +184,16 @@ test("one terminal claimant wins and late completion cannot overwrite it", async
     assert.equal(Number(timeout.won) + Number(worker.won), 1);
     const terminal = await readWorkerTerminal(jobDir);
     assert.ok(terminal);
+    await writeFile(join(jobDir, "status.json"), `${JSON.stringify({ state: "losing-projection" })}\n`);
+    await writeFile(join(jobDir, "result.md"), "losing projection\n");
+    const late = await claimWorkerTerminal(
+      jobDir,
+      JOB_ID,
+      "cancel",
+      { state: "failed", stopReason: "cancelled" },
+      "late cancellation",
+    );
+    assert.equal(late.won, false);
     const canonicalStatus = JSON.parse(await readFile(join(jobDir, "status.json"), "utf8"));
     const canonicalResult = await readFile(join(jobDir, "result.md"), "utf8");
     assert.deepEqual(canonicalStatus, terminal.status);

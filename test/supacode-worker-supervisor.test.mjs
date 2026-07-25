@@ -7,7 +7,9 @@ import test from "node:test";
 import { writeRunnerProcess } from "../extensions/supacode-subagents/lifecycle.ts";
 import { captureProcessIdentity, inspectProcessIdentity } from "../extensions/supacode-subagents/process-identity.ts";
 import {
+  claimWorkerTerminationIntent,
   observeWorkerSurfaces,
+  readWorkerTerminationIntent,
   terminateWorker,
   verifyWorkerProcessesAbsent,
 } from "../extensions/supacode-subagents/worker-supervisor.ts";
@@ -38,6 +40,94 @@ test("surface monitoring confirms each missing worker independently", () => {
     observeWorkerSurfaces([FIRST, SECOND], undefined, state, 2),
     [],
   );
+});
+
+test("orchestrator termination linearizes before a later manual-close observation", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-termination-intent-"));
+  const worker = { id: "job", jobDir, launchNonce: "nonce" };
+  try {
+    const timeout = await claimWorkerTerminationIntent(worker, "timeout", "deadline reached");
+    const manual = await claimWorkerTerminationIntent(worker, "manual", "surface disappeared");
+    assert.equal(timeout.won, true);
+    assert.equal(manual.won, false);
+    assert.equal(manual.record.owner, "timeout");
+    assert.equal((await readWorkerTerminationIntent(worker)).owner, "timeout");
+  } finally {
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test("a manual-close decision prevents a later timeout from issuing destructive cleanup", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-manual-wins-"));
+  const worker = {
+    id: "manual-job",
+    jobDir,
+    tabWorktreeId: "/worktree",
+    tabId: "eeeeeeee-1111-4222-8333-ffffffffffff",
+    surfaceId: SECOND.surfaceId,
+    launchNonce: "manual-nonce",
+  };
+  let destructiveCalls = 0;
+  try {
+    await writeFile(join(jobDir, "job.json"), `${JSON.stringify({ workerLaunchClaimVersion: 1 })}\n`);
+    await claimWorkerTerminationIntent(worker, "manual", "surface disappeared");
+    const result = await terminateWorker({
+      exec: async (_command, args) => {
+        if (args[0] === "surface" && args[1] === "close") destructiveCalls++;
+        if (args[0] === "tab" && args[1] === "list") {
+          return { stdout: `${worker.tabId}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "list") {
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
+      },
+    }, worker, undefined, { owner: "timeout", reason: "deadline reached" });
+    assert.equal(result.verified, true);
+    assert.equal(result.terminationOwner, "manual");
+    assert.equal(result.terminationClaimWon, false);
+    assert.equal(destructiveCalls, 0);
+  } finally {
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test("authenticated recovery can finish a crashed termination winner without changing its decision", async () => {
+  const jobDir = await mkdtemp(join(tmpdir(), "pi-worker-termination-recovery-"));
+  const worker = {
+    id: "termination-recovery-job",
+    jobDir,
+    tabWorktreeId: "/worktree",
+    tabId: "eeeeeeee-1111-4222-8333-ffffffffffff",
+    surfaceId: SECOND.surfaceId,
+    launchNonce: "termination-recovery-nonce",
+  };
+  let surfacePresent = true;
+  try {
+    await writeFile(join(jobDir, "job.json"), `${JSON.stringify({ workerLaunchClaimVersion: 1 })}\n`);
+    await claimWorkerTerminationIntent(worker, "timeout", "original timeout winner crashed");
+    const result = await terminateWorker({
+      exec: async (_command, args) => {
+        if (args[0] === "tab" && args[1] === "list") {
+          return { stdout: `${worker.tabId}\n`, stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "list") {
+          return { stdout: surfacePresent ? `${worker.surfaceId}\n` : "", stderr: "", code: 0, killed: false };
+        }
+        if (args[0] === "surface" && args[1] === "close") {
+          surfacePresent = false;
+          return { stdout: "", stderr: "", code: 0, killed: false };
+        }
+        return { stdout: "", stderr: "unexpected command", code: 1, killed: false };
+      },
+    }, worker, undefined, { owner: "recovery", reason: "resume cleanup" });
+    assert.equal(result.verified, true);
+    assert.equal(result.terminationOwner, "timeout");
+    assert.equal(result.terminationReason, "original timeout winner crashed");
+    assert.equal(surfacePresent, false);
+  } finally {
+    await rm(jobDir, { recursive: true, force: true });
+  }
 });
 
 test("recovery wins the durable launch claim before closing a surface whose runner never started", async () => {

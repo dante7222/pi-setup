@@ -18,6 +18,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+  MAX_REVIEW_EVIDENCE_BYTES,
+  MAX_REVIEW_EVIDENCE_LINES,
+  boundedArtifactText,
+} from "./artifact-limits.ts";
+import {
   applyPreparedDelegateHandoff,
   discardPreparedDelegateHandoff,
   formatDelegateHandoffPreview,
@@ -47,6 +52,18 @@ import {
   ensureDirectoryDurable,
   readJsonStrict,
 } from "./durable-state.ts";
+import { execRejectKilled } from "./exec-result.ts";
+import {
+  captureReviewerProcessEvidence,
+  captureValidationProcessEvidence,
+  loopCheckFingerprint,
+  publishLoopAcceptance,
+  readVerifiedLoopAcceptance,
+  writeLoopPolicy,
+  type BoundProcessEvidence,
+  type BoundReviewerProcessEvidence,
+  type LoopAcceptanceIntent,
+} from "./loop-acceptance.ts";
 import {
   decideLoopTransition,
   normalizeValidationCommand,
@@ -81,6 +98,14 @@ import {
   type RunnerProcessRecord,
   type WorkerTerminalRecord,
 } from "./lifecycle.ts";
+import {
+  acquireOrchestratorLease,
+  acquireOrchestratorRecoveryLease,
+  authorizeOrchestratorRecovery,
+  type OrchestratorLease,
+  type OrchestratorRecoveryAuthorization,
+  type OrchestratorRecoveryLease,
+} from "./orchestrator-lease.ts";
 import { resolvePermissionConfigPath } from "./permission-config.ts";
 import {
   captureProcessIdentity,
@@ -112,14 +137,18 @@ import {
   ValidationProcessFailure,
   type ValidationProcessResult,
 } from "./validation-process.ts";
+import { escapeTerminalText } from "./terminal-text.ts";
 import { aggregateUsage } from "./usage.ts";
 import {
+  claimWorkerTerminationIntent,
   observeWorkerSurfaces,
+  readWorkerTerminationIntent,
   reconcileWorkerSurfaceCreation,
   terminateRecordedProcess,
   terminateWorker,
   verifyWorkerProcessesAbsent,
   type SurfaceObservationState,
+  type WorkerTerminationOwner,
   type WorkerTerminationResult,
 } from "./worker-supervisor.ts";
 import { codingWorktreeName } from "./worktree-name.ts";
@@ -128,6 +157,13 @@ const WORKER_JOB_ENV = "PI_SUPACODE_SUBAGENT_JOB_DIR";
 const PERMISSION_CONFIG_ENV = "PI_PERMISSION_CONFIG";
 const PERMISSION_YOLO_ENV = "VENTRIS_PI_PERMISSION_YOLO";
 const MAX_PARALLEL = 8;
+const MAX_TASK_LENGTH = 64 * 1024;
+const MAX_REVIEW_FOCUS_LENGTH = 16 * 1024;
+const MAX_TITLE_LENGTH = 256;
+const MAX_MODEL_LENGTH = 256;
+const MAX_SKILL_PATH_LENGTH = 4096;
+const RESEARCH_RETENTION_DAYS = 30;
+const RESEARCH_RETENTION_MAX_JOBS = 100;
 const DEFAULT_TIMEOUT_SECONDS = 15 * 60;
 const WORKER_STARTUP_TIMEOUT_MS = 60_000;
 const POLL_INTERVAL_MS = 250;
@@ -143,6 +179,11 @@ const MAX_LOOP_ATTEMPTS = 5;
 const MAX_LOOP_CHECKS = 10;
 const MAX_LOOP_REVIEWERS = 4;
 const MAX_CHECK_LOG_BYTES = 5 * 1024 * 1024;
+const MAX_WORKER_STDERR_BYTES = 5 * 1024 * 1024;
+const MAX_SUPACODE_STDOUT_BYTES = 1024 * 1024;
+const MAX_DETAIL_GIT_COMMITS = 100;
+const MAX_DETAIL_GIT_PATHS = 500;
+const MAX_DETAIL_GIT_STATUS_BYTES = 32 * 1024;
 const CHECK_OUTPUT_TAIL_BYTES = 16 * 1024;
 const RESEARCH_TOOLS = "read,rg,find,ls";
 const CODING_TOOLS = "read,bash,edit,write,rg,find,ls";
@@ -150,6 +191,7 @@ const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const OBJECT_ID_PATTERN = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i;
 const CREATION_COMPLETION_WRITER_PATH = fileURLToPath(new URL("./creation-complete.mjs", import.meta.url));
+const BOUNDED_EXEC_PATH = fileURLToPath(new URL("./bounded-exec.mjs", import.meta.url));
 
 class EvaluatorRecoveryFailure extends Error {
   constructor(message: string) {
@@ -233,6 +275,8 @@ interface WorkerJob {
   runnerMetadataPath: string;
   runnerExitPath: string;
   launchNonce: string;
+  orchestratorLeaseVersion: 1;
+  orchestratorOwnerToken: string;
   workerLaunchClaimVersion: 1;
   surfaceCreationProtocolVersion: 1;
   worktreeCreationProtocolVersion?: 1;
@@ -249,6 +293,7 @@ interface WorkerJob {
   baseSha?: string;
   tabId: string;
   surfaceId: string;
+  deadlineAt?: number;
 }
 
 type PreparedWorkerJob = Omit<WorkerJob, "tabId" | "surfaceId">;
@@ -285,6 +330,7 @@ type ExtensionAPIWithLaunchTestHook = ExtensionAPI & {
     options: SupacodeLaunchOptions,
   ) => Promise<SupacodeLaunchResult>;
   __supacodePiExecutableForTests?: string;
+  __supacodeExecutableForTests?: string;
   __supacodePublishWorkerReportForTests?: (
     jobDir: string,
     jobId: string,
@@ -374,6 +420,7 @@ interface LoopCheckResult {
   killed: boolean;
   timedOut: boolean;
   terminationVerified: boolean;
+  process?: BoundProcessEvidence;
   outputBytes: number;
   logBytes: number;
   logTruncated: boolean;
@@ -387,13 +434,6 @@ interface LoopCheckResult {
 
 type LoopCandidateEvidence = LoopCandidate;
 
-interface LoopAcceptanceIntent {
-  schemaVersion: 2;
-  jobId: string;
-  candidate: LoopCandidate;
-  createdAt: string;
-}
-
 interface LoopReviewResult {
   profileId: string;
   title: string;
@@ -404,6 +444,7 @@ interface LoopReviewResult {
   usage?: Usage;
   before: CandidateAttestation;
   after: CandidateAttestation;
+  process?: BoundReviewerProcessEvidence;
 }
 
 interface LoopIterationRecord {
@@ -437,6 +478,11 @@ interface LoopWorkspace {
   projectTrusted: boolean;
   piRuntime: PiRuntime;
   permissionConfigPath?: string;
+  policyPath: string;
+  policySha256: string;
+  orchestratorLeaseVersion: 1;
+  orchestratorOwnerToken: string;
+  orchestratorLease: OrchestratorLease;
   createdAt: string;
 }
 
@@ -474,7 +520,7 @@ function isoNow(): string {
 }
 
 function sanitizeTitle(value: string): string {
-  const cleaned = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  const cleaned = escapeTerminalText(value).replace(/\s+/g, " ").trim();
   return (cleaned || "delegated task").slice(0, 60);
 }
 
@@ -557,8 +603,63 @@ function resolveReviewerSkillPaths(profileId: string, configuredPaths: string[])
 function terminalLifecyclePhase(status: WorkerStatus): "completed" | "failed" | "timed_out" | "cancelled" {
   if (status.state === "completed") return "completed";
   if (status.stopReason === "timeout") return "timed_out";
-  if (status.stopReason === "cancelled" || status.stopReason === "aborted") return "cancelled";
+  if (["cancelled", "aborted", "manual_close"].includes(status.stopReason ?? "")) return "cancelled";
   return "failed";
+}
+
+function terminationSettlement(
+  termination: WorkerTerminationResult,
+  running: WorkerStatus | undefined,
+  launchNonce: string,
+  fallbackOwner: WorkerTerminationOwner,
+  fallbackReason: string,
+): {
+  status: WorkerStatus;
+  terminalOwner: WorkerTerminalRecord["owner"];
+  phase: "failed" | "timed_out" | "cancelled";
+  reason: string;
+} {
+  const owner = termination.terminationOwner ?? fallbackOwner;
+  const reason = termination.terminationReason ?? fallbackReason;
+  const terminalOwner: WorkerTerminalRecord["owner"] = owner === "timeout"
+    ? "timeout"
+    : owner === "cancel"
+      ? "cancel"
+      : owner === "abort" || owner === "manual"
+        ? "abort"
+        : "recovery";
+  const stopReason = owner === "timeout"
+    ? "timeout"
+    : owner === "cancel"
+      ? "cancelled"
+      : owner === "manual"
+        ? "manual_close"
+        : owner === "abort"
+          ? "aborted"
+          : owner === "launch_failure"
+            ? "launch_failed"
+            : owner === "batch_failure"
+              ? "batch_launch_failed"
+              : owner === "apply_cleanup"
+                ? "apply_cleanup"
+                : "recovered_termination";
+  const status = {
+    state: "failed",
+    pid: running?.pid,
+    processIdentity: running?.processIdentity,
+    launchNonce: running?.launchNonce ?? launchNonce,
+    completedAt: isoNow(),
+    stopReason,
+    errorMessage: reason,
+    termination,
+  } satisfies WorkerStatus;
+  return {
+    status,
+    terminalOwner,
+    phase: owner === "timeout" ? "timed_out" :
+      owner === "cancel" || owner === "abort" || owner === "manual" ? "cancelled" : "failed",
+    reason,
+  };
 }
 
 async function readAuthenticatedRunnerExit(
@@ -601,12 +702,34 @@ async function readText(filePath: string): Promise<string> {
   }
 }
 
+async function appendBoundedArtifact(
+  filePath: string,
+  value: string,
+  maxBytes: number,
+): Promise<void> {
+  const existing = await readText(filePath);
+  await atomicWrite(
+    filePath,
+    boundedArtifactText(`${existing}${value}`, maxBytes, 100_000),
+  );
+}
+
 async function filePathExists(filePath: string): Promise<boolean> {
   try {
     await fs.promises.access(filePath);
     return true;
   } catch {
     return false;
+  }
+}
+
+async function lexicalPathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.promises.lstat(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }
 
@@ -628,7 +751,7 @@ async function recordSupacodeCreationNotStarted(
   );
 }
 
-async function runSupacodeCreation(
+export async function runSupacodeCreation(
   pi: ExtensionAPI,
   args: string[],
   cwd: string,
@@ -656,8 +779,9 @@ async function runSupacodeCreation(
   if (testHook) {
     const result = await testHook(args, { signal, timeout: timeoutMs });
     await recordCompletion(true, result.code);
-    if (result.code !== 0) {
-      throw new Error((result.stderr || result.stdout || `Supacode exited with ${result.code}`).trim());
+    if (result.killed || result.code !== 0) {
+      throw new Error((result.stderr || result.stdout ||
+        `Supacode ${result.killed ? "was terminated" : `exited with ${result.code}`}`).trim());
     }
     stdout = result.stdout;
   } else {
@@ -673,9 +797,26 @@ async function runSupacodeCreation(
       await recordCompletion(false, 74);
       throw error;
     }
+    const supacodeExecutable = (pi as ExtensionAPIWithLaunchTestHook).__supacodeExecutableForTests ?? "supacode";
+    const captureConfiguration = JSON.stringify({
+      stdout: {
+        mode: "capture",
+        path: stdoutPath,
+        maxBytes: MAX_SUPACODE_STDOUT_BYTES,
+        append: false,
+        mirror: false,
+      },
+      stderr: {
+        mode: "capture",
+        path: stderrPath,
+        maxBytes: MAX_WORKER_STDERR_BYTES,
+        append: false,
+        mirror: false,
+      },
+    });
     const command = [
       "set +e",
-      `${["supacode", ...args].map(shellQuote).join(" ")} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}`,
+      `${["node", BOUNDED_EXEC_PATH, captureConfiguration, "--", supacodeExecutable, ...args].map(shellQuote).join(" ")}`,
       "SUPACODE_EXIT_CODE=$?",
       `node ${shellQuote(CREATION_COMPLETION_WRITER_PATH)} ${shellQuote(launchDir)} ${shellQuote(launchJobId)} ${shellQuote(launchNonce)} "$SUPACODE_EXIT_CODE" || exit 76`,
       "exit $SUPACODE_EXIT_CODE",
@@ -1070,6 +1211,26 @@ export function buildRunner(job: PreparedWorkerJob): string {
   args.push(`@${job.promptPath}`, "Complete the delegated task described in the attached prompt.");
 
   const command = args.map(shellQuote).join(" ");
+  const stderrCaptureConfiguration = JSON.stringify({
+    stdout: { mode: "inherit" },
+    stderr: {
+      mode: "capture",
+      path: job.stderrPath,
+      maxBytes: MAX_WORKER_STDERR_BYTES,
+      append: true,
+      mirror: "stderr",
+    },
+  });
+  const diagnosticCaptureConfiguration = JSON.stringify({
+    stdout: {
+      mode: "capture",
+      path: job.stderrPath,
+      maxBytes: MAX_WORKER_STDERR_BYTES,
+      append: true,
+      mirror: "stderr",
+    },
+    stderr: { mode: "inherit" },
+  });
   return `#!/bin/zsh
 set -u
 JOB_DIR=${shellQuote(job.jobDir)}
@@ -1083,16 +1244,16 @@ touch "$STDERR_PATH"
 node ${shellQuote(job.runnerMetadataPath)} start || exit 73
 printf '\\n[supacode-subagent %s] %s\\n\\n' ${shellQuote(job.batchId.slice(0, 4))} ${shellQuote(job.title)}
 set +e
-PI_RUNTIME_VERSION=$("$PI_EXECUTABLE" --version 2> >(tee -a "$STDERR_PATH" >&2))
+PI_RUNTIME_VERSION=$(node ${shellQuote(BOUNDED_EXEC_PATH)} ${shellQuote(stderrCaptureConfiguration)} -- "$PI_EXECUTABLE" --version)
 VERSION_EXIT_CODE=$?
 if (( VERSION_EXIT_CODE != 0 )); then
-  printf 'Pi runtime preflight failed with exit code %s.\\n' "$VERSION_EXIT_CODE" | tee -a "$STDERR_PATH" >&2
+  node ${shellQuote(BOUNDED_EXEC_PATH)} ${shellQuote(diagnosticCaptureConfiguration)} -- /usr/bin/printf 'Pi runtime preflight failed with exit code %s.\\n' "$VERSION_EXIT_CODE" || true
   EXIT_CODE=74
 elif [[ "$PI_RUNTIME_VERSION" != "$EXPECTED_PI_VERSION" ]]; then
-  printf 'Pi runtime changed after worker preparation: expected %s, found %s. Restart the parent Pi session.\\n' "$EXPECTED_PI_VERSION" "$PI_RUNTIME_VERSION" | tee -a "$STDERR_PATH" >&2
+  node ${shellQuote(BOUNDED_EXEC_PATH)} ${shellQuote(diagnosticCaptureConfiguration)} -- /usr/bin/printf 'Pi runtime changed after worker preparation: expected %s, found %s. Restart the parent Pi session.\\n' "$EXPECTED_PI_VERSION" "$PI_RUNTIME_VERSION" || true
   EXIT_CODE=74
 else
-  ${command} 2> >(tee -a "$STDERR_PATH" >&2)
+  node ${shellQuote(BOUNDED_EXEC_PATH)} ${shellQuote(stderrCaptureConfiguration)} -- ${command}
   EXIT_CODE=$?
 fi
 node ${shellQuote(job.runnerMetadataPath)} exit "$EXIT_CODE" || true
@@ -1123,7 +1284,7 @@ async function execChecked(
   args: string[],
   options: { cwd?: string; signal?: AbortSignal; timeout?: number } = {},
 ): Promise<string> {
-  const result = await pi.exec(command, args, options);
+  const result = await execRejectKilled(pi, command, args, options);
   if (result.code !== 0) {
     const diagnostic = (result.stderr || result.stdout || `exit ${result.code}`).trim();
     throw new Error(`${command} ${args.join(" ")} failed: ${diagnostic}`);
@@ -1202,6 +1363,9 @@ async function ensureRepositoryKnown(
 }
 
 interface CodingWorktreePlan {
+  jobId: string;
+  batchId: string;
+  provenanceToken: string;
   repoRoot: string;
   relativeCwd: string;
   branch: string;
@@ -1213,6 +1377,92 @@ interface SupacodeCreationIntent {
   launchDir: string;
   launchJobId: string;
   launchNonce: string;
+}
+
+interface WorktreeProvenanceRecord {
+  schemaVersion: 2;
+  protocolVersion: 1;
+  jobId: string;
+  batchId: string;
+  provenanceToken: string;
+  creationLaunchNonce: string;
+  worktreeId: string;
+  worktreePath: string;
+  branch: string;
+  baseSha: string;
+  state: "observed" | "authenticated";
+  observedAt: string;
+  authenticatedAt?: string;
+}
+
+async function writeWorktreeProvenance(
+  jobDir: string,
+  plan: CodingWorktreePlan,
+  creation: SupacodeCreationIntent,
+  worktreeId: string,
+  worktreePath: string,
+  state: WorktreeProvenanceRecord["state"],
+): Promise<WorktreeProvenanceRecord> {
+  const filePath = path.join(jobDir, "worktree-provenance.json");
+  const existing = await readJson<WorktreeProvenanceRecord>(filePath);
+  const record = {
+    schemaVersion: SUBAGENT_SCHEMA_VERSION,
+    protocolVersion: 1,
+    jobId: plan.jobId,
+    batchId: plan.batchId,
+    provenanceToken: plan.provenanceToken,
+    creationLaunchNonce: creation.launchNonce,
+    worktreeId,
+    worktreePath,
+    branch: plan.branch,
+    baseSha: plan.baseSha,
+    state,
+    observedAt: existing?.observedAt ?? isoNow(),
+    authenticatedAt: state === "authenticated" ? isoNow() : undefined,
+  } satisfies WorktreeProvenanceRecord;
+  if (existing && (
+    existing.schemaVersion !== SUBAGENT_SCHEMA_VERSION || existing.protocolVersion !== 1 ||
+    existing.jobId !== record.jobId || existing.batchId !== record.batchId ||
+    existing.provenanceToken !== record.provenanceToken ||
+    existing.creationLaunchNonce !== record.creationLaunchNonce ||
+    existing.worktreeId !== record.worktreeId || existing.worktreePath !== record.worktreePath ||
+    existing.branch !== record.branch || existing.baseSha !== record.baseSha ||
+    (existing.state === "authenticated" && state !== "authenticated")
+  )) throw new Error(`Worktree provenance changed after observation: ${filePath}`);
+  await atomicWrite(filePath, `${JSON.stringify(record, null, 2)}\n`);
+  return record;
+}
+
+async function readWorktreeProvenance(
+  jobDir: string,
+  plan: CodingWorktreePlan,
+  creation: SupacodeCreationIntent,
+): Promise<WorktreeProvenanceRecord | undefined> {
+  const filePath = path.join(jobDir, "worktree-provenance.json");
+  const record = await readJson<WorktreeProvenanceRecord>(filePath);
+  if (!record) return undefined;
+  if (
+    record.schemaVersion !== SUBAGENT_SCHEMA_VERSION || record.protocolVersion !== 1 ||
+    record.jobId !== plan.jobId || record.batchId !== plan.batchId ||
+    record.provenanceToken !== plan.provenanceToken ||
+    record.creationLaunchNonce !== creation.launchNonce ||
+    typeof record.worktreeId !== "string" || !record.worktreeId ||
+    !path.isAbsolute(record.worktreePath) || record.branch !== plan.branch ||
+    record.baseSha !== plan.baseSha ||
+    (record.state !== "observed" && record.state !== "authenticated") ||
+    typeof record.observedAt !== "string" ||
+    (record.state === "authenticated" && typeof record.authenticatedAt !== "string")
+  ) throw new Error(`Unsupported worktree provenance at ${filePath}.`);
+  const decodedResourcePath = decodeSupacodeResourceId(record.worktreeId);
+  if (!path.isAbsolute(decodedResourcePath)) {
+    throw new Error(`Worktree provenance Supacode identity is not an absolute path: ${filePath}`);
+  }
+  const decodedPath = await canonicalizeMissingPath(decodedResourcePath);
+  const recordedPath = await canonicalizeMissingPath(record.worktreePath);
+  if (decodedPath !== recordedPath || recordedPath !== record.worktreePath) {
+    throw new Error(`Worktree provenance path does not match its Supacode identity: ${filePath}`);
+  }
+  return record;
 }
 
 async function planCodingWorktree(
@@ -1239,9 +1489,12 @@ async function planCodingWorktree(
     }
   }
   return {
+    jobId,
+    batchId,
+    provenanceToken: randomUUID(),
     repoRoot,
     relativeCwd,
-    branch: `pi-agent/${batchId.slice(0, 6)}/${jobId.slice(0, 6)}`,
+    branch: `pi-agent/${batchId}/${jobId}`,
     folderName: codingWorktreeName(title, jobId),
     baseSha,
   };
@@ -1379,6 +1632,7 @@ async function prepareWorker(
   batchTitle: string,
   id: string,
   yolo: boolean,
+  lease: OrchestratorLease,
   signal: AbortSignal | undefined,
 ): Promise<PreparedWorkerJob> {
   const title = taskTitle(spec.task, spec.title);
@@ -1405,10 +1659,16 @@ async function prepareWorker(
       originalCwd: ctxCwd,
       workerCwd: spec.workingDirectory ?? ctxCwd,
       launchNonce,
+      orchestratorLeaseVersion: 1,
+      orchestratorOwnerToken: lease.ownerToken,
       createdAt,
     }, null, 2)}\n`,
   );
-  await initializeJobLifecycle(jobDir, id, batchId, "planned", { mode: spec.mode });
+  await initializeJobLifecycle(jobDir, id, batchId, "planned", {
+    mode: spec.mode,
+    orchestratorLeaseVersion: 1,
+    orchestratorOwnerToken: lease.ownerToken,
+  });
   let worktreePlan: CodingWorktreePlan | undefined;
   try {
     worktreePlan = spec.mode === "coding"
@@ -1435,6 +1695,8 @@ async function prepareWorker(
         branch: worktreePlan.branch,
         baseSha: worktreePlan.baseSha,
         worktreeCreationProtocolVersion: 1,
+        worktreeProvenanceVersion: 1,
+        worktreeProvenanceToken: worktreePlan.provenanceToken,
         worktreeLaunchDir: worktreeCreation.launchDir,
         worktreeLaunchJobId: worktreeCreation.launchJobId,
         worktreeLaunchNonce: worktreeCreation.launchNonce,
@@ -1456,6 +1718,8 @@ async function prepareWorker(
     await updateJobLifecycle(jobDir, "provisioning_worktree", undefined, {
       workspacePlan: worktreePlan,
       worktreeCreationProtocolVersion: 1,
+      worktreeProvenanceVersion: 1,
+      worktreeProvenanceToken: worktreePlan.provenanceToken,
       worktreeLaunchDir: worktreeCreation.launchDir,
       worktreeLaunchJobId: worktreeCreation.launchJobId,
       worktreeLaunchNonce: worktreeCreation.launchNonce,
@@ -1467,6 +1731,14 @@ async function prepareWorker(
         worktreeCreation,
         signal,
         async (observedCodeWorktreeId, observedWorktreePath) => {
+          await writeWorktreeProvenance(
+            jobDir,
+            worktreePlan,
+            worktreeCreation,
+            observedCodeWorktreeId,
+            observedWorktreePath,
+            "observed",
+          );
           const metadata = await readJson<Record<string, unknown>>(path.join(jobDir, "job.json")) ?? {};
           await atomicWrite(
             path.join(jobDir, "job.json"),
@@ -1483,6 +1755,14 @@ async function prepareWorker(
             worktreeAuthenticationState: "pending",
           });
         },
+      );
+      await writeWorktreeProvenance(
+        jobDir,
+        worktreePlan,
+        worktreeCreation,
+        worktree.id,
+        worktree.worktreePath,
+        "authenticated",
       );
       codeWorktreeId = worktree.id;
       workerCwd = worktree.workerCwd;
@@ -1558,6 +1838,8 @@ async function prepareWorker(
     runnerMetadataPath,
     runnerExitPath,
     launchNonce,
+    orchestratorLeaseVersion: 1,
+    orchestratorOwnerToken: lease.ownerToken,
     workerLaunchClaimVersion: 1,
     surfaceCreationProtocolVersion: 1,
     worktreeCreationProtocolVersion: worktreeCreation ? 1 : undefined,
@@ -1621,6 +1903,8 @@ async function writeJobMetadata(
       originalCwd: job.originalCwd,
       workerCwd: job.workerCwd,
       launchNonce: job.launchNonce,
+      orchestratorLeaseVersion: job.orchestratorLeaseVersion,
+      orchestratorOwnerToken: job.orchestratorOwnerToken,
       workerLaunchClaimVersion: job.workerLaunchClaimVersion,
       surfaceCreationProtocolVersion: job.surfaceCreationProtocolVersion,
       worktreeCreationProtocolVersion: job.worktreeCreationProtocolVersion,
@@ -1637,6 +1921,7 @@ async function writeJobMetadata(
       baseSha: job.baseSha,
       tabId: "tabId" in job ? job.tabId : undefined,
       surfaceId: "surfaceId" in job ? job.surfaceId : undefined,
+      deadlineAt: "deadlineAt" in job ? job.deadlineAt : undefined,
       createdAt: existing.createdAt ?? isoNow(),
       ...extra,
     }, null, 2)}\n`,
@@ -1764,7 +2049,8 @@ export async function closeBatchAnchor(
   }
 
   const closed = stablePresence === "present"
-    ? await pi.exec(
+    ? await execRejectKilled(
+        pi,
         "supacode",
         [
           "surface",
@@ -1782,7 +2068,8 @@ export async function closeBatchAnchor(
   let confirmedMissing = 0;
   let confirmedTabAbsent = 0;
   for (let attempt = 0; attempt < 20; attempt++) {
-    const listed = await pi.exec(
+    const listed = await execRejectKilled(
+      pi,
       "supacode",
       ["surface", "list", "-w", batch.worktreeId, "-t", batch.tabId],
       { signal, timeout: 5000 },
@@ -1832,6 +2119,7 @@ async function createWorkerSurface(
   batch: WorkerBatch,
   prepared: PreparedWorkerJob,
   launched: WorkerJob[],
+  timeoutSeconds: number,
   signal?: AbortSignal,
   onPrepared?: (job: WorkerJob, batch: WorkerBatch) => Promise<void>,
 ): Promise<WorkerJob> {
@@ -1926,8 +2214,8 @@ async function createWorkerSurface(
       signal,
     );
   } catch (error) {
-    const termination = await closeWorkerSurface(pi, job);
     const message = error instanceof Error ? error.message : String(error);
+    const termination = await closeWorkerSurface(pi, job, "launch_failure", message);
     await updateJobLifecycle(
       job.jobDir,
       termination.verified ? "failed" : "recovery_required",
@@ -1937,7 +2225,12 @@ async function createWorkerSurface(
   }
   const returnedSurfaceId = lastNonEmptyLine(stdout);
   if (!sameSupacodeUuid(returnedSurfaceId, surfaceId)) {
-    const termination = await closeWorkerSurface(pi, job);
+    const termination = await closeWorkerSurface(
+      pi,
+      job,
+      "launch_failure",
+      "Supacode returned an unexpected surface ID.",
+    );
     await updateJobLifecycle(
       job.jobDir,
       termination.verified ? "failed" : "recovery_required",
@@ -1950,7 +2243,12 @@ async function createWorkerSurface(
     readJobDecision(job.jobDir),
   ]);
   if (postLaunchControl || postLaunchDecision?.owner === "cancel") {
-    const termination = await closeWorkerSurface(pi, job);
+    const termination = await closeWorkerSurface(
+      pi,
+      job,
+      "cancel",
+      postLaunchControl?.reason ?? "Cancellation won during worker surface creation.",
+    );
     await atomicWrite(path.join(job.jobDir, "termination.json"), `${JSON.stringify(termination, null, 2)}\n`);
     await updateJobLifecycle(
       job.jobDir,
@@ -1989,10 +2287,17 @@ async function createWorkerSurface(
     if (!runnerReady) {
       throw new Error(`Worker ${job.id} surface exists, but its runner did not publish identity within 10 seconds.`);
     }
-    await updateJobLifecycle(job.jobDir, "running");
+    job.deadlineAt = Date.now() + timeoutSeconds * 1000;
+    await writeJobMetadata(job, job.jobDir, { deadlineAt: job.deadlineAt });
+    await updateJobLifecycle(job.jobDir, "running", undefined, { deadlineAt: job.deadlineAt });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const termination = await closeWorkerSurface(pi, job);
+    const termination = await closeWorkerSurface(
+      pi,
+      job,
+      signal?.aborted ? "abort" : "launch_failure",
+      message,
+    );
     let terminationPersisted = true;
     try {
       await atomicWrite(
@@ -2002,14 +2307,20 @@ async function createWorkerSurface(
     } catch {
       terminationPersisted = false;
     }
+    const settlement = terminationSettlement(
+      termination,
+      await readJson<WorkerStatus>(job.statusPath),
+      job.launchNonce,
+      signal?.aborted ? "abort" : "launch_failure",
+      message,
+    );
     try {
       await updateJobLifecycle(
         job.jobDir,
-        termination.verified && terminationPersisted && signal?.aborted ? "cancelled" :
-          termination.verified && terminationPersisted ? "failed" : "recovery_required",
+        termination.verified && terminationPersisted ? settlement.phase : "recovery_required",
         termination.verified && terminationPersisted
-          ? message
-          : `${message} ${termination.errors.join(" ")} ${terminationPersisted ? "" : "Termination result could not be persisted."}`.trim(),
+          ? settlement.reason
+          : `${settlement.reason} ${termination.errors.join(" ")} ${terminationPersisted ? "" : "Termination result could not be persisted."}`.trim(),
       );
     } catch {
       // The durable launching intent and exact resource IDs remain for explicit recovery.
@@ -2022,10 +2333,17 @@ async function createWorkerSurface(
 async function closeWorkerSurface(
   pi: ExtensionAPI,
   job: WorkerJob,
+  owner: "launch_failure" | "cancel" | "abort",
+  reason: string,
 ): Promise<WorkerTerminationResult> {
   try {
     const status = await readJson<WorkerStatus>(job.statusPath);
-    const termination = await terminateWorker(pi, job, status?.processIdentity);
+    const termination = await terminateWorker(
+      pi,
+      job,
+      status?.processIdentity,
+      { owner, reason },
+    );
     await atomicWrite(
       path.join(job.jobDir, "termination.json"),
       `${JSON.stringify(termination, null, 2)}\n`,
@@ -2065,12 +2383,17 @@ async function terminateWorkerAfterBatchFailure(
     readJobControl(job.jobDir),
     readJobDecision(job.jobDir),
   ]);
-  const cancelled = parentAborted || control !== undefined || decision?.owner === "cancel";
+  const requestedOwner: WorkerTerminationOwner = parentAborted
+    ? "abort"
+    : control !== undefined || decision?.owner === "cancel"
+      ? "cancel"
+      : "batch_failure";
   await updateJobLifecycle(job.jobDir, "stopping", reason);
   const termination = await terminateWorker(
     pi,
     job,
     existingTerminal?.status.processIdentity ?? status?.processIdentity,
+    { owner: requestedOwner, reason },
   );
   await atomicWrite(
     path.join(job.jobDir, "termination.json"),
@@ -2095,27 +2418,24 @@ async function terminateWorkerAfterBatchFailure(
     );
     return { verified: true };
   }
-  const terminalStatus = {
-    state: "failed",
-    pid: status?.pid,
-    processIdentity: status?.processIdentity,
-    launchNonce: job.launchNonce,
-    completedAt: isoNow(),
-    stopReason: cancelled ? "aborted" : "batch_launch_failed",
-    errorMessage: reason,
+  const settlement = terminationSettlement(
     termination,
-  } satisfies WorkerStatus;
-  await claimWorkerTerminal(
+    status,
+    job.launchNonce,
+    requestedOwner,
+    reason,
+  );
+  const winningTerminal = await claimWorkerTerminal(
     job.jobDir,
     job.id,
-    cancelled ? "abort" : "recovery",
-    terminalStatus,
-    reason,
+    settlement.terminalOwner,
+    settlement.status,
+    settlement.reason,
   );
   await reconcileJobLifecycle(
     job.jobDir,
-    terminalLifecyclePhase(terminalStatus),
-    reason,
+    terminalLifecyclePhase(winningTerminal.record.status),
+    winningTerminal.record.status.errorMessage ?? settlement.reason,
   );
   return { verified: true };
 }
@@ -2196,7 +2516,8 @@ export async function closeBatchTab(
     });
   }
   const closed = presence === "present"
-    ? await pi.exec(
+    ? await execRejectKilled(
+        pi,
         "supacode",
         ["tab", "close", "-w", batch.worktreeId, "-t", batch.tabId],
         { timeout: CLEANUP_TIMEOUT_MS },
@@ -2375,6 +2696,11 @@ async function monitorBatchSurfaces(
             continue;
           }
         }
+        const existingTerminationIntent = await readWorkerTerminationIntent(job);
+        if (existingTerminationIntent && existingTerminationIntent.owner !== "manual") {
+          reported.add(missingId);
+          continue;
+        }
         const status = await readJson<WorkerStatus>(job.statusPath);
         const processes = await verifyWorkerProcessesAbsent(
           pi,
@@ -2383,7 +2709,13 @@ async function monitorBatchSurfaces(
           POLL_INTERVAL_MS,
         );
         if (!processes.absent) continue;
+        const terminationIntent = await claimWorkerTerminationIntent(
+          job,
+          "manual",
+          "Worker surface disappeared before orchestrator-owned termination began.",
+        );
         reported.add(missingId);
+        if (terminationIntent.record.owner !== "manual") continue;
         onClosed(job);
         return;
       }
@@ -2404,7 +2736,8 @@ async function collectGitSummary(
     const status = await gitOutput(pi, job.worktreePath, ["status", "--short"], signal);
     if (!job.baseSha) return { head, status, dirty: Boolean(status) };
 
-    const ancestor = await pi.exec(
+    const ancestor = await execRejectKilled(
+      pi,
       "git",
       ["-C", job.worktreePath, "merge-base", "--is-ancestor", job.baseSha, head],
       { signal, timeout: 30_000 },
@@ -2490,7 +2823,7 @@ async function waitForWorker(
   timeoutSeconds: number,
   signal: AbortSignal | undefined,
 ): Promise<WorkerResult> {
-  const deadline = Date.now() + timeoutSeconds * 1000;
+  const deadline = job.deadlineAt ?? Date.now() + timeoutSeconds * 1000;
   try {
     while (Date.now() < deadline) {
       if (signal?.aborted) throw new Error("Subagent operation aborted");
@@ -2515,27 +2848,37 @@ async function waitForWorker(
           pi,
           job,
           existingTerminal?.status.processIdentity ?? cancelledStatus.processIdentity,
+          { owner: "cancel", reason: cancellationReason },
         );
-        const finalStatus = { ...cancelledStatus, termination } satisfies WorkerStatus;
-        await atomicWrite(job.statusPath, `${JSON.stringify(finalStatus)}\n`);
+        const settlement = terminationSettlement(
+          termination,
+          runningStatus,
+          job.launchNonce,
+          "cancel",
+          cancellationReason,
+        );
         await atomicWrite(path.join(job.jobDir, "termination.json"), `${JSON.stringify(termination, null, 2)}\n`);
         if (!termination.verified) {
           await updateJobLifecycle(
             job.jobDir,
             "recovery_required",
-            `${cancellationReason} Worker termination is indeterminate.`,
+            `${settlement.reason} Worker termination is indeterminate.`,
           );
-          throw new Error(`${cancellationReason} Worker termination is indeterminate.`);
+          throw new Error(`${settlement.reason} Worker termination is indeterminate.`);
         }
         const claimed = await claimWorkerTerminal(
           job.jobDir,
           job.id,
-          "cancel",
-          cancelledStatus,
-          cancellationReason,
+          settlement.terminalOwner,
+          settlement.status,
+          settlement.reason,
         );
-        await reconcileJobLifecycle(job.jobDir, "cancelled", cancellationReason);
-        return workerResultFromTerminal(pi, job, claimed.record, signal, finalStatus);
+        await reconcileJobLifecycle(
+          job.jobDir,
+          terminalLifecyclePhase(claimed.record.status),
+          claimed.record.status.errorMessage ?? settlement.reason,
+        );
+        return workerResultFromTerminal(pi, job, claimed.record, signal, claimed.record.status);
       }
       let terminal = await readWorkerTerminal<WorkerStatus>(job.jobDir);
       const report = await readWorkerReport<WorkerStatus>(job.jobDir, job.id, job.launchNonce);
@@ -2617,6 +2960,7 @@ async function waitForWorker(
       pi,
       job,
       existingTerminal?.status.processIdentity ?? timeoutStatus.processIdentity,
+      { owner: "timeout", reason: timeoutMessage },
     );
     await atomicWrite(path.join(job.jobDir, "termination.json"), `${JSON.stringify(termination, null, 2)}\n`);
     if (!termination.verified) {
@@ -2650,17 +2994,26 @@ async function waitForWorker(
       }
       return workerResultFromTerminal(pi, job, existingTerminal, signal, winnerStatus);
     }
+    const settlement = terminationSettlement(
+      termination,
+      running,
+      job.launchNonce,
+      "timeout",
+      timeoutMessage,
+    );
     const claimed = await claimWorkerTerminal(
       job.jobDir,
       job.id,
-      "timeout",
-      timeoutStatus,
-      timeoutMessage,
+      settlement.terminalOwner,
+      settlement.status,
+      settlement.reason,
     );
-    const persistedStatus = { ...timeoutStatus, termination } satisfies WorkerStatus;
-    await atomicWrite(job.statusPath, `${JSON.stringify(persistedStatus)}\n`);
-    await reconcileJobLifecycle(job.jobDir, "timed_out", timeoutMessage);
-    return workerResultFromTerminal(pi, job, claimed.record, signal, persistedStatus);
+    await reconcileJobLifecycle(
+      job.jobDir,
+      terminalLifecyclePhase(claimed.record.status),
+      claimed.record.status.errorMessage ?? settlement.reason,
+    );
+    return workerResultFromTerminal(pi, job, claimed.record, signal, claimed.record.status);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const running = await readJson<WorkerStatus>(job.statusPath);
@@ -2679,6 +3032,7 @@ async function waitForWorker(
       pi,
       job,
       existingTerminal?.status.processIdentity ?? status.processIdentity,
+      { owner: "abort", reason: message },
     );
     await atomicWrite(path.join(job.jobDir, "termination.json"), `${JSON.stringify(termination, null, 2)}\n`);
     if (!termination.verified) {
@@ -2689,18 +3043,31 @@ async function waitForWorker(
       );
       throw new Error(`${message} Worker termination is indeterminate: ${termination.errors.join(" ")}`);
     }
+    const settlement = terminationSettlement(
+      termination,
+      running,
+      job.launchNonce,
+      "abort",
+      message,
+    );
     let terminal = existingTerminal;
     if (!terminal) {
       try {
-        terminal = (await claimWorkerTerminal(job.jobDir, job.id, "abort", status, message)).record;
+        terminal = (await claimWorkerTerminal(
+          job.jobDir,
+          job.id,
+          settlement.terminalOwner,
+          settlement.status,
+          settlement.reason,
+        )).record;
       } catch (claimError) {
         const claimFailure = claimError instanceof Error ? claimError.message : String(claimError);
         await updateJobLifecycle(
           job.jobDir,
           "recovery_required",
-          `${message} Terminal claim failed after verified termination: ${claimFailure}`,
+          `${settlement.reason} Terminal claim failed after verified termination: ${claimFailure}`,
         );
-        throw new Error(`${message} Terminal claim failed after verified termination: ${claimFailure}`);
+        throw new Error(`${settlement.reason} Terminal claim failed after verified termination: ${claimFailure}`);
       }
     }
     const runnerExit = await readAuthenticatedRunnerExit(job.jobDir, job.id, job.launchNonce);
@@ -2714,8 +3081,8 @@ async function waitForWorker(
     }
     await reconcileJobLifecycle(
       job.jobDir,
-      existingTerminal ? terminalLifecyclePhase(terminal.status) : "cancelled",
-      existingTerminal ? terminal.status.errorMessage : message,
+      terminalLifecyclePhase(terminal.status),
+      terminal.status.errorMessage ?? settlement.reason,
     );
     throw error;
   }
@@ -2769,6 +3136,8 @@ async function prepareLoopWorkerAttempt(
     runnerMetadataPath,
     runnerExitPath,
     launchNonce,
+    orchestratorLeaseVersion: workspace.orchestratorLeaseVersion,
+    orchestratorOwnerToken: workspace.orchestratorOwnerToken,
     workerLaunchClaimVersion: 1,
     surfaceCreationProtocolVersion: 1,
     tabWorktreeId: workspace.codeWorktreeId,
@@ -2824,6 +3193,7 @@ async function runPreparedWorkerAttempt(
       batch,
       prepared,
       [],
+      timeoutSeconds,
       signal,
       async (launchedJob, launchedBatch) => {
         job = launchedJob;
@@ -2947,6 +3317,8 @@ async function runLoopChecks(
     const gateDir = path.join(iterationDir, "checks", String(index + 1).padStart(2, "0"));
     const checkoutPath = path.join(gateDir, "checkout");
     const logPath = path.join(gateDir, "check.log");
+    const processJobId = `${workspace.id}-check-${candidate.attempt}-${index + 1}`;
+    const processLaunchNonce = randomUUID();
     const before = await createCandidateCheckout(
       pi,
       workspace.worktreePath,
@@ -2961,8 +3333,6 @@ async function runLoopChecks(
     let safeToRemove = true;
     try {
       await atomicWrite(logPath, `Candidate tree: ${candidate.tree}\nCommand: ${check.command}\n\n`);
-      const processJobId = `${workspace.id}-check-${candidate.attempt}-${index + 1}`;
-      const processLaunchNonce = randomUUID();
       await recordValidationGateIntent(gateDir, processJobId, processLaunchNonce);
       await recordCandidateEvaluatorProcessIntent(checkoutPath, processJobId, processLaunchNonce);
       await updateJobLifecycle(workspace.jobDir, "running", undefined, {
@@ -3015,7 +3385,11 @@ async function runLoopChecks(
         safeToRemove = !(error instanceof ValidationProcessFailure) || error.terminationVerified;
         if (signal?.aborted || !safeToRemove) throw error;
         const message = error instanceof Error ? error.message : String(error);
-        await fs.promises.appendFile(logPath, `\nValidation runner error: ${message}\n`, "utf8");
+        await appendBoundedArtifact(
+          logPath,
+          `\nValidation runner error: ${message}\n`,
+          MAX_CHECK_LOG_BYTES,
+        );
         executed = {
           exitCode: 1,
           killed: false,
@@ -3064,27 +3438,41 @@ async function runLoopChecks(
       : "";
     const mutationNotice = after.unchanged
       ? ""
-      : `\n[check mutated its candidate checkout: ${after.statusPaths.join(", ") || "tree or HEAD changed"}]`;
-    await fs.promises.appendFile(
+      : `\n[check mutated its candidate checkout: ${after.statusPaths.slice(0, 100).join(", ") || "tree or HEAD changed"}${after.statusPaths.length > 100 ? `, … ${after.statusPaths.length - 100} more` : ""}]`;
+    await appendBoundedArtifact(
       logPath,
       `\n\nExit: ${executed.exitCode}\nKilled: ${executed.killed}\nTimed out: ${executed.timedOut}\nTermination verified: ${executed.terminationVerified}\nCandidate unchanged: ${after.unchanged}${truncationNotice}${mutationNotice}\n`,
-      "utf8",
+      MAX_CHECK_LOG_BYTES,
     );
     const preview = truncateTail(executed.outputTail.trim() || "(no output)", {
       maxBytes: 8 * 1024,
       maxLines: 200,
     }).content;
-    results.push({
+    const processEvidence = executed.commandStarted
+      ? await captureValidationProcessEvidence(
+          gateDir,
+          processJobId,
+          processLaunchNonce,
+          executed.timedOut ? 124 : executed.exitCode,
+        )
+      : undefined;
+    const passed = executed.exitCode === 0 && !executed.killed && !executed.timedOut &&
+      executed.terminationVerified && before.unchanged && after.unchanged;
+    const fingerprintInput = {
       command: check.command,
       candidateTree: candidate.tree,
       candidateCommit: candidate.commit,
       before,
       after,
-      passed: executed.exitCode === 0 && !executed.killed && executed.terminationVerified && before.unchanged && after.unchanged,
+      passed,
       exitCode: executed.exitCode,
       killed: executed.killed,
       timedOut: executed.timedOut,
       terminationVerified: executed.terminationVerified,
+      process: processEvidence,
+    };
+    results.push({
+      ...fingerprintInput,
       outputBytes: executed.outputBytes,
       logBytes: executed.logBytes,
       logTruncated: executed.logTruncated,
@@ -3092,10 +3480,12 @@ async function runLoopChecks(
       completedAt,
       durationMs: Date.now() - started,
       logPath,
-      fingerprint: createHash("sha256")
-        .update(`${candidate.tree}\0${check.command}\0${executed.exitCode}\0${executed.killed}\0${after.tree}\0${executed.outputTail}`)
-        .digest("hex"),
-      outputPreview: `${preview}${truncationNotice}${mutationNotice}`,
+      fingerprint: loopCheckFingerprint(fingerprintInput),
+      outputPreview: truncateContextHead(
+        `${preview}${truncationNotice}${mutationNotice}`,
+        16 * 1024,
+        300,
+      ).content,
     });
   }
   await atomicWrite(path.join(iterationDir, "checks.json"), `${JSON.stringify(results, null, 2)}\n`);
@@ -3323,24 +3713,40 @@ async function runLoopReviews(
       );
     }
   }
-  return results.map((result, index) => {
+  return Promise.all(results.map(async (result, index) => {
+    const reviewerJob = reviewerJobs[index];
+    if (!reviewerJob || reviewerJob.id !== result.id) {
+      throw new Error(`Reviewer ${reviewers[index].id} is missing its authenticated worker identity.`);
+    }
     const unchanged = before[index].unchanged && after[index].unchanged;
+    const output = boundedArtifactText(
+      result.output,
+      MAX_REVIEW_EVIDENCE_BYTES,
+      MAX_REVIEW_EVIDENCE_LINES,
+    ).trimEnd();
     return {
       profileId: reviewers[index].id,
       title: result.title,
       verdict: result.state === "completed" && unchanged
-        ? parseReviewVerdict(result.output)
+        ? parseReviewVerdict(output)
         : "blocked",
       state: result.state,
       output: unchanged
-        ? result.output
-        : `${result.output}\n\nReviewer checkout mutation detected; verdict forced to BLOCKED.`,
+        ? output
+        : `${output}\n\nReviewer checkout mutation detected; verdict forced to BLOCKED.`,
       resultPath: result.resultPath,
       usage: result.status?.usage,
       before: before[index],
       after: after[index],
+      process: result.state === "completed"
+        ? await captureReviewerProcessEvidence(
+            reviewerJob.jobDir,
+            reviewerJob.id,
+            reviewerJob.launchNonce,
+          )
+        : undefined,
     };
-  });
+  }));
 }
 
 function repairTask(
@@ -3401,29 +3807,162 @@ function loopAttemptsUsage(attempts: LoopIterationRecord[]): Usage | undefined {
   return aggregateUsage(values);
 }
 
+function boundedGitDetails(git: GitSummary | undefined) {
+  if (!git) return undefined;
+  const commits = git.commits ?? [];
+  const changedFiles = git.changedFiles ?? [];
+  const status = git.status
+    ? truncateContextHead(git.status, MAX_DETAIL_GIT_STATUS_BYTES, 1_000)
+    : undefined;
+  return {
+    baseSha: git.baseSha,
+    head: git.head,
+    commit: git.commit,
+    commits: commits.slice(0, MAX_DETAIL_GIT_COMMITS).map((entry) => ({
+      sha: entry.sha,
+      subject: escapeTerminalText(truncateContextHead(entry.subject, 1_024, 4).content),
+    })),
+    commitCount: commits.length,
+    commitsTruncated: commits.length > MAX_DETAIL_GIT_COMMITS,
+    changedFiles: changedFiles.slice(0, MAX_DETAIL_GIT_PATHS).map((filePath) =>
+      escapeTerminalText(truncateContextHead(filePath, 4_096, 1).content)),
+    changedFileCount: changedFiles.length,
+    changedFilesTruncated: changedFiles.length > MAX_DETAIL_GIT_PATHS,
+    status: status ? escapeTerminalText(status.content) : undefined,
+    statusTruncated: status?.truncated ?? false,
+    dirty: git.dirty,
+    baseIsAncestor: git.baseIsAncestor,
+  };
+}
+
 function resultDetails(results: WorkerResult[]) {
   return {
     results: results.map((result) => ({
       id: result.id,
       batchId: result.batchId,
-      batchTitle: result.batchTitle,
-      title: result.title,
+      batchTitle: result.batchTitle && escapeTerminalText(result.batchTitle),
+      title: escapeTerminalText(result.title),
       mode: result.mode,
       state: result.state,
-      error: result.error,
-      jobDir: result.jobDir,
-      resultPath: result.resultPath,
-      stderrPath: result.stderrPath,
+      error: result.error && escapeTerminalText(result.error).slice(0, 4096),
+      jobDir: result.jobDir && escapeTerminalText(result.jobDir),
+      resultPath: result.resultPath && escapeTerminalText(result.resultPath),
+      stderrPath: result.stderrPath && escapeTerminalText(result.stderrPath),
       tabId: result.tabId,
       surfaceId: result.surfaceId,
       tabWorktreeId: result.tabWorktreeId,
       codeWorktreeId: result.codeWorktreeId,
-      worktreePath: result.worktreePath,
-      branch: result.branch,
-      git: result.git,
-      status: result.status,
-      resultPreview: result.output.slice(0, 4096),
+      worktreePath: result.worktreePath && escapeTerminalText(result.worktreePath),
+      branch: result.branch && escapeTerminalText(result.branch),
+      git: boundedGitDetails(result.git),
+      status: result.status
+        ? {
+            ...result.status,
+            stopReason: result.status.stopReason && escapeTerminalText(result.status.stopReason).slice(0, 256),
+            errorMessage: result.status.errorMessage && escapeTerminalText(result.status.errorMessage).slice(0, 4096),
+            model: result.status.model && escapeTerminalText(result.status.model).slice(0, MAX_MODEL_LENGTH),
+            processIdentity: result.status.processIdentity
+              ? {
+                  ...result.status.processIdentity,
+                  command: escapeTerminalText(result.status.processIdentity.command).slice(0, 4096),
+                  launchNonce: escapeTerminalText(result.status.processIdentity.launchNonce).slice(0, 256),
+                }
+              : undefined,
+            termination: result.status.termination
+              ? {
+                  ...result.status.termination,
+                  errors: result.status.termination.errors.slice(0, 20).map((message) =>
+                    escapeTerminalText(message).slice(0, 4096)),
+                }
+              : undefined,
+          }
+        : undefined,
+      resultPreview: escapeTerminalText(result.output).slice(0, 4096),
     })),
+  };
+}
+
+function loopResultDetails(result: DelegateLoopResult) {
+  const summarizeAttestation = (attestation: CandidateAttestation) => ({
+    candidateTree: attestation.candidateTree,
+    candidateCommit: attestation.candidateCommit,
+    checkoutPath: escapeTerminalText(attestation.checkoutPath),
+    head: attestation.head,
+    tree: attestation.tree,
+    unchanged: attestation.unchanged,
+    statusPaths: attestation.statusPaths.slice(0, 100).map(escapeTerminalText),
+    statusPathCount: attestation.statusPathCount ?? attestation.statusPaths.length,
+    gitlinkPaths: attestation.gitlinkPaths.slice(0, 100).map(escapeTerminalText),
+    gitlinkPathCount: attestation.gitlinkPathCount ?? attestation.gitlinkPaths.length,
+    observedAt: attestation.observedAt,
+  });
+  return {
+    id: result.id,
+    batchId: result.batchId,
+    title: escapeTerminalText(result.title),
+    state: result.state,
+    reason: escapeTerminalText(truncateContextHead(result.reason, 8 * 1024, 200).content),
+    jobDir: escapeTerminalText(result.jobDir),
+    worktreePath: escapeTerminalText(result.worktreePath),
+    branch: escapeTerminalText(result.branch),
+    baseSha: result.baseSha,
+    maxAttempts: result.maxAttempts,
+    attempts: result.attempts.map((attempt) => ({
+      attempt: attempt.attempt,
+      worker: {
+        id: attempt.worker.id,
+        state: attempt.worker.state,
+        error: attempt.worker.error && escapeTerminalText(attempt.worker.error).slice(0, 4096),
+        resultPath: attempt.worker.resultPath && escapeTerminalText(attempt.worker.resultPath),
+      },
+      candidateFingerprint: attempt.candidateFingerprint,
+      transition: {
+        state: attempt.transition.state,
+        reason: escapeTerminalText(attempt.transition.reason).slice(0, 4096),
+      },
+      evidence: attempt.evidence
+        ? {
+            attempt: attempt.evidence.attempt,
+            tree: attempt.evidence.tree,
+            commit: attempt.evidence.commit,
+            ref: attempt.evidence.ref,
+            head: attempt.evidence.head,
+            branch: escapeTerminalText(attempt.evidence.branch),
+            patchPath: escapeTerminalText(attempt.evidence.patchPath),
+            patchSha256: attempt.evidence.patchSha256,
+            patchBytes: attempt.evidence.patchBytes,
+            changedPathCount: attempt.evidence.changedPaths.length,
+            gitlinkPathCount: attempt.evidence.gitlinkPaths.length,
+          }
+        : undefined,
+      checks: attempt.checks.map((check) => ({
+        command: escapeTerminalText(check.command),
+        candidateTree: check.candidateTree,
+        candidateCommit: check.candidateCommit,
+        before: summarizeAttestation(check.before),
+        after: summarizeAttestation(check.after),
+        passed: check.passed,
+        exitCode: check.exitCode,
+        killed: check.killed,
+        timedOut: check.timedOut,
+        terminationVerified: check.terminationVerified,
+        logPath: escapeTerminalText(check.logPath),
+        fingerprint: check.fingerprint,
+      })),
+      reviews: attempt.reviews.map((review) => ({
+        profileId: review.profileId,
+        title: escapeTerminalText(review.title),
+        verdict: review.verdict,
+        state: review.state,
+        resultPath: review.resultPath && escapeTerminalText(review.resultPath),
+        before: summarizeAttestation(review.before),
+        after: summarizeAttestation(review.after),
+      })),
+    })),
+    finalWorker: result.finalWorker
+      ? resultDetails([result.finalWorker]).results[0]
+      : undefined,
+    usage: result.usage,
   };
 }
 
@@ -3458,6 +3997,7 @@ async function runWorkerBatch(
   const ordered: Array<WorkerResult | undefined> = new Array(specs.length);
   const prepared: Array<{ index: number; job: PreparedWorkerJob }> = [];
   const launched: Array<{ index: number; job: WorkerJob }> = [];
+  const leases: OrchestratorLease[] = [];
   const launchRecoveryErrors: string[] = [];
   let batch: WorkerBatch | undefined;
   let manuallyClosed = false;
@@ -3469,6 +4009,9 @@ async function runWorkerBatch(
         details: { batchId, batchTitle, prepared: prepared.length, total: specs.length },
       });
       const workerId = randomUUID();
+      const jobDir = path.join(batchDir, workerId);
+      const lease = await acquireOrchestratorLease(jobDir, workerId);
+      leases.push(lease);
       try {
         const job = await prepareWorker(
           pi,
@@ -3479,12 +4022,12 @@ async function runWorkerBatch(
           batchTitle,
           workerId,
           yolo,
+          lease,
           signal,
         );
         prepared.push({ index, job });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const jobDir = path.join(batchDir, workerId);
         let metadata: Record<string, unknown> | undefined;
         try {
           metadata = await readJson<Record<string, unknown>>(path.join(jobDir, "job.json"));
@@ -3530,8 +4073,18 @@ async function runWorkerBatch(
                 stopReason: "preparation_failed",
                 errorMessage: message,
               } satisfies WorkerStatus;
-              await claimWorkerTerminal(jobDir, workerId, "recovery", status, message);
-              await reconcileJobLifecycle(jobDir, "failed", message);
+              const winningTerminal = await claimWorkerTerminal(
+                jobDir,
+                workerId,
+                "recovery",
+                status,
+                message,
+              );
+              await reconcileJobLifecycle(
+                jobDir,
+                terminalLifecyclePhase(winningTerminal.record.status),
+                winningTerminal.record.status.errorMessage ?? message,
+              );
             }
           }
         } catch (settlementError) {
@@ -3586,8 +4139,18 @@ async function runWorkerBatch(
             errorMessage: message,
             launchNonce: item.job.launchNonce,
           } satisfies WorkerStatus;
-          await claimWorkerTerminal(item.job.jobDir, item.job.id, "recovery", status, message);
-          await updateJobLifecycle(item.job.jobDir, "failed", message);
+          const winningTerminal = await claimWorkerTerminal(
+            item.job.jobDir,
+            item.job.id,
+            "recovery",
+            status,
+            message,
+          );
+          await reconcileJobLifecycle(
+            item.job.jobDir,
+            terminalLifecyclePhase(winningTerminal.record.status),
+            winningTerminal.record.status.errorMessage ?? message,
+          );
           ordered[item.index] = {
             id: item.job.id,
             batchId,
@@ -3653,6 +4216,7 @@ async function runWorkerBatch(
               batch,
               item.job,
               launched.map((entry) => entry.job),
+              timeoutSeconds,
               workerSignal,
               async (preparedJob) => {
                 launchingJob = preparedJob;
@@ -3673,17 +4237,17 @@ async function runWorkerBatch(
                 errorMessage: message,
                 launchNonce: item.job.launchNonce,
               } satisfies WorkerStatus;
-              await claimWorkerTerminal(
+              const winningTerminal = await claimWorkerTerminal(
                 item.job.jobDir,
                 item.job.id,
                 cancelled ? "cancel" : "recovery",
                 status,
                 message,
               );
-              await updateJobLifecycle(
+              await reconcileJobLifecycle(
                 item.job.jobDir,
-                cancelled ? "cancelled" : "failed",
-                message,
+                terminalLifecyclePhase(winningTerminal.record.status),
+                winningTerminal.record.status.errorMessage ?? message,
               );
             }
             if (workerSignal.aborted) throw error;
@@ -3787,7 +4351,12 @@ async function runWorkerBatch(
     if (manuallyClosed) throw new Error(message);
     throw error;
   } finally {
+    const releases = await Promise.allSettled(leases.map((lease) => lease.release()));
+    const failedRelease = releases.find(
+      (release): release is PromiseRejectedResult => release.status === "rejected",
+    );
     await refocusParent(pi, parent);
+    if (failedRelease) throw failedRelease.reason;
   }
 
   return ordered.filter((item): item is WorkerResult => Boolean(item));
@@ -3874,8 +4443,33 @@ async function createLoopWorkspace(
   const jobDir = path.join(getAgentDir(), "subagents", batchId, id);
   await ensureDirectoryDurable(jobDir);
   await fs.promises.chmod(jobDir, 0o700);
+  const orchestratorLease = await acquireOrchestratorLease(jobDir, id);
+  try {
   const createdAt = isoNow();
   const worktreePlan = await planCodingWorktree(pi, ctxCwd, title, batchId, id, signal);
+  const destinationRoot = await fs.promises.realpath(worktreePlan.repoRoot);
+  const policy = await writeLoopPolicy(jobDir, id, {
+    objective: options.task,
+    checks: options.checks,
+    reviewers: options.reviewers.map((reviewer) => ({
+      id: reviewer.id,
+      title: reviewer.title,
+      prompt: reviewer.prompt,
+      skillPaths: reviewer.skillPaths,
+      model: reviewer.model,
+      thinking: reviewer.thinking,
+    })),
+    maxAttempts: options.maxAttempts,
+    workerTimeoutSeconds: options.workerTimeoutSeconds,
+    reviewerTimeoutSeconds: options.reviewerTimeoutSeconds,
+    model: options.model,
+    thinking: options.thinking,
+    delegation: {
+      baseSha: worktreePlan.baseSha,
+      destinationRoot,
+      branch: worktreePlan.branch,
+    },
+  });
   const worktreeCreation = {
     launchDir: path.join(jobDir, "worktree-launch"),
     launchJobId: `${id}-worktree-launch`,
@@ -3898,9 +4492,15 @@ async function createLoopWorkspace(
     piRuntime,
     workspacePlan: worktreePlan,
     worktreeCreationProtocolVersion: 1,
+    worktreeProvenanceVersion: 1,
+    worktreeProvenanceToken: worktreePlan.provenanceToken,
     worktreeLaunchDir: worktreeCreation.launchDir,
     worktreeLaunchJobId: worktreeCreation.launchJobId,
     worktreeLaunchNonce: worktreeCreation.launchNonce,
+    policyPath: policy.path,
+    policySha256: policy.sha256,
+    orchestratorLeaseVersion: 1,
+    orchestratorOwnerToken: orchestratorLease.ownerToken,
     createdAt,
   };
   await atomicWrite(path.join(jobDir, "loop.json"), `${JSON.stringify(loopIntent, null, 2)}\n`);
@@ -3922,6 +4522,12 @@ async function createLoopWorkspace(
       loopState: "implementing",
       workspacePlan: worktreePlan,
       worktreeCreationProtocolVersion: 1,
+      worktreeProvenanceVersion: 1,
+      worktreeProvenanceToken: worktreePlan.provenanceToken,
+      policyPath: policy.path,
+      policySha256: policy.sha256,
+      orchestratorLeaseVersion: 1,
+      orchestratorOwnerToken: orchestratorLease.ownerToken,
       worktreeLaunchDir: worktreeCreation.launchDir,
       worktreeLaunchJobId: worktreeCreation.launchJobId,
       worktreeLaunchNonce: worktreeCreation.launchNonce,
@@ -3932,6 +4538,10 @@ async function createLoopWorkspace(
     delegateLoop: true,
     workspacePlan: worktreePlan,
     worktreeCreationProtocolVersion: 1,
+    worktreeProvenanceVersion: 1,
+    worktreeProvenanceToken: worktreePlan.provenanceToken,
+    orchestratorLeaseVersion: 1,
+    orchestratorOwnerToken: orchestratorLease.ownerToken,
     worktreeLaunchDir: worktreeCreation.launchDir,
     worktreeLaunchJobId: worktreeCreation.launchJobId,
     worktreeLaunchNonce: worktreeCreation.launchNonce,
@@ -3943,6 +4553,10 @@ async function createLoopWorkspace(
   );
   await updateJobLifecycle(jobDir, "provisioning_worktree", undefined, {
     worktreeCreationProtocolVersion: 1,
+    worktreeProvenanceVersion: 1,
+    worktreeProvenanceToken: worktreePlan.provenanceToken,
+    orchestratorLeaseVersion: 1,
+    orchestratorOwnerToken: orchestratorLease.ownerToken,
     worktreeLaunchDir: worktreeCreation.launchDir,
     worktreeLaunchJobId: worktreeCreation.launchJobId,
     worktreeLaunchNonce: worktreeCreation.launchNonce,
@@ -3955,6 +4569,14 @@ async function createLoopWorkspace(
       worktreeCreation,
       signal,
       async (observedCodeWorktreeId, observedWorktreePath) => {
+        await writeWorktreeProvenance(
+          jobDir,
+          worktreePlan,
+          worktreeCreation,
+          observedCodeWorktreeId,
+          observedWorktreePath,
+          "observed",
+        );
         const metadata = await readJson<Record<string, unknown>>(path.join(jobDir, "job.json")) ?? {};
         await atomicWrite(
           path.join(jobDir, "job.json"),
@@ -3980,6 +4602,14 @@ async function createLoopWorkspace(
     );
     throw error;
   }
+  await writeWorktreeProvenance(
+    jobDir,
+    worktreePlan,
+    worktreeCreation,
+    worktree.id,
+    worktree.worktreePath,
+    "authenticated",
+  );
   const workspace = {
     id,
     batchId,
@@ -3998,6 +4628,11 @@ async function createLoopWorkspace(
     projectTrusted,
     piRuntime,
     permissionConfigPath: resolvePermissionConfigPath(process.env[PERMISSION_CONFIG_ENV], ctxCwd),
+    policyPath: policy.path,
+    policySha256: policy.sha256,
+    orchestratorLeaseVersion: 1,
+    orchestratorOwnerToken: orchestratorLease.ownerToken,
+    orchestratorLease,
     createdAt,
   } satisfies LoopWorkspace;
   await atomicWrite(
@@ -4053,6 +4688,10 @@ async function createLoopWorkspace(
     baseSha: workspace.baseSha,
   });
   return workspace;
+  } catch (error) {
+    await orchestratorLease.release();
+    throw error;
+  }
 }
 
 function canonicalLoopJob(workspace: LoopWorkspace, activeJob: WorkerJob): WorkerJob {
@@ -4080,7 +4719,7 @@ function formatDelegateLoopResult(result: DelegateLoopResult): string {
   const apply = result.state === "awaiting_apply"
     ? `\nApply after inspection: \`/delegate-apply ${result.id}\``
     : "";
-  return `Delegate loop ${result.state.replaceAll("_", " ")}.
+  return escapeTerminalText(`Delegate loop ${result.state.replaceAll("_", " ")}.
 
 Reason: ${reason.content}${reason.truncated ? "\n[Reason truncated; see loop artifacts.]" : ""}
 Worktree: ${result.worktreePath}
@@ -4089,36 +4728,7 @@ Base: ${result.baseSha}
 Attempts: ${result.attempts.length}/${result.maxAttempts}
 ${attempts.join("\n") || "- No completed attempt."}${apply}
 
-Artifacts: ${result.jobDir}`;
-}
-
-async function readLoopAcceptanceIntent(
-  jobDir: string,
-  expectedJobId: string,
-): Promise<LoopAcceptanceIntent | undefined> {
-  const filePath = path.join(jobDir, "acceptance.json");
-  const intent = await readJson<LoopAcceptanceIntent>(filePath);
-  if (!intent) return undefined;
-  const candidate = intent.candidate;
-  const resolvedJobDir = path.resolve(jobDir);
-  const resolvedPatchPath = typeof candidate?.patchPath === "string"
-    ? path.resolve(candidate.patchPath)
-    : "";
-  if (
-    intent.schemaVersion !== SUBAGENT_SCHEMA_VERSION || intent.jobId !== expectedJobId ||
-    typeof intent.createdAt !== "string" || !candidate ||
-    !Number.isSafeInteger(candidate.attempt) || candidate.attempt < 1 ||
-    !OBJECT_ID_PATTERN.test(candidate.tree) || !OBJECT_ID_PATTERN.test(candidate.commit) ||
-    !OBJECT_ID_PATTERN.test(candidate.head) || typeof candidate.branch !== "string" ||
-    candidate.ref !== `refs/pi-agent-candidates/${expectedJobId}/${String(candidate.attempt).padStart(3, "0")}` ||
-    !resolvedPatchPath.startsWith(`${resolvedJobDir}${path.sep}`) ||
-    !/^[a-f0-9]{64}$/i.test(candidate.patchSha256) ||
-    !Number.isSafeInteger(candidate.patchBytes) || candidate.patchBytes < 0 ||
-    typeof candidate.patchPreview !== "string" || typeof candidate.patchPreviewTruncated !== "boolean" ||
-    !Array.isArray(candidate.changedPaths) || !candidate.changedPaths.every((entry) => typeof entry === "string") ||
-    !Array.isArray(candidate.gitlinkPaths) || !candidate.gitlinkPaths.every((entry) => typeof entry === "string")
-  ) throw new Error(`Unsupported delegate-loop acceptance intent at ${filePath}.`);
-  return { ...intent, candidate: { ...candidate, patchPath: resolvedPatchPath } };
+Artifacts: ${result.jobDir}`);
 }
 
 async function finalizeDelegateLoop(
@@ -4136,8 +4746,15 @@ async function finalizeDelegateLoop(
   if (control && state !== "cancelled") throw new Error(`Delegate loop cancelled: ${control.reason}`);
   const canonicalJob = canonicalLoopJob(workspace, activeJob);
   const acceptedCandidate = state === "awaiting_apply" ? attempts.at(-1)?.evidence : undefined;
+  let acceptanceIntent: LoopAcceptanceIntent | undefined;
   if (state === "awaiting_apply") {
-    if (!acceptedCandidate) throw new Error("Accepted delegate loop has no immutable candidate evidence.");
+    const acceptedIteration = attempts.at(-1);
+    if (!acceptedCandidate || !acceptedIteration) {
+      throw new Error("Accepted delegate loop has no immutable candidate evidence.");
+    }
+    if (attempts.slice(0, -1).some((attempt) => attempt.candidateFingerprint === acceptedIteration.candidateFingerprint)) {
+      throw new Error("Repeated candidate state cannot be accepted after an earlier gate evaluation.");
+    }
     await verifyLoopCandidateSource(
       pi,
       workspace,
@@ -4145,15 +4762,26 @@ async function finalizeDelegateLoop(
       path.join(workspace.jobDir, "final-acceptance.index"),
       signal,
     );
-    await atomicWrite(
-      path.join(workspace.jobDir, "acceptance.json"),
-      `${JSON.stringify({
-        schemaVersion: SUBAGENT_SCHEMA_VERSION,
-        jobId: workspace.id,
-        candidate: acceptedCandidate,
-        createdAt: isoNow(),
-      } satisfies LoopAcceptanceIntent, null, 2)}\n`,
+    acceptanceIntent = await publishLoopAcceptance(
+      workspace.jobDir,
+      workspace.id,
+      { path: workspace.policyPath, sha256: workspace.policySha256 },
+      acceptedCandidate,
+      acceptedIteration.checks,
+      acceptedIteration.reviews,
     );
+    await verifyLoopCandidateSource(
+      pi,
+      workspace,
+      acceptedCandidate,
+      path.join(workspace.jobDir, "final-decision.index"),
+      signal,
+    );
+    const finalControl = await readJobControl(workspace.jobDir);
+    if (finalControl) {
+      await claimJobDecision(workspace.jobDir, workspace.id, "cancel");
+      throw new Error(`Delegate loop cancelled before acceptance: ${finalControl.reason}`);
+    }
     const decision = await claimJobDecision(workspace.jobDir, workspace.id, "accept");
     if (decision.record.owner !== "accept") {
       throw new Error("Delegate loop cancellation won the terminal decision before acceptance.");
@@ -4167,6 +4795,9 @@ async function finalizeDelegateLoop(
     acceptedTree: acceptedCandidate?.tree,
     acceptedCommit: acceptedCandidate?.commit,
     acceptedRef: acceptedCandidate?.ref,
+    acceptedGateManifestPath: acceptanceIntent?.gateManifest.path,
+    acceptedGateManifestSha256: acceptanceIntent?.gateManifest.sha256,
+    acceptedPolicySha256: acceptanceIntent?.policy.sha256,
     activeWorkerJobDir: activeJob.jobDir,
   });
   const usage = loopAttemptsUsage(attempts);
@@ -4212,6 +4843,9 @@ async function finalizeDelegateLoop(
       acceptedTree: acceptedCandidate?.tree,
       acceptedCommit: acceptedCandidate?.commit,
       acceptedRef: acceptedCandidate?.ref,
+      acceptedGateManifestPath: acceptanceIntent?.gateManifest.path,
+      acceptedGateManifestSha256: acceptanceIntent?.gateManifest.sha256,
+      acceptedPolicySha256: acceptanceIntent?.policy.sha256,
     },
   );
   const git = await collectGitSummary(pi, canonicalJob, signal);
@@ -4529,6 +5163,7 @@ async function runDelegateLoop(
     );
     throw error;
   } finally {
+    await workspace.orchestratorLease.release();
     await refocusParent(pi, parent);
   }
 }
@@ -4700,7 +5335,136 @@ function formatLifecycleStatus(job: LifecycleJobRecord): string {
   if (job.terminal) lines.push(`Terminal owner: ${job.terminal.owner} at ${job.terminal.claimedAt}`);
   if (job.control) lines.push(`Control: ${job.control.action} requested at ${job.control.requestedAt}`);
   if (lifecycle?.reason) lines.push(`Reason: ${lifecycle.reason}`);
-  return lines.join("\n");
+  return escapeTerminalText(lines.join("\n"));
+}
+
+async function protectedLoopReviewerJobDirs(
+  jobs: LifecycleJobRecord[],
+): Promise<Set<string>> {
+  const protectedDirs = new Set<string>();
+  for (const job of jobs) {
+    if (job.mode !== "coding" || job.metadata.delegateLoop !== true) continue;
+    for (const binding of activeReviewerBindings(job.lifecycle)) {
+      if (!path.isAbsolute(binding.jobDir)) {
+        throw new Error(`Delegate loop ${job.id} has a non-absolute active reviewer path.`);
+      }
+      protectedDirs.add(path.resolve(binding.jobDir));
+    }
+    const iterationsDir = path.join(job.jobDir, "iterations");
+    let iterationEntries: fs.Dirent[] = [];
+    try {
+      iterationEntries = (await fs.promises.readdir(iterationsDir, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory() && /^\d{3}$/.test(entry.name));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (iterationEntries.length > 10) {
+      throw new Error(`Delegate loop ${job.id} has an unsupported number of iteration directories.`);
+    }
+    for (const iteration of iterationEntries) {
+      const reviews = await readJson<Array<Record<string, unknown>>>(
+        path.join(iterationsDir, iteration.name, "reviews.json"),
+      );
+      for (const review of reviews ?? []) {
+        const processEvidence = metadataRecord(review, "process");
+        const reviewerJobDir = processEvidence && metadataString(processEvidence, "jobDir");
+        if (!reviewerJobDir) continue;
+        if (!path.isAbsolute(reviewerJobDir)) {
+          throw new Error(`Delegate loop ${job.id} has a non-absolute recorded reviewer path.`);
+        }
+        protectedDirs.add(path.resolve(reviewerJobDir));
+      }
+    }
+    const acceptanceExpected = metadataString(job.metadata, "loopState") === "awaiting_apply" ||
+      job.decision?.owner === "accept";
+    const acceptance = await readVerifiedLoopAcceptance(job.jobDir, job.id);
+    if (!acceptance) {
+      if (acceptanceExpected) {
+        throw new Error(`Accepted delegate loop ${job.id} has no verifiable evidence; pruning was refused.`);
+      }
+      continue;
+    }
+    const reviews = await readJson<Array<Record<string, unknown>>>(path.join(
+      job.jobDir,
+      "iterations",
+      String(acceptance.candidate.attempt).padStart(3, "0"),
+      "reviews.json",
+    ));
+    if (!reviews) throw new Error(`Accepted delegate loop ${job.id} has no reviewer evidence.`);
+    for (const review of reviews) {
+      const processEvidence = metadataRecord(review, "process");
+      const reviewerJobDir = processEvidence && metadataString(processEvidence, "jobDir");
+      if (!reviewerJobDir || !path.isAbsolute(reviewerJobDir)) {
+        throw new Error(`Accepted delegate loop ${job.id} has incomplete reviewer retention evidence.`);
+      }
+      protectedDirs.add(path.resolve(reviewerJobDir));
+    }
+  }
+  return protectedDirs;
+}
+
+async function researchJobPrunable(
+  pi: ExtensionAPI,
+  job: LifecycleJobRecord,
+): Promise<{ eligible: boolean; reason?: string }> {
+  if (job.mode !== "research") return { eligible: false, reason: "coding artifacts are retained" };
+  if (!job.terminal || !["completed", "failed", "timed_out", "cancelled"].includes(job.lifecycle?.phase ?? "")) {
+    return { eligible: false, reason: "job is not authoritatively terminal" };
+  }
+  if (metadataString(job.metadata, "worktreePath") || metadataString(job.metadata, "codeWorktreeId")) {
+    return { eligible: false, reason: "job owns coding-worktree artifacts" };
+  }
+  const workerDir = await effectiveLifecycleJobDir(job);
+  if (job.terminal.owner === "worker") {
+    const launchNonce = metadataString(job.metadata, "launchNonce");
+    const [runner, exit] = await Promise.all([
+      readRunnerProcess(workerDir),
+      readRunnerExit(workerDir),
+    ]);
+    if (!launchNonce || !authenticateRunnerExit(job.id, launchNonce, runner, exit)) {
+      return { eligible: false, reason: "worker terminal has no authenticated normal runner exit" };
+    }
+  }
+  const authorization = await authorizeOrchestratorRecovery(
+    job.jobDir,
+    job.id,
+    job.metadata.orchestratorLeaseVersion,
+  );
+  if (!authorization.allowed) return { eligible: false, reason: authorization.reason };
+  const resource = supervisedLifecycleWorker(job, workerDir);
+  if (!resource) {
+    if (hasLifecycleSurfaceIntent(job)) {
+      return { eligible: false, reason: "surface identity is incomplete" };
+    }
+    const [runner, status] = await Promise.all([
+      readRunnerProcess(workerDir),
+      readJson<WorkerStatus>(path.join(workerDir, "status.json")),
+    ]);
+    return runner || status?.processIdentity
+      ? { eligible: false, reason: "process identity remains recorded without a supervised surface" }
+      : { eligible: true };
+  }
+  const processes = await verifyWorkerProcessesAbsent(
+    pi,
+    resource,
+    job.terminal.status && typeof job.terminal.status === "object"
+      ? (job.terminal.status as WorkerStatus).processIdentity
+      : undefined,
+  );
+  if (!processes.absent) {
+    return { eligible: false, reason: `process state is ${processes.states.join(", ")}` };
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (await observeSupacodeSurface(
+      pi,
+      resource.tabWorktreeId,
+      resource.tabId,
+      resource.surfaceId,
+      { timeoutMs: TAB_LIST_TIMEOUT_MS },
+    ) !== "absent") return { eligible: false, reason: "surface absence is not stable" };
+    if (attempt === 0) await delay(100);
+  }
+  return { eligible: true };
 }
 
 async function cancelLifecycleJob(
@@ -4810,6 +5574,10 @@ async function cancelLifecycleJob(
   }
   const existing = await readWorkerTerminal<WorkerStatus>(workerDir);
   if (existing) {
+    await restoreWorkerTerminalProjection(workerDir, existing);
+    if (path.resolve(workerDir) !== path.resolve(job.jobDir)) {
+      await atomicWrite(path.join(job.jobDir, "status.json"), `${JSON.stringify(existing.status)}\n`);
+    }
     const resource = supervisedLifecycleWorker(job, workerDir);
     if (!resource) {
       if (hasLifecycleSurfaceIntent(job)) {
@@ -4822,7 +5590,12 @@ async function cancelLifecycleJob(
       }
       return `Worker ${job.id} already reached terminal state ${existing.status.state} (${existing.owner}).`;
     }
-    const termination = await terminateWorker(pi, resource, existing.status.processIdentity);
+    const termination = await terminateWorker(
+      pi,
+      resource,
+      existing.status.processIdentity,
+      { owner: "cancel", reason },
+    );
     const expectedLaunchNonce = existing.status.launchNonce ?? metadataString(job.metadata, "launchNonce");
     const runnerExit = expectedLaunchNonce
       ? await readAuthenticatedRunnerExit(workerDir, job.id, expectedLaunchNonce)
@@ -4910,26 +5683,71 @@ async function cancelLifecycleJob(
         return `Cancellation requested for ${job.id}, but process termination is indeterminate.`;
       }
     }
-    await claimWorkerTerminal(workerDir, job.id, "cancel", cancelledStatus, reason);
-    await reconcileJobLifecycle(job.jobDir, "cancelled", reason);
-    await atomicWrite(path.join(job.jobDir, "status.json"), `${JSON.stringify(cancelledStatus)}\n`);
-    return `Cancelled ${job.id} before a worker surface was launched.`;
+    const winningTerminal = await claimWorkerTerminal(
+      workerDir,
+      job.id,
+      "cancel",
+      cancelledStatus,
+      reason,
+    );
+    if (path.resolve(workerDir) !== path.resolve(job.jobDir)) {
+      await atomicWrite(
+        path.join(job.jobDir, "status.json"),
+        `${JSON.stringify(winningTerminal.record.status)}\n`,
+      );
+    }
+    await reconcileJobLifecycle(
+      job.jobDir,
+      terminalLifecyclePhase(winningTerminal.record.status),
+      winningTerminal.record.status.errorMessage ?? reason,
+    );
+    return winningTerminal.record.owner === "cancel"
+      ? `Cancelled ${job.id} before a worker surface was launched.`
+      : `Termination for ${job.id} was already owned by ${winningTerminal.record.owner}.`;
   }
-  const termination = await terminateWorker(pi, resource, status?.processIdentity);
-  const finalStatus = { ...cancelledStatus, termination } satisfies WorkerStatus;
-  await atomicWrite(path.join(job.jobDir, "status.json"), `${JSON.stringify(finalStatus)}\n`);
+  const termination = await terminateWorker(
+    pi,
+    resource,
+    status?.processIdentity,
+    { owner: "cancel", reason },
+  );
+  const settlement = terminationSettlement(
+    termination,
+    status,
+    resource.launchNonce,
+    "cancel",
+    reason,
+  );
   await atomicWrite(path.join(job.jobDir, "termination.json"), `${JSON.stringify(termination, null, 2)}\n`);
   if (!termination.verified) {
     await updateJobLifecycle(
       job.jobDir,
       "recovery_required",
-      `${reason} Worker termination is indeterminate.`,
+      `${settlement.reason} Worker termination is indeterminate.`,
     );
     return `Cancellation requested for ${job.id}, but termination is indeterminate: ${termination.errors.join(" ")}`;
   }
-  await claimWorkerTerminal(workerDir, job.id, "cancel", cancelledStatus, reason);
-  await reconcileJobLifecycle(job.jobDir, "cancelled", reason);
-  return `Cancelled ${job.id}; its surface and recorded processes are absent.`;
+  const winningTerminal = await claimWorkerTerminal(
+    workerDir,
+    job.id,
+    settlement.terminalOwner,
+    settlement.status,
+    settlement.reason,
+  );
+  if (path.resolve(workerDir) !== path.resolve(job.jobDir)) {
+    await atomicWrite(
+      path.join(job.jobDir, "status.json"),
+      `${JSON.stringify(winningTerminal.record.status)}\n`,
+    );
+  }
+  await reconcileJobLifecycle(
+    job.jobDir,
+    terminalLifecyclePhase(winningTerminal.record.status),
+    winningTerminal.record.status.errorMessage ?? settlement.reason,
+  );
+  return winningTerminal.record.owner === "cancel"
+    ? `Cancelled ${job.id}; its surface and recorded processes are absent.`
+    : `Termination for ${job.id} was already owned by ${winningTerminal.record.owner}; resources are absent.`;
 }
 
 async function batchTabClosureSafety(
@@ -5017,7 +5835,8 @@ async function batchTabClosureSafety(
   if (tabPresence === "unknown") {
     return { safe: false, reason: "Could not verify batch-tab presence before cleanup." };
   }
-  const listed = await pi.exec(
+  const listed = await execRejectKilled(
+    pi,
     "supacode",
     ["surface", "list", "-w", worktreeId, "-t", tabId],
     { timeout: TAB_LIST_TIMEOUT_MS },
@@ -5097,10 +5916,13 @@ interface WorktreeRecoveryOutcome {
 }
 
 interface WorktreeCleanupRecord {
-  schemaVersion: 1;
+  schemaVersion: 2;
+  protocolVersion: 1;
   jobId: string;
+  provenanceToken: string;
+  creationLaunchNonce: string;
   worktreePath: string;
-  worktreeId?: string;
+  worktreeId: string;
   gitDir: string;
   gitDirDevice: string;
   gitDirInode: string;
@@ -5159,7 +5981,7 @@ async function finishRecordedWorktreeCleanup(
   reconcileAsFailed: boolean,
 ): Promise<WorktreeRecoveryOutcome | undefined> {
   const cleanupPath = path.join(job.jobDir, "worktree-cleanup.json");
-  if (record.worktreeId) {
+  {
     let idPath: string;
     try {
       idPath = await canonicalizeMissingPath(decodeSupacodeResourceId(record.worktreeId));
@@ -5175,6 +5997,21 @@ async function finishRecordedWorktreeCleanup(
     }
   }
   const repository = metadataString(job.metadata, "originalCwd") ?? record.worktreePath;
+  const removedPathStillUnowned = async (): Promise<boolean> => {
+    if (await lexicalPathExists(record.worktreePath)) return false;
+    const refreshed = await gitRawOutput(
+      pi,
+      repository,
+      ["worktree", "list", "--porcelain", "-z"],
+    );
+    const refreshedPaths = refreshed.split("\0\0").flatMap((entry) =>
+      entry.split("\0").filter((line) => line.startsWith("worktree ")).map((line) => line.slice("worktree ".length))
+    );
+    const canonicalPaths = await Promise.all(
+      refreshedPaths.map((candidate) => canonicalizeMissingPath(candidate)),
+    );
+    return !canonicalPaths.includes(record.worktreePath);
+  };
   const registered = await gitRawOutput(
     pi,
     repository,
@@ -5201,7 +6038,8 @@ async function finishRecordedWorktreeCleanup(
     return { message: reason, complete: false };
   }
   if (stillRegistered && !await filePathExists(record.worktreePath)) {
-    const removedStaleRegistration = await pi.exec(
+    const removedStaleRegistration = await execRejectKilled(
+      pi,
       "git",
       ["-C", repository, "worktree", "remove", record.worktreePath],
       { timeout: 60_000 },
@@ -5235,7 +6073,7 @@ async function finishRecordedWorktreeCleanup(
     current = { ...current, phase: "git_removed", updatedAt: isoNow() };
     await atomicWrite(cleanupPath, `${JSON.stringify(current, null, 2)}\n`);
   }
-  if (current.phase === "git_removed" && current.worktreeId) {
+  if (current.phase === "git_removed") {
     const worktreeId = current.worktreeId;
     let absentConfirmations = 0;
     let previousPresence: SupacodeResourcePresence | undefined;
@@ -5257,6 +6095,11 @@ async function finishRecordedWorktreeCleanup(
       } else {
         absentConfirmations = 0;
         if (!deletionIssued && previousPresence === "present") {
+          if (!await removedPathStillUnowned()) {
+            const reason = `Removed worktree path ${current.worktreePath} was reused immediately before Supacode deletion; cleanup was refused.`;
+            await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+            return { message: reason, complete: false };
+          }
           const intentAt = isoNow();
           current = {
             ...current,
@@ -5265,7 +6108,8 @@ async function finishRecordedWorktreeCleanup(
           };
           await atomicWrite(cleanupPath, `${JSON.stringify(current, null, 2)}\n`);
           deletionIssued = true;
-          const deleted = await pi.exec(
+          const deleted = await execRejectKilled(
+            pi,
             "supacode",
             ["worktree", "delete", "-w", worktreeId],
             { timeout: 190_000 },
@@ -5355,29 +6199,118 @@ async function recoverUnlaunchedCodingWorktree(
     await updateJobLifecycle(job.jobDir, "recovery_required", reason);
     return { message: reason, complete: false };
   }
-  const plan = metadataRecord(job.metadata, "workspacePlan") ??
+  const planMetadata = metadataRecord(job.metadata, "workspacePlan") ??
     metadataRecord(job.lifecycle.details, "workspacePlan");
-  const branch = plan && metadataString(plan, "branch");
-  const baseSha = plan && metadataString(plan, "baseSha");
+  const planJobId = planMetadata && metadataString(planMetadata, "jobId");
+  const planBatchId = planMetadata && metadataString(planMetadata, "batchId");
+  const provenanceToken = planMetadata && metadataString(planMetadata, "provenanceToken");
+  const repoRoot = planMetadata && metadataString(planMetadata, "repoRoot");
+  const relativeCwd = planMetadata && typeof planMetadata.relativeCwd === "string"
+    ? planMetadata.relativeCwd
+    : undefined;
+  const branch = planMetadata && metadataString(planMetadata, "branch");
+  const folderName = planMetadata && metadataString(planMetadata, "folderName");
+  const baseSha = planMetadata && metadataString(planMetadata, "baseSha");
   const originalCwd = metadataString(job.metadata, "originalCwd");
+  const launchDir = metadataString(job.metadata, "worktreeLaunchDir") ??
+    metadataString(job.lifecycle?.details ?? {}, "worktreeLaunchDir");
+  const launchJobId = metadataString(job.metadata, "worktreeLaunchJobId") ??
+    metadataString(job.lifecycle?.details ?? {}, "worktreeLaunchJobId");
+  const launchNonce = metadataString(job.metadata, "worktreeLaunchNonce") ??
+    metadataString(job.lifecycle?.details ?? {}, "worktreeLaunchNonce");
+  if (
+    job.metadata.worktreeProvenanceVersion !== 1 ||
+    metadataString(job.metadata, "worktreeProvenanceToken") !== provenanceToken ||
+    planJobId !== job.id || planBatchId !== job.batchId || !provenanceToken ||
+    !repoRoot || !path.isAbsolute(repoRoot) || relativeCwd === undefined || !branch ||
+    branch !== `pi-agent/${job.batchId}/${job.id}` || !folderName || !baseSha ||
+    !OBJECT_ID_PATTERN.test(baseSha) || !originalCwd || !launchDir || !launchJobId || !launchNonce
+  ) {
+    await updateJobLifecycle(job.jobDir, "recovery_required", "Full worktree provisioning provenance is incomplete.");
+    return { message: "Full worktree provisioning provenance is incomplete; no resource was removed.", complete: false };
+  }
+  const plan = {
+    jobId: planJobId,
+    batchId: planBatchId,
+    provenanceToken,
+    repoRoot,
+    relativeCwd,
+    branch,
+    folderName,
+    baseSha,
+  } satisfies CodingWorktreePlan;
+  const creation = { launchDir, launchJobId, launchNonce } satisfies SupacodeCreationIntent;
   const observedWorktreeId = metadataString(job.metadata, "observedCodeWorktreeId") ??
     metadataString(job.lifecycle?.details ?? {}, "observedCodeWorktreeId");
   const observedWorktreePath = metadataString(job.metadata, "observedWorktreePath") ??
     metadataString(job.lifecycle?.details ?? {}, "observedWorktreePath");
-  if (!branch || !baseSha || !originalCwd) {
-    await updateJobLifecycle(job.jobDir, "recovery_required", "Worktree provisioning intent is incomplete.");
-    return { message: "Worktree provisioning intent is incomplete; no resource was removed.", complete: false };
+  let provenance = await readWorktreeProvenance(job.jobDir, plan, creation);
+  if (!provenance && (observedWorktreeId || observedWorktreePath)) {
+    if (!observedWorktreeId || !observedWorktreePath) {
+      const reason = "Observed worktree provenance has an incomplete exact ID/path pair; cleanup was refused.";
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: false };
+    }
+    const exactPath = await canonicalizeMissingPath(observedWorktreePath);
+    provenance = await writeWorktreeProvenance(
+      job.jobDir,
+      plan,
+      creation,
+      observedWorktreeId,
+      exactPath,
+      "observed",
+    );
+  }
+  if (!provenance) {
+    const completion = await readJson<SupacodeCreationCompletion>(
+      path.join(creation.launchDir, "creation-complete.json"),
+    );
+    if (completion?.commandStarted && completion.exitCode === 0) {
+      const recoveredId = lastNonEmptyLine(await readText(path.join(creation.launchDir, "stdout.log")));
+      if (recoveredId) {
+        const decodedRecoveredPath = decodeSupacodeResourceId(recoveredId);
+        if (!path.isAbsolute(decodedRecoveredPath)) {
+          const reason = "Worktree creation output did not contain an absolute Supacode resource identity.";
+          await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+          return { message: reason, complete: false };
+        }
+        const recoveredPath = await canonicalizeMissingPath(decodedRecoveredPath);
+        provenance = await writeWorktreeProvenance(
+          job.jobDir,
+          plan,
+          creation,
+          recoveredId,
+          recoveredPath,
+          "observed",
+        );
+      }
+    }
+    if (!provenance) {
+      const noCreation = completion?.commandStarted === false ||
+        (!completion && await validationGateProvesCommandNeverLaunched(
+          creation.launchDir,
+          creation.launchJobId,
+          creation.launchNonce,
+        ));
+      const reason = noCreation
+        ? "The authenticated creator never launched; no worktree resource exists."
+        : "Worktree creation settled without an exact returned resource ID; branch-based recovery is forbidden.";
+      if (noCreation && reconcileAsFailed) await reconcileJobLifecycle(job.jobDir, "failed", reason);
+      else if (!noCreation) await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      return { message: reason, complete: noCreation };
+    }
   }
   const cleanupPath = path.join(job.jobDir, "worktree-cleanup.json");
   const cleanupRecord = await readJson<WorktreeCleanupRecord>(cleanupPath);
   if (cleanupRecord) {
     if (
-      cleanupRecord.schemaVersion !== 1 || cleanupRecord.jobId !== job.id ||
+      cleanupRecord.schemaVersion !== SUBAGENT_SCHEMA_VERSION || cleanupRecord.protocolVersion !== 1 ||
+      cleanupRecord.jobId !== job.id || cleanupRecord.provenanceToken !== plan.provenanceToken ||
+      cleanupRecord.creationLaunchNonce !== creation.launchNonce ||
       cleanupRecord.branch !== branch || !path.isAbsolute(cleanupRecord.worktreePath) ||
       !path.isAbsolute(cleanupRecord.gitDir) || !/^\d+$/.test(cleanupRecord.gitDirDevice) ||
       !/^\d+$/.test(cleanupRecord.gitDirInode) ||
-      (cleanupRecord.worktreeId !== undefined &&
-        (typeof cleanupRecord.worktreeId !== "string" || !cleanupRecord.worktreeId.trim())) ||
+      typeof cleanupRecord.worktreeId !== "string" || !cleanupRecord.worktreeId.trim() ||
       (cleanupRecord.supacodeDeletionIntentAt !== undefined &&
         (typeof cleanupRecord.supacodeDeletionIntentAt !== "string" ||
           !cleanupRecord.supacodeDeletionIntentAt.trim())) ||
@@ -5392,13 +6325,13 @@ async function recoverUnlaunchedCodingWorktree(
     }
     const [canonicalCleanupPath, canonicalCleanupIdPath] = await Promise.all([
       canonicalizeMissingPath(cleanupRecord.worktreePath),
-      cleanupRecord.worktreeId
-        ? canonicalizeMissingPath(decodeSupacodeResourceId(cleanupRecord.worktreeId))
-        : Promise.resolve(undefined),
+      canonicalizeMissingPath(decodeSupacodeResourceId(cleanupRecord.worktreeId)),
     ]);
     if (
       canonicalCleanupPath !== cleanupRecord.worktreePath ||
-      (canonicalCleanupIdPath !== undefined && canonicalCleanupIdPath !== cleanupRecord.worktreePath)
+      canonicalCleanupIdPath !== cleanupRecord.worktreePath ||
+      cleanupRecord.worktreeId !== provenance.worktreeId ||
+      cleanupRecord.worktreePath !== provenance.worktreePath
     ) {
       const reason = "Persisted worktree cleanup path and Supacode identity do not match.";
       await updateJobLifecycle(job.jobDir, "recovery_required", reason);
@@ -5407,59 +6340,51 @@ async function recoverUnlaunchedCodingWorktree(
     const resumed = await finishRecordedWorktreeCleanup(pi, job, cleanupRecord, reconcileAsFailed);
     if (resumed) return resumed;
   }
-  const listed = await gitRawOutput(pi, originalCwd, ["worktree", "list", "--porcelain", "-z"]);
-  const worktree = listed
-    .split("\0\0")
-    .filter(Boolean)
-    .map((block) => {
-      const fields = new Map<string, string>();
-      for (const line of block.split("\0").filter(Boolean)) {
-        const separator = line.indexOf(" ");
-        fields.set(
-          separator < 0 ? line : line.slice(0, separator),
-          separator < 0 ? "" : line.slice(separator + 1),
-        );
-      }
-      return {
-        path: fields.get("worktree"),
-        head: fields.get("HEAD"),
-        branch: fields.get("branch")?.replace(/^refs\/heads\//, ""),
-      };
-    })
-    .find((candidate) => candidate.branch === branch);
-  if (!worktree?.path) {
-    if (observedWorktreeId || observedWorktreePath) {
-      const reason = `Supacode returned an unauthenticated worktree that was retained for manual reconciliation: ${observedWorktreePath ?? "unknown path"} (${observedWorktreeId ?? "unknown ID"}).`;
-      await updateJobLifecycle(job.jobDir, "recovery_required", reason, {
-        observedCodeWorktreeId: observedWorktreeId,
-        observedWorktreePath,
-      });
-      return { message: reason, complete: false };
+  const registered = await gitRawOutput(pi, originalCwd, ["worktree", "list", "--porcelain", "-z"]);
+  const registeredPaths = registered.split("\0\0").flatMap((record) =>
+    record.split("\0").filter((line) => line.startsWith("worktree ")).map((line) => line.slice("worktree ".length))
+  );
+  const canonicalRegisteredPaths = await Promise.all(
+    registeredPaths.map((candidate) => canonicalizeMissingPath(candidate)),
+  );
+  if (!await filePathExists(provenance.worktreePath)) {
+    const resourcePresence = await observeSupacodeWorktree(pi, provenance.worktreeId, { timeoutMs: 30_000 });
+    if (resourcePresence === "absent" && !canonicalRegisteredPaths.includes(provenance.worktreePath)) {
+      const reason = `Exact provisioned worktree ${provenance.worktreePath} is already absent.`;
+      if (reconcileAsFailed) await reconcileJobLifecycle(job.jobDir, "failed", reason);
+      return { message: reason, complete: true };
     }
-    const reason = "No Git worktree exists for the persisted provisioning intent.";
-    if (reconcileAsFailed) await reconcileJobLifecycle(job.jobDir, "failed", reason);
-    return { message: reason, complete: true };
+    const reason = `Exact provisioned worktree ${provenance.worktreePath} is missing, but Git or Supacode still reports its identity; cleanup was refused.`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+    return { message: reason, complete: false };
   }
-  const worktreePath = await fs.promises.realpath(worktree.path);
-  if (observedWorktreePath) {
-    let canonicalObserved: string;
-    try {
-      canonicalObserved = await fs.promises.realpath(observedWorktreePath);
-    } catch {
-      const reason = `Observed Supacode worktree path disappeared before authentication: ${observedWorktreePath} (${observedWorktreeId ?? "unknown ID"}).`;
-      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
-      return { message: reason, complete: false };
-    }
-    if (canonicalObserved !== worktreePath) {
-      const reason = `Observed Supacode worktree ${canonicalObserved} does not match planned worktree ${worktreePath}; both were retained.`;
-      await updateJobLifecycle(job.jobDir, "recovery_required", reason, {
-        observedCodeWorktreeId: observedWorktreeId,
-        observedWorktreePath: canonicalObserved,
-        worktreePath,
-      });
-      return { message: reason, complete: false };
-    }
+  const worktreePath = await fs.promises.realpath(provenance.worktreePath);
+  if (worktreePath !== provenance.worktreePath || !canonicalRegisteredPaths.includes(worktreePath)) {
+    const reason = `Exact provisioned worktree identity changed at ${provenance.worktreePath}; cleanup was refused.`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+    return { message: reason, complete: false };
   }
+  try {
+    await authenticateCreatedCodingWorktree(
+      pi,
+      plan,
+      provenance.worktreeId,
+      worktreePath,
+    );
+    provenance = await writeWorktreeProvenance(
+      job.jobDir,
+      plan,
+      creation,
+      provenance.worktreeId,
+      worktreePath,
+      "authenticated",
+    );
+  } catch (error) {
+    const reason = `Exact provisioned worktree failed authentication and was retained: ${error instanceof Error ? error.message : String(error)}`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", reason, { worktreePath });
+    return { message: reason, complete: false };
+  }
+  const worktree = { head: await gitOutput(pi, worktreePath, ["rev-parse", "HEAD"]) };
   const status = await gitRawOutput(pi, worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]);
   if (worktree.head !== baseSha || status.trim()) {
     const reason = `Recovered worktree ${worktreePath} is not an untouched delegation base; it was retained.`;
@@ -5473,22 +6398,19 @@ async function recoverUnlaunchedCodingWorktree(
   );
   const worktreeGitDir = await fs.promises.realpath(worktreeGitDirOutput.trim());
   const worktreeGitDirStat = await fs.promises.stat(worktreeGitDir);
-  const supacodeList = await execChecked(pi, "supacode", ["worktree", "list"], { timeout: 30_000 });
-  const worktreeId = findSupacodePathId(supacodeList, worktreePath) ?? observedWorktreeId;
-  if (worktreeId) {
-    let worktreeIdPath: string;
-    try {
-      worktreeIdPath = await canonicalizeMissingPath(decodeSupacodeResourceId(worktreeId));
-    } catch {
-      const reason = `Observed Supacode worktree ID is not a valid path: ${worktreeId}`;
-      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
-      return { message: reason, complete: false };
-    }
-    if (worktreeIdPath !== worktreePath) {
-      const reason = `Observed Supacode worktree ID does not match authenticated path ${worktreePath}; Git cleanup was refused.`;
-      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
-      return { message: reason, complete: false };
-    }
+  const worktreeId = provenance.worktreeId;
+  let worktreeIdPath: string;
+  try {
+    worktreeIdPath = await canonicalizeMissingPath(decodeSupacodeResourceId(worktreeId));
+  } catch {
+    const reason = `Provenance Supacode worktree ID is not a valid path: ${worktreeId}`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+    return { message: reason, complete: false };
+  }
+  if (worktreeIdPath !== worktreePath) {
+    const reason = `Provenance Supacode worktree ID does not match authenticated path ${worktreePath}; Git cleanup was refused.`;
+    await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+    return { message: reason, complete: false };
   }
   if (cleanupRecord && cleanupRecord.worktreePath !== worktreePath) {
     const reason = `Persisted cleanup path ${cleanupRecord.worktreePath} does not match recovered worktree ${worktreePath}.`;
@@ -5497,10 +6419,13 @@ async function recoverUnlaunchedCodingWorktree(
   }
   const now = isoNow();
   const transaction = {
-    schemaVersion: 1,
+    schemaVersion: SUBAGENT_SCHEMA_VERSION,
+    protocolVersion: 1,
     jobId: job.id,
+    provenanceToken: plan.provenanceToken,
+    creationLaunchNonce: creation.launchNonce,
     worktreePath,
-    worktreeId: cleanupRecord?.worktreeId ?? worktreeId,
+    worktreeId,
     gitDir: worktreeGitDir,
     gitDirDevice: String(worktreeGitDirStat.dev),
     gitDirInode: String(worktreeGitDirStat.ino),
@@ -5510,7 +6435,8 @@ async function recoverUnlaunchedCodingWorktree(
     updatedAt: now,
   } satisfies WorktreeCleanupRecord;
   await atomicWrite(cleanupPath, `${JSON.stringify(transaction, null, 2)}\n`);
-  const removed = await pi.exec(
+  const removed = await execRejectKilled(
+    pi,
     "git",
     ["-C", originalCwd, "worktree", "remove", worktreePath],
     { timeout: 60_000 },
@@ -5579,7 +6505,7 @@ async function recoverCreationLaunchProcess(
     }
     if (!processGroupAbsent) return false;
     for (let attempt = 0; attempt < 2; attempt++) {
-      const barrier = await pi.exec("supacode", ["worktree", "list"], { timeout: 30_000 });
+      const barrier = await execRejectKilled(pi, "supacode", ["worktree", "list"], { timeout: 30_000 });
       if (barrier.code !== 0) return false;
       if (attempt === 0) await delay(100);
     }
@@ -5757,7 +6683,7 @@ async function recoverActiveReviewerResources(
         if (unstarted.recovered && unstarted.batch) {
           batches.set(unstarted.batch.id, unstarted.batch);
           const recoveryMessage = unstarted.message ?? `Reviewer ${binding.jobId} never launched.`;
-          await claimWorkerTerminal(
+          const winningTerminal = await claimWorkerTerminal(
             refreshed.jobDir,
             binding.jobId,
             "recovery",
@@ -5770,7 +6696,11 @@ async function recoverActiveReviewerResources(
             } satisfies WorkerStatus,
             recoveryMessage,
           );
-          await reconcileJobLifecycle(refreshed.jobDir, "cancelled", recoveryMessage);
+          await reconcileJobLifecycle(
+            refreshed.jobDir,
+            terminalLifecyclePhase(winningTerminal.record.status),
+            winningTerminal.record.status.errorMessage ?? recoveryMessage,
+          );
           messages.push(recoveryMessage);
           continue;
         }
@@ -5830,7 +6760,7 @@ async function recoverActiveReviewerResources(
         if (unstartedSurface.recovered && unstartedSurface.batch) {
           batches.set(unstartedSurface.batch.id, unstartedSurface.batch);
           const recoveryMessage = unstartedSurface.message ?? `Reviewer ${binding.jobId} never launched.`;
-          await claimWorkerTerminal(
+          const winningTerminal = await claimWorkerTerminal(
             resolvedBindingDir,
             binding.jobId,
             "recovery",
@@ -5843,7 +6773,11 @@ async function recoverActiveReviewerResources(
             } satisfies WorkerStatus,
             recoveryMessage,
           );
-          await reconcileJobLifecycle(resolvedBindingDir, "cancelled", recoveryMessage);
+          await reconcileJobLifecycle(
+            resolvedBindingDir,
+            terminalLifecyclePhase(winningTerminal.record.status),
+            winningTerminal.record.status.errorMessage ?? recoveryMessage,
+          );
           messages.push(recoveryMessage);
           continue;
         }
@@ -5862,6 +6796,7 @@ async function recoverActiveReviewerResources(
           pi,
           { id, jobDir: resolvedBindingDir, tabWorktreeId: worktreeId, tabId, surfaceId, launchNonce },
           terminal?.status.processIdentity ?? status?.processIdentity,
+          { owner: "recovery", reason: "Recovering retained reviewer resources." },
         );
         await atomicWrite(
           path.join(resolvedBindingDir, "termination.json"),
@@ -6102,7 +7037,8 @@ async function recoverEvaluatorCheckouts(
       if (!canonicalRegisteredPaths.includes(resolvedCheckout)) {
         throw new Error("Evaluator checkout is not registered to the authenticated repository.");
       }
-      const removed = await pi.exec(
+      const removed = await execRejectKilled(
+        pi,
         "git",
         ["-C", canonicalRepositoryRoot, "worktree", "remove", "--force", resolvedCheckout],
         { timeout: 60_000 },
@@ -6140,6 +7076,18 @@ async function recoverLifecycleJob(
   job: LifecycleJobRecord,
   acceptResolvedConflicts = false,
 ): Promise<string> {
+  let authorization: OrchestratorRecoveryAuthorization;
+  try {
+    authorization = await authorizeOrchestratorRecovery(
+      job.jobDir,
+      job.id,
+      job.metadata.orchestratorLeaseVersion,
+    );
+  } catch (error) {
+    return `Authenticated orchestrator ownership could not be verified; recovery was refused: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (!authorization.allowed) return authorization.reason;
+
   if (job.decision?.owner === "cancel") {
     const messages = [await cancelLifecycleJob(pi, job, "Recovered an interrupted cancellation decision.")];
     const refreshed = await resolveLifecycleJob(getAgentDir(), job.id);
@@ -6247,7 +7195,12 @@ async function recoverLifecycleJob(
     const missingNormalExit = terminal.owner === "worker" && !runnerExit;
     let processes: { absent: boolean; states: Array<"alive" | "missing" | "mismatch" | "unknown"> };
     if (resource) {
-      const termination = await terminateWorker(pi, resource, terminal.status.processIdentity);
+      const termination = await terminateWorker(
+        pi,
+        resource,
+        terminal.status.processIdentity,
+        { owner: "recovery", reason: "Reconciling terminal delegated-worker resources." },
+      );
       await atomicWrite(
         path.join(workerDir, "termination.json"),
         `${JSON.stringify(termination, null, 2)}\n`,
@@ -6323,34 +7276,63 @@ async function recoverLifecycleJob(
             stopReason: "recovered_orphan",
             errorMessage: message,
           } satisfies WorkerStatus;
-          await claimWorkerTerminal(workerDir, job.id, "recovery", recoveredStatus, message);
-          if (!delegateLoop) await reconcileJobLifecycle(job.jobDir, "failed", message);
+          const winningTerminal = await claimWorkerTerminal(
+            workerDir,
+            job.id,
+            "recovery",
+            recoveredStatus,
+            message,
+          );
+          await restoreWorkerTerminalProjection(workerDir, winningTerminal.record);
+          if (!delegateLoop) {
+            await reconcileJobLifecycle(
+              job.jobDir,
+              terminalLifecyclePhase(winningTerminal.record.status),
+              winningTerminal.record.status.errorMessage ?? message,
+            );
+          }
           evaluatorCleanupSafe = true;
-          messages.push(message);
+          messages.push(winningTerminal.record.status.errorMessage ?? message);
         }
       }
     }
   } else if (resource) {
-    const termination = await terminateWorker(pi, resource);
+    const termination = await terminateWorker(
+      pi,
+      resource,
+      undefined,
+      { owner: "recovery", reason: "Recovering a pre-runner delegated-worker surface." },
+    );
     await atomicWrite(
       path.join(workerDir, "termination.json"),
       `${JSON.stringify(termination, null, 2)}\n`,
     );
     if (termination.verified) {
-      const message = "Recovered a surface whose worker runner had not reached terminal publication.";
-      const recoveredStatus = {
-        state: "failed",
-        launchNonce: resource.launchNonce,
-        completedAt: isoNow(),
-        stopReason: "recovered_prelaunch_surface",
-        errorMessage: message,
+      const fallbackReason = "Recovered a surface whose worker runner had not reached terminal publication.";
+      const settlement = terminationSettlement(
         termination,
-      } satisfies WorkerStatus;
-      await atomicWrite(path.join(workerDir, "status.json"), `${JSON.stringify(recoveredStatus)}\n`);
-      await claimWorkerTerminal(workerDir, job.id, "recovery", recoveredStatus, message);
-      if (!delegateLoop) await reconcileJobLifecycle(job.jobDir, "failed", message);
+        status,
+        resource.launchNonce,
+        "recovery",
+        fallbackReason,
+      );
+      const winningTerminal = await claimWorkerTerminal(
+        workerDir,
+        job.id,
+        settlement.terminalOwner,
+        settlement.status,
+        settlement.reason,
+      );
+      await restoreWorkerTerminalProjection(workerDir, winningTerminal.record);
+      if (!delegateLoop) {
+        await reconcileJobLifecycle(
+          job.jobDir,
+          terminalLifecyclePhase(winningTerminal.record.status),
+          winningTerminal.record.status.errorMessage ?? settlement.reason,
+        );
+      }
       evaluatorCleanupSafe = true;
-      messages.push(message);
+      messages.push(winningTerminal.record.status.errorMessage ?? settlement.reason);
     } else {
       const reason = `Pre-runner surface recovery is indeterminate: ${termination.errors.join(" ")}`;
       await updateJobLifecycle(job.jobDir, "recovery_required", reason);
@@ -6365,16 +7347,29 @@ async function recoverLifecycleJob(
       stopReason: delegateLoop ? "recovery_required" : "recovered_prelaunch_batch",
       errorMessage: message,
     } satisfies WorkerStatus;
-    await atomicWrite(path.join(workerDir, "status.json"), `${JSON.stringify(recoveredStatus)}\n`);
-    await claimWorkerTerminal(workerDir, job.id, "recovery", recoveredStatus, message);
+    const winningTerminal = await claimWorkerTerminal(
+      workerDir,
+      job.id,
+      "recovery",
+      recoveredStatus,
+      message,
+    );
+    await restoreWorkerTerminalProjection(workerDir, winningTerminal.record);
     if (delegateLoop) {
-      await atomicWrite(path.join(job.jobDir, "status.json"), `${JSON.stringify(recoveredStatus)}\n`);
-      canonicalLoopStatus = recoveredStatus;
+      await atomicWrite(
+        path.join(job.jobDir, "status.json"),
+        `${JSON.stringify(winningTerminal.record.status)}\n`,
+      );
+      canonicalLoopStatus = winningTerminal.record.status;
     } else {
-      await reconcileJobLifecycle(job.jobDir, "failed", message);
+      await reconcileJobLifecycle(
+        job.jobDir,
+        terminalLifecyclePhase(winningTerminal.record.status),
+        winningTerminal.record.status.errorMessage ?? message,
+      );
     }
     evaluatorCleanupSafe = true;
-    messages.push(message);
+    messages.push(winningTerminal.record.status.errorMessage ?? message);
   } else {
     await updateJobLifecycle(
       job.jobDir,
@@ -6405,16 +7400,34 @@ async function recoverLifecycleJob(
   }
 
   if (delegateLoop && evaluatorCleanupSafe && evaluatorRecoveryComplete) {
-    const acceptanceIntent = await readLoopAcceptanceIntent(job.jobDir, job.id);
+    let acceptanceIntent: LoopAcceptanceIntent | undefined;
+    let acceptanceVerificationFailed = false;
+    try {
+      acceptanceIntent = await readVerifiedLoopAcceptance(job.jobDir, job.id);
+    } catch (error) {
+      acceptanceVerificationFailed = true;
+      const reason = `Accepted delegate-loop evidence is invalid: ${error instanceof Error ? error.message : String(error)}`;
+      await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+      messages.push(reason);
+    }
     if (job.decision?.owner === "accept" || acceptanceIntent) {
       try {
         const intent = acceptanceIntent;
         const worktreePath = metadataString(job.metadata, "worktreePath");
         const branch = metadataString(job.metadata, "branch");
         const baseSha = metadataString(job.metadata, "baseSha");
-        if (!intent || !worktreePath || !branch || !baseSha) {
+        const originalCwd = metadataString(job.metadata, "originalCwd");
+        if (!intent || !worktreePath || !branch || !baseSha || !originalCwd) {
           throw new Error("Accepted delegate loop has incomplete recovery intent or workspace identity.");
         }
+        const destinationRoot = await fs.promises.realpath(
+          await gitOutput(pi, originalCwd, ["rev-parse", "--show-toplevel"]),
+        );
+        if (
+          intent.delegation.baseSha !== baseSha ||
+          intent.delegation.branch !== branch ||
+          intent.delegation.destinationRoot !== destinationRoot
+        ) throw new Error("Accepted delegate-loop recovery identity does not match its hashed policy.");
         await verifyLoopCandidateSource(
           pi,
           { id: job.id, worktreePath, branch, baseSha },
@@ -6440,6 +7453,9 @@ async function recoverLifecycleJob(
               acceptedTree: intent.candidate.tree,
               acceptedCommit: intent.candidate.commit,
               acceptedRef: intent.candidate.ref,
+              acceptedGateManifestPath: intent.gateManifest.path,
+              acceptedGateManifestSha256: intent.gateManifest.sha256,
+              acceptedPolicySha256: intent.policy.sha256,
             }, null, 2)}\n`,
           );
           await atomicWrite(
@@ -6457,6 +7473,9 @@ async function recoverLifecycleJob(
             acceptedTree: intent.candidate.tree,
             acceptedCommit: intent.candidate.commit,
             acceptedRef: intent.candidate.ref,
+            acceptedGateManifestPath: intent.gateManifest.path,
+            acceptedGateManifestSha256: intent.gateManifest.sha256,
+            acceptedPolicySha256: intent.policy.sha256,
           });
           messages.push("Recovered accepted delegate-loop metadata from its immutable acceptance intent.");
         }
@@ -6467,9 +7486,13 @@ async function recoverLifecycleJob(
       }
     } else {
       const stopReason = canonicalLoopStatus?.stopReason;
-      if (stopReason === "delegate_loop_awaiting_apply" && canonicalLoopStatus?.state === "completed") {
-        await reconcileJobLifecycle(job.jobDir, "completed");
-        messages.push("Canonical delegate-loop state reconciled as awaiting apply.");
+      if (acceptanceVerificationFailed ||
+          (stopReason === "delegate_loop_awaiting_apply" && canonicalLoopStatus?.state === "completed")) {
+        const reason = acceptanceVerificationFailed
+          ? "Delegate-loop acceptance verification failed; completed lifecycle reconciliation was refused."
+          : "Canonical awaiting-apply status has no verified acceptance intent and exclusive accept decision.";
+        await updateJobLifecycle(job.jobDir, "recovery_required", reason);
+        messages.push(reason);
       } else if (stopReason === "delegate_loop_cancelled") {
         await reconcileJobLifecycle(job.jobDir, "cancelled", canonicalLoopStatus?.errorMessage);
         messages.push("Canonical delegate-loop state reconciled as cancelled.");
@@ -6508,6 +7531,7 @@ async function recoverLifecycleJob(
         destination,
         undefined,
         acceptResolvedConflicts,
+        job.id,
       );
       messages.push(apply.message, ...apply.transactions);
     } catch (error) {
@@ -6527,10 +7551,10 @@ const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "x
 });
 
 const SingleParams = Type.Object({
-  task: Type.String({ minLength: 1, pattern: "\\S", description: "Self-contained task; no parent conversation." }),
-  title: Type.Optional(Type.String({ description: "Pane title." })),
+  task: Type.String({ minLength: 1, maxLength: MAX_TASK_LENGTH, pattern: "\\S", description: "Self-contained task; no parent conversation." }),
+  title: Type.Optional(Type.String({ maxLength: MAX_TITLE_LENGTH, description: "Pane title." })),
   mode: Type.Optional(ModeSchema),
-  model: Type.Optional(Type.String({ minLength: 1, pattern: "\\S", description: "Pi model pattern; inherits parent." })),
+  model: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_MODEL_LENGTH, pattern: "\\S", description: "Pi model pattern; inherits parent." })),
   thinking: Type.Optional(ThinkingSchema),
   timeoutSeconds: Type.Optional(
     Type.Integer({ minimum: 30, maximum: 3600, default: DEFAULT_TIMEOUT_SECONDS, description: "Worker timeout." }),
@@ -6541,10 +7565,10 @@ const SingleParams = Type.Object({
 });
 
 const ParallelTask = Type.Object({
-  task: Type.String({ minLength: 1, pattern: "\\S", description: "Self-contained task; no parent conversation." }),
-  title: Type.Optional(Type.String({ description: "Pane title." })),
+  task: Type.String({ minLength: 1, maxLength: MAX_TASK_LENGTH, pattern: "\\S", description: "Self-contained task; no parent conversation." }),
+  title: Type.Optional(Type.String({ maxLength: MAX_TITLE_LENGTH, description: "Pane title." })),
   mode: Type.Optional(ModeSchema),
-  model: Type.Optional(Type.String({ minLength: 1, pattern: "\\S", description: "Pi model pattern; inherits parent." })),
+  model: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_MODEL_LENGTH, pattern: "\\S", description: "Pi model pattern; inherits parent." })),
   thinking: Type.Optional(ThinkingSchema),
 });
 
@@ -6579,20 +7603,20 @@ const LoopCheckSchema = Type.Object({
 });
 
 const LoopReviewerSchema = Type.Object({
-  focus: Type.String({ minLength: 1, pattern: "\\S", description: "Review focus and acceptance rubric." }),
-  title: Type.Optional(Type.String({ description: "Pane title." })),
+  focus: Type.String({ minLength: 1, maxLength: MAX_REVIEW_FOCUS_LENGTH, pattern: "\\S", description: "Review focus and acceptance rubric." }),
+  title: Type.Optional(Type.String({ maxLength: MAX_TITLE_LENGTH, description: "Pane title." })),
   skills: Type.Optional(
-    Type.Array(Type.String({ minLength: 1, pattern: "\\S" }), {
+    Type.Array(Type.String({ minLength: 1, maxLength: MAX_SKILL_PATH_LENGTH, pattern: "\\S" }), {
       maxItems: 16,
       description: "Trusted skill paths; relative paths use the package root.",
     }),
   ),
-  model: Type.Optional(Type.String({ minLength: 1, pattern: "\\S", description: "Pi model pattern; inherits parent." })),
+  model: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_MODEL_LENGTH, pattern: "\\S", description: "Pi model pattern; inherits parent." })),
   thinking: Type.Optional(ThinkingSchema),
 });
 
 const DelegateLoopParams = Type.Object({
-  task: Type.String({ minLength: 1, pattern: "\\S", description: "Self-contained objective, acceptance criteria, and boundaries." }),
+  task: Type.String({ minLength: 1, maxLength: MAX_TASK_LENGTH, pattern: "\\S", description: "Self-contained objective, acceptance criteria, and boundaries." }),
   checks: Type.Array(LoopCheckSchema, {
     minItems: 1,
     maxItems: MAX_LOOP_CHECKS,
@@ -6605,8 +7629,8 @@ const DelegateLoopParams = Type.Object({
       description: "One-off reviewer overrides; omit for configured profiles.",
     }),
   ),
-  title: Type.Optional(Type.String({ description: "Loop and coding-worker title." })),
-  model: Type.Optional(Type.String({ minLength: 1, pattern: "\\S", description: "Coding model pattern; inherits parent." })),
+  title: Type.Optional(Type.String({ maxLength: MAX_TITLE_LENGTH, description: "Loop and coding-worker title." })),
+  model: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_MODEL_LENGTH, pattern: "\\S", description: "Coding model pattern; inherits parent." })),
   thinking: Type.Optional(ThinkingSchema),
   maxAttempts: Type.Optional(
     Type.Integer({
@@ -6683,7 +7707,165 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
           "info",
         );
       } catch (error) {
-        ctx.ui.notify(`Could not read delegation status: ${error instanceof Error ? error.message : String(error)}`, "error");
+        ctx.ui.notify(escapeTerminalText(`Could not read delegation status: ${error instanceof Error ? error.message : String(error)}`), "error");
+      }
+    },
+  });
+
+  pi.registerCommand("delegate-prune", {
+    description: "Delete bounded old research-worker artifacts after verifying resource absence",
+    handler: async (_args, ctx) => {
+      try {
+        await ctx.waitForIdle();
+        if (!ctx.hasUI) {
+          ctx.ui.notify("/delegate-prune requires an interactive confirmation UI.", "error");
+          return;
+        }
+        const cutoff = Date.now() - RESEARCH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+        const lifecycleJobs = await listLifecycleJobs(getAgentDir());
+        const protectedReviewerDirs = await protectedLoopReviewerJobDirs(lifecycleJobs);
+        const terminalResearch = lifecycleJobs.filter((job) =>
+          job.mode === "research" &&
+          ["completed", "failed", "timed_out", "cancelled"].includes(job.lifecycle?.phase ?? ""));
+        const candidates = terminalResearch
+          .slice(RESEARCH_RETENTION_MAX_JOBS)
+          .filter((job) => !protectedReviewerDirs.has(path.resolve(job.jobDir)))
+          .filter((job) => {
+            const created = job.createdAt ? Date.parse(job.createdAt) : Number.NaN;
+            return Number.isFinite(created) && created < cutoff;
+          });
+        const eligible: LifecycleJobRecord[] = [];
+        const retained: string[] = [];
+        for (const job of candidates) {
+          try {
+            const result = await researchJobPrunable(pi, job);
+            if (result.eligible) eligible.push(job);
+            else retained.push(`${job.id.slice(0, 8)}: ${result.reason ?? "not eligible"}`);
+          } catch (error) {
+            retained.push(`${job.id.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        if (eligible.length === 0) {
+          ctx.ui.notify(
+            escapeTerminalText(
+              candidates.length === 0
+                ? `No research artifacts exceed both retention limits (${RESEARCH_RETENTION_DAYS} days and newest ${RESEARCH_RETENTION_MAX_JOBS} jobs).`
+                : `No old research artifacts were safe to prune.\n${retained.join("\n")}`,
+            ),
+            retained.length > 0 ? "warning" : "info",
+          );
+          return;
+        }
+        const confirmed = await ctx.ui.confirm(
+          "Delete old delegated research artifacts?",
+          escapeTerminalText([
+            `Delete ${eligible.length} terminal research job director${eligible.length === 1 ? "y" : "ies"}?`,
+            `Policy: older than ${RESEARCH_RETENTION_DAYS} days and outside the newest ${RESEARCH_RETENTION_MAX_JOBS} terminal research jobs.`,
+            "Coding jobs, live/unknown resources, and recovery-required artifacts are retained.",
+            "",
+            ...eligible.slice(0, 50).map((job) => `- ${job.id}  ${job.jobDir}`),
+            ...(eligible.length > 50 ? [`- … ${eligible.length - 50} more`] : []),
+          ].join("\n")),
+        );
+        if (!confirmed) return;
+        const freshJobs = await listLifecycleJobs(getAgentDir());
+        const freshProtectedReviewerDirs = await protectedLoopReviewerJobDirs(freshJobs);
+        const freshCandidateIds = new Set(
+          freshJobs
+            .filter((job) => job.mode === "research" &&
+              ["completed", "failed", "timed_out", "cancelled"].includes(job.lifecycle?.phase ?? ""))
+            .slice(RESEARCH_RETENTION_MAX_JOBS)
+            .filter((job) => !freshProtectedReviewerDirs.has(path.resolve(job.jobDir)))
+            .filter((job) => {
+              const created = job.createdAt ? Date.parse(job.createdAt) : Number.NaN;
+              return Number.isFinite(created) && created < cutoff;
+            })
+            .map((job) => job.id),
+        );
+        let deleted = 0;
+        const skipped: string[] = [];
+        for (const selected of eligible) {
+          let pruningLease: OrchestratorRecoveryLease | undefined;
+          let removed = false;
+          try {
+            const job = await resolveLifecycleJob(getAgentDir(), selected.id);
+            const created = job.createdAt ? Date.parse(job.createdAt) : Number.NaN;
+            const stillRetainedByPolicy = !freshCandidateIds.has(job.id) || job.mode !== "research" ||
+              !Number.isFinite(created) || created >= cutoff ||
+              !["completed", "failed", "timed_out", "cancelled"].includes(job.lifecycle?.phase ?? "") ||
+              path.resolve(job.jobDir) !== path.resolve(selected.jobDir);
+            if (stillRetainedByPolicy) {
+              skipped.push(`${selected.id.slice(0, 8)}: eligibility changed after confirmation`);
+              continue;
+            }
+            const leaseAcquisition = await acquireOrchestratorRecoveryLease(
+              job.jobDir,
+              job.id,
+              job.metadata.orchestratorLeaseVersion,
+            );
+            if (!leaseAcquisition.acquired) {
+              skipped.push(`${selected.id.slice(0, 8)}: ${leaseAcquisition.reason}`);
+              continue;
+            }
+            pruningLease = leaseAcquisition.lease;
+            const lockedJob = await resolveLifecycleJob(getAgentDir(), selected.id);
+            const lockedCreated = lockedJob.createdAt ? Date.parse(lockedJob.createdAt) : Number.NaN;
+            const lockedJobs = await listLifecycleJobs(getAgentDir());
+            const lockedProtectedReviewerDirs = await protectedLoopReviewerJobDirs(lockedJobs);
+            const lockedCandidateIds = new Set(
+              lockedJobs
+                .filter((candidate) => candidate.mode === "research" &&
+                  ["completed", "failed", "timed_out", "cancelled"].includes(candidate.lifecycle?.phase ?? ""))
+                .slice(RESEARCH_RETENTION_MAX_JOBS)
+                .filter((candidate) => !lockedProtectedReviewerDirs.has(path.resolve(candidate.jobDir)))
+                .filter((candidate) => {
+                  const candidateCreated = candidate.createdAt ? Date.parse(candidate.createdAt) : Number.NaN;
+                  return Number.isFinite(candidateCreated) && candidateCreated < cutoff;
+                })
+                .map((candidate) => candidate.id),
+            );
+            if (
+              !lockedCandidateIds.has(lockedJob.id) || lockedJob.mode !== "research" ||
+              !Number.isFinite(lockedCreated) || lockedCreated >= cutoff ||
+              !["completed", "failed", "timed_out", "cancelled"].includes(lockedJob.lifecycle?.phase ?? "") ||
+              path.resolve(lockedJob.jobDir) !== path.resolve(selected.jobDir) ||
+              lockedProtectedReviewerDirs.has(path.resolve(lockedJob.jobDir))
+            ) {
+              skipped.push(`${selected.id.slice(0, 8)}: eligibility changed while acquiring prune ownership`);
+              continue;
+            }
+            const revalidated = await researchJobPrunable(pi, lockedJob);
+            if (!revalidated.eligible) {
+              skipped.push(`${selected.id.slice(0, 8)}: ${revalidated.reason ?? "no longer eligible"}`);
+              continue;
+            }
+            await fs.promises.rm(lockedJob.jobDir, { recursive: true, force: true });
+            removed = true;
+            deleted++;
+          } catch (error) {
+            skipped.push(`${selected.id.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`);
+          } finally {
+            if (pruningLease && !removed && await lexicalPathExists(pruningLease.jobDir)) {
+              try {
+                await pruningLease.release();
+              } catch (error) {
+                skipped.push(`${selected.id.slice(0, 8)}: recovery-claim release failed: ${error instanceof Error ? error.message : String(error)}`);
+              }
+            }
+          }
+        }
+        ctx.ui.notify(
+          escapeTerminalText([
+            `Deleted ${deleted} old research artifact director${deleted === 1 ? "y" : "ies"}.`,
+            ...skipped.map((message) => `Retained ${message}`),
+          ].join("\n")),
+          skipped.length > 0 ? "warning" : "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(
+          escapeTerminalText(`Could not prune delegation artifacts: ${error instanceof Error ? error.message : String(error)}`),
+          "error",
+        );
       }
     },
   });
@@ -6691,6 +7873,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
   pi.registerCommand("delegate-cancel", {
     description: "Request cancellation and verify termination of a delegated worker",
     handler: async (args, ctx) => {
+      let cancellationLease: OrchestratorRecoveryLease | undefined;
       try {
         if (!ctx.hasUI) {
           ctx.ui.notify("/delegate-cancel requires an interactive confirmation UI.", "error");
@@ -6718,12 +7901,30 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
           `${formatLifecycleStatus(job)}\n\nCancellation closes the exact worker surface and verifies recorded process identities before reporting success.`,
         );
         if (!confirmed) return;
+        const leaseAcquisition = await acquireOrchestratorRecoveryLease(
+          job.jobDir,
+          job.id,
+          job.metadata.orchestratorLeaseVersion,
+          { allowLiveOrchestrator: true },
+        );
+        if (!leaseAcquisition.acquired) {
+          ctx.ui.notify(escapeTerminalText(`Cancellation was not started: ${leaseAcquisition.reason}`), "warning");
+          return;
+        }
+        cancellationLease = leaseAcquisition.lease;
         ctx.ui.setStatus("delegate-cancel", `Cancelling ${job.id.slice(0, 8)}...`);
         const result = await cancelLifecycleJob(pi, job, "Cancelled by explicit /delegate-cancel request.");
-        ctx.ui.notify(result, result.includes("indeterminate") ? "warning" : "info");
+        ctx.ui.notify(escapeTerminalText(result), result.includes("indeterminate") ? "warning" : "info");
       } catch (error) {
-        ctx.ui.notify(`Could not cancel delegation: ${error instanceof Error ? error.message : String(error)}`, "error");
+        ctx.ui.notify(escapeTerminalText(`Could not cancel delegation: ${error instanceof Error ? error.message : String(error)}`), "error");
       } finally {
+        if (cancellationLease) {
+          try {
+            await cancellationLease.release();
+          } catch (error) {
+            ctx.ui.notify(escapeTerminalText(`Could not release cancellation ownership: ${error instanceof Error ? error.message : String(error)}`), "error");
+          }
+        }
         ctx.ui.setStatus("delegate-cancel", undefined);
       }
     },
@@ -6732,6 +7933,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
   pi.registerCommand("delegate-recover", {
     description: "Reconcile interrupted delegation metadata and stale destination apply state",
     handler: async (args, ctx) => {
+      let recoveryLease: OrchestratorRecoveryLease | undefined;
       try {
         await ctx.waitForIdle();
         if (!ctx.hasUI) {
@@ -6759,6 +7961,16 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
           `${formatLifecycleStatus(job)}\n\nRecovery only removes a destination lock after proving its recorded owner is gone; ambiguous state remains blocked.`,
         );
         if (!confirmed) return;
+        const leaseAcquisition = await acquireOrchestratorRecoveryLease(
+          job.jobDir,
+          job.id,
+          job.metadata.orchestratorLeaseVersion,
+        );
+        if (!leaseAcquisition.acquired) {
+          ctx.ui.notify(escapeTerminalText(`Recovery was not started: ${leaseAcquisition.reason}`), "warning");
+          return;
+        }
+        recoveryLease = leaseAcquisition.lease;
         ctx.ui.setStatus("delegate-recover", `Recovering ${job.id.slice(0, 8)}...`);
         let result = await recoverLifecycleJob(pi, job);
         if (result.includes("conflict resolution requires explicit confirmation")) {
@@ -6771,10 +7983,17 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
             result += `\n${await recoverLifecycleJob(pi, refreshed, true)}`;
           }
         }
-        ctx.ui.notify(result, result.includes("required") || result.includes("indeterminate") ? "warning" : "info");
+        ctx.ui.notify(escapeTerminalText(result), result.includes("required") || result.includes("indeterminate") ? "warning" : "info");
       } catch (error) {
-        ctx.ui.notify(`Could not recover delegation: ${error instanceof Error ? error.message : String(error)}`, "error");
+        ctx.ui.notify(escapeTerminalText(`Could not recover delegation: ${error instanceof Error ? error.message : String(error)}`), "error");
       } finally {
+        if (recoveryLease) {
+          try {
+            await recoveryLease.release();
+          } catch (error) {
+            ctx.ui.notify(escapeTerminalText(`Could not release recovery ownership: ${error instanceof Error ? error.message : String(error)}`), "error");
+          }
+        }
         ctx.ui.setStatus("delegate-recover", undefined);
       }
     },
@@ -6808,7 +8027,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
         ctx.ui.setStatus("delegate-apply", "Preparing delegated changes...");
         prepared = await prepareDelegateHandoff(pi, jobId, undefined, getAgentDir());
         if (prepared.blockers.length > 0) {
-          ctx.ui.notify(`Cannot apply delegated changes:\n${prepared.blockers.join("\n")}`, "error");
+          ctx.ui.notify(escapeTerminalText(`Cannot apply delegated changes:\n${prepared.blockers.join("\n")}`), "error");
           await discardPreparedDelegateHandoff(prepared);
           prepared = undefined;
           return;
@@ -6835,7 +8054,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
       } catch (error) {
         if (prepared) await discardPreparedDelegateHandoff(prepared);
         const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`Could not apply delegated changes: ${message}`, "error");
+        ctx.ui.notify(escapeTerminalText(`Could not apply delegated changes: ${message}`), "error");
       } finally {
         ctx.ui.setStatus("delegate-apply", undefined);
       }
@@ -6951,7 +8170,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
       await assertCleanLoopParent(pi, ctx.cwd, signal);
       const confirmed = await ctx.ui.confirm(
         "Run delegated coding loop?",
-        `Objective: ${truncateHead(options.task, { maxBytes: 2048, maxLines: 30 }).content}\n\nValidation commands:\n${options.checks.map((check) => `- ${check.command}`).join("\n")}\n\nReviewer profiles:\n${options.reviewers.map((reviewer) => `- ${reviewer.title}${reviewer.skillPaths.length > 0 ? ` (skills: ${reviewer.skillPaths.join(", ")})` : ""}`).join("\n")}\n\nThese commands execute on the host in a separate Git worktree, not a security sandbox.`,
+        escapeTerminalText(`Objective: ${truncateHead(options.task, { maxBytes: 2048, maxLines: 30 }).content}\n\nValidation commands:\n${options.checks.map((check) => `- ${check.command}`).join("\n")}\n\nReviewer profiles:\n${options.reviewers.map((reviewer) => `- ${reviewer.title}${reviewer.skillPaths.length > 0 ? ` (skills: ${reviewer.skillPaths.join(", ")})` : ""}`).join("\n")}\n\nThese commands execute on the host in a separate Git worktree, not a security sandbox.`),
         { signal },
       );
       signal?.throwIfAborted();
@@ -6974,7 +8193,7 @@ export default function supacodeSubagents(pi: ExtensionAPI) {
       );
       return {
         content: [{ type: "text", text: formatDelegateLoopResult(result) }],
-        details: result,
+        details: loopResultDetails(result),
         ...(result.usage ? { usage: result.usage } : {}),
       };
     },
