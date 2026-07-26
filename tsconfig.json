@@ -13,6 +13,6 @@
     ]
   },
   "include": [
-    "extensions/supacode-subagents/**/*.ts"
+    "extensions/**/*.ts"
   ]
 }

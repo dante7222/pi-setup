@@ -35,12 +35,6 @@
       "gradlew *": "allow",
       "./gradlew *": "allow"
     },
-    "task": {
-      "*": "ask",
-      "research": "allow",
-      "coding": "allow",
-      "apply": "allow"
-    },
     "webfetch": "allow",
     "websearch": "allow",
     "get_search_content": "allow",

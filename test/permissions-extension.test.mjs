@@ -5,8 +5,6 @@ import { join } from "node:path";
 import test from "node:test";
 import permissions from "../extensions/permissions/index.ts";
 
-const YOLO_ENV = "VENTRIS_PI_PERMISSION_YOLO";
-
 function createHarness(entries = [], sessionId = "session-1", flagValues = {}) {
   const handlers = new Map();
   const commands = new Map();
@@ -98,7 +96,6 @@ test("extension asks, remembers hashed session grants, and clears them", async (
 
 test("yolo bypasses config loading, denies, prompts, and input classification", async () => {
   const previous = process.env.PI_PERMISSION_CONFIG;
-  const previousYolo = process.env[YOLO_ENV];
   process.env.PI_PERMISSION_CONFIG = join(
     tmpdir(),
     `missing-pi-permissions-${process.pid}-${Date.now()}.json`,
@@ -151,12 +148,10 @@ test("yolo bypasses config loading, denies, prompts, and input classification", 
   } finally {
     if (previous === undefined) delete process.env.PI_PERMISSION_CONFIG;
     else process.env.PI_PERMISSION_CONFIG = previous;
-    if (previousYolo === undefined) delete process.env[YOLO_ENV];
-    else process.env[YOLO_ENV] = previousYolo;
   }
 });
 
-test("slash yolo mode toggles, persists, reloads policy on disable, and propagates", async () => {
+test("slash yolo mode toggles, persists, and reloads policy on disable", async () => {
   const entries = [];
   const harness = createHarness(entries, "session-slash-yolo");
   const ui = createContext(harness, { choice: "Deny" });
@@ -172,7 +167,6 @@ test("slash yolo mode toggles, persists, reloads policy on disable, and propagat
     undefined,
   );
   assert.equal(ui.getSelectCount(), 0);
-  assert.equal(process.env[YOLO_ENV], "1");
   assert.equal(ui.statuses.at(-1).value, "<bold><error>YOLO mode</error></bold>");
 
   const restoredHarness = createHarness(entries, "session-slash-yolo");
@@ -193,7 +187,6 @@ test("slash yolo mode toggles, persists, reloads policy on disable, and propagat
   );
   assert.equal(denied.block, true);
   assert.equal(restored.getSelectCount(), 1);
-  assert.equal(process.env[YOLO_ENV], undefined);
   assert.equal(restored.statuses.at(-1).value, undefined);
 
   const disabledHarness = createHarness(entries, "session-slash-yolo");

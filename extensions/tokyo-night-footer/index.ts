@@ -187,12 +187,16 @@ function tone(theme: Theme, statusTone: StatusTone, text: string): string {
 function styleCaret(line: string, theme: Theme): string {
   if (!line.includes("\x1b[7m")) return line;
 
-  const background = usesExactTokyoNight(theme)
-    ? ansiColor(TOKYO_NIGHT_ULTRAVIOLET, 48)
-    : theme.getBgAnsi("customMessageLabel");
-  const foreground = usesExactTokyoNight(theme)
-    ? ansiForeground(TOKYO_NIGHT_BACKGROUND)
-    : theme.getFgAnsi("toolPendingBg");
+  if (!usesExactTokyoNight(theme)) {
+    const accent = theme.getFgAnsi("customMessageLabel");
+    return line.replace(
+      /\x1b\[7m([\s\S]*?)\x1b\[0m/g,
+      (_match, glyph: string) => `${accent}\x1b[7m${glyph}${RESET_ALL}`,
+    );
+  }
+
+  const background = ansiColor(TOKYO_NIGHT_ULTRAVIOLET, 48);
+  const foreground = ansiForeground(TOKYO_NIGHT_BACKGROUND);
   return line.replace(
     /\x1b\[7m([\s\S]*?)\x1b\[0m/g,
     (_match, glyph: string) => `${background}${foreground}${glyph}${RESET_ALL}`,
@@ -438,8 +442,8 @@ function renderTopBorder(
   let left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
   const right = renderStatusGroup(rightSegments, "right", theme, nerdIcons);
 
-  // The right-aligned session title is the identity of parent and worker panes.
-  // Keep it visible while progressively removing lower-priority status details.
+  // Keep the right-aligned session title visible while progressively removing
+  // lower-priority status details.
   while (visibleWidth(left) + visibleWidth(right) > availableWidth && leftSegments.length > 1) {
     leftSegments.splice(leastImportantSegmentIndex(leftSegments), 1);
     left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);

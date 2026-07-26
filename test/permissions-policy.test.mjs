@@ -135,39 +135,6 @@ test("external paths add an external_directory request", () => {
   ]);
 });
 
-test("subagents use task permission with one resource per mode", () => {
-  assert.deepEqual(permissionRequestsForTool("delegate", {}, "/repo"), [
-    { permission: "task", resource: "research" },
-  ]);
-  assert.deepEqual(
-    permissionRequestsForTool(
-      "delegate_parallel",
-      { tasks: [{ task: "a" }, { task: "b", mode: "coding" }, { task: "c", mode: "coding" }] },
-      "/repo",
-    ),
-    [
-      { permission: "task", resource: "research" },
-      { permission: "task", resource: "coding" },
-    ],
-  );
-  assert.deepEqual(
-    permissionRequestsForTool(
-      "delegate_loop",
-      { checks: [{ command: "npm test && npm run lint" }, { command: "git diff --check" }] },
-      "/repo",
-    ),
-    [
-      { permission: "task", resource: "coding" },
-      { permission: "bash", resource: "npm test" },
-      { permission: "bash", resource: "npm run lint" },
-      { permission: "bash", resource: "git diff --check" },
-    ],
-  );
-  assert.deepEqual(permissionRequestsForTool("delegate_apply", { jobId: "abcd" }, "/repo"), [
-    { permission: "task", resource: "apply" },
-  ]);
-});
-
 test("web and unknown tools receive stable resources", () => {
   assert.deepEqual(
     permissionRequestsForTool("functions.web_search", { queries: ["one", "two"] }, "/repo"),
@@ -303,10 +270,6 @@ test("tracked pi.json matches the working OpenCode profile", () => {
   }
   assert.equal(evaluatePermission(policy.rules, "bash", "git status"), "allow");
   assert.equal(evaluatePermission(policy.rules, "bash", "npm test"), "ask");
-  assert.equal(evaluatePermission(policy.rules, "task", "research"), "allow");
-  assert.equal(evaluatePermission(policy.rules, "task", "coding"), "allow");
-  assert.equal(evaluatePermission(policy.rules, "task", "apply"), "allow");
-  assert.equal(evaluatePermission(policy.rules, "task", "other"), "ask");
   assert.equal(evaluatePermission(policy.rules, "unrecognized_tool", "*"), "ask");
 });
 

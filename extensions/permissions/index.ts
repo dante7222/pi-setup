@@ -21,7 +21,6 @@ const MAX_CONFIG_BYTES = 1024 * 1024;
 const ENTRY_TYPE = "ventris-permissions";
 const ENTRY_VERSION = 1;
 const STATUS_KEY = "permissions";
-const YOLO_ENV = "VENTRIS_PI_PERMISSION_YOLO";
 const RPC_PROMPT_TIMEOUT_MS = 30_000;
 
 const CHOICE_DENY = "Deny";
@@ -210,8 +209,6 @@ export default function permissions(pi: ExtensionAPI): void {
       yolo,
       error: yolo ? undefined : "configuration is loading",
     };
-    if (yolo) process.env[YOLO_ENV] = "1";
-    else delete process.env[YOLO_ENV];
 
     if (yolo) {
       if (ctx.hasUI) {
@@ -238,10 +235,6 @@ export default function permissions(pi: ExtensionAPI): void {
     }
 
     updateStatus(ctx, state);
-  });
-
-  pi.on("session_shutdown", () => {
-    delete process.env[YOLO_ENV];
   });
 
   pi.on("tool_call", async (event, ctx) => {
@@ -344,7 +337,6 @@ export default function permissions(pi: ExtensionAPI): void {
           operation: "yolo",
           enabled: true,
         } satisfies PermissionStateEntry);
-        process.env[YOLO_ENV] = "1";
         if (ctx.mode === "tui") ctx.ui.setStatus(STATUS_KEY, undefined);
         updateStatus(ctx, state);
         ctx.ui.notify(
@@ -370,7 +362,6 @@ export default function permissions(pi: ExtensionAPI): void {
         operation: "yolo",
         enabled: false,
       } satisfies PermissionStateEntry);
-      delete process.env[YOLO_ENV];
       updateStatus(ctx, state);
       if (state.policy) {
         ctx.ui.notify("YOLO mode disabled; pi.json permissions are active.", "info");

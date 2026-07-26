@@ -16,10 +16,6 @@ interface NormalizedToolPath {
 
 type PathKind = "file" | "directory";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function requiredString(
   input: Record<string, unknown>,
   key: string,
@@ -266,46 +262,6 @@ export function permissionRequestsForTool(
     return bashPermissionResources(requiredString(input, "command", name)).map(
       (resource) => ({ permission: "bash", resource }),
     );
-  }
-
-  if (name === "delegate") {
-    const mode = optionalString(input, "mode", name) ?? "research";
-    return [{ permission: "task", resource: mode }];
-  }
-
-  if (name === "delegate_parallel") {
-    const tasks = input.tasks;
-    if (!Array.isArray(tasks) || tasks.length === 0) {
-      throw new Error("delegate_parallel.tasks must be a non-empty array");
-    }
-    for (const task of tasks) {
-      if (!isRecord(task)) throw new Error("delegate_parallel.tasks entries must be objects");
-      requests.push({
-        permission: "task",
-        resource: optionalString(task, "mode", "delegate_parallel task") ?? "research",
-      });
-    }
-    return deduplicate(requests);
-  }
-
-  if (name === "delegate_loop") {
-    requests.push({ permission: "task", resource: "coding" });
-    const checks = input.checks;
-    if (!Array.isArray(checks) || checks.length === 0) {
-      throw new Error("delegate_loop.checks must be a non-empty array");
-    }
-    for (const check of checks) {
-      if (!isRecord(check)) throw new Error("delegate_loop.checks entries must be objects");
-      const command = requiredString(check, "command", "delegate_loop check");
-      for (const resource of bashPermissionResources(command)) {
-        requests.push({ permission: "bash", resource });
-      }
-    }
-    return deduplicate(requests);
-  }
-
-  if (name === "delegate_apply") {
-    return [{ permission: "task", resource: "apply" }];
   }
 
   if (name === "web_search") {
