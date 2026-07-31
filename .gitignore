@@ -1,4 +1,5 @@
 node_modules/
+.pi/
 .pi-runtime-sync.lock
 *.log
 .DS_Store
