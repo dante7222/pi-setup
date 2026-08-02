@@ -17,6 +17,7 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
+import { isCodexFastModeEffective } from "./codex-fast-mode.ts";
 import {
   createGitStatusTracker,
   ensureGitStatus,
@@ -49,6 +50,7 @@ const TOKYO_NIGHT_SESSION_ACCENTS = [
 type StatusTone =
   | "pi"
   | "model"
+  | "fast"
   | "path"
   | "gitClean"
   | "gitDirty"
@@ -59,6 +61,7 @@ type StatusTone =
 const TOKYO_NIGHT_TONES: Record<StatusTone, string> = {
   pi: "#7dcfff",
   model: "#bb9af7",
+  fast: "#7dcfff",
   path: "#7dcfff",
   gitClean: "#bb9af7",
   gitDirty: "#e0af68",
@@ -70,6 +73,7 @@ const TOKYO_NIGHT_TONES: Record<StatusTone, string> = {
 const SEMANTIC_TONES: Record<StatusTone, ThemeColor> = {
   pi: "borderAccent",
   model: "customMessageLabel",
+  fast: "accent",
   path: "borderAccent",
   gitClean: "success",
   gitDirty: "warning",
@@ -222,6 +226,7 @@ function statusSegmentPriority(id: string): number {
   if (id === `status:${PERMISSION_STATUS_KEY}`) return 100;
   if (id === "scroll") return 95;
   if (id === "model") return 90;
+  if (id === "fast") return 85;
   if (id.startsWith("status:")) return 85;
   if (id === "context") return 80;
   if (id === "path") return 75;
@@ -345,6 +350,10 @@ function buildLeftSegments(
       const color = THINKING_COLORS[thinking] ?? "thinkingText";
       segments.push({ id: "thinking", content: theme.fg(color, withIcon("●", thinking)) });
     }
+  }
+
+  if (isCodexFastModeEffective(ctx.model?.provider, ctx.model?.id)) {
+    segments.push({ id: "fast", content: tone(theme, "fast", withIcon("●", "fast")) });
   }
 
   const pathWidth = Math.max(12, Math.min(40, Math.floor(availableWidth * 0.3)));
