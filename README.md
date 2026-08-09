@@ -40,6 +40,8 @@ The extension replaces Pi's normal footer with a single status line embedded in 
 
 Throughput is calculated from turn start through the completed assistant message and displayed as `󰓅 42.3 tok/s` (or `⚡` without Nerd Fonts). The latest successful value remains visible until another response completes. Context is displayed as `72k/272k`, updates from live assistant usage, and changes from green to yellow above 70% and red above 90%. Git status refreshes asynchronously after file and shell activity, while context follows the active session branch. Statuses such as the permission system's YOLO warning remain visible after the normal footer is hidden.
 
+Prime Agent 0.7 does not expose Pi's `ctx.mode`, and its normal daemon protocol cannot carry executable custom footer or editor factories. In that runtime the extension automatically renders the status as a serializable one-line widget below the editor instead. Current in-process Pi sessions retain the integrated top-border layout.
+
 With the **tokyo-night** theme in a truecolor terminal, status foregrounds use the matching Tokyo Night palette directly while inheriting the editor's background without a fill. The software caret uses Tokyo Night ultraviolet (`#bb9af7`). Other themes and reduced-color terminals fall back to Pi's semantic theme colors. Thin Powerline-style separator glyphs are used when a Nerd Font is detected, but the `pi-powerline-footer` package is neither used nor required.
 
 The status border owns Pi's custom editor and custom footer slots, so another extension that replaces either one will conflict with it. The files under `integrations/pi-powerline-footer/` are retained only as legacy integration references and are not part of the active setup.

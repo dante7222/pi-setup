@@ -8,6 +8,8 @@ const blockedCommands = [
   "grep -R foo . | head",
   "printf x && grep foo file",
   "if grep -q foo file; then echo yes; fi",
+  "{ grep foo file; }",
+  "! { grep -q foo file; }",
   "VAR=1 grep foo file",
   "command grep foo file",
   "env LC_ALL=C grep foo file",

@@ -12,7 +12,7 @@ type ShellToken = ShellWord | ShellOperator;
 
 const COMMAND_SEPARATORS = new Set(["\n", ";", ";;", ";&", ";;&", "&", "&&", "|", "|&", "||", "(", ")"]);
 const REDIRECTIONS = new Set(["<", ">", "<<", ">>", "<<<", "<>", "<&", ">&"]);
-const CONTROL_PREFIXES = new Set(["!", "if", "then", "elif", "else", "while", "until", "do"]);
+const CONTROL_PREFIXES = new Set(["!", "{", "if", "then", "elif", "else", "while", "until", "do"]);
 const SHELLS = new Set(["bash", "dash", "ksh", "sh", "zsh"]);
 const SIMPLE_WRAPPERS = new Set(["builtin", "command", "exec", "nohup", "time"]);
 const SUDO_OPTIONS_WITH_VALUES = new Set(["-C", "-D", "-g", "-h", "-p", "-R", "-r", "-T", "-t", "-U", "-u"]);

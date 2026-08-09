@@ -29,11 +29,13 @@ import {
   type GitStatusTracker,
   invalidateGitStatus,
 } from "./git-status.ts";
+import { estimateLoadedContextTokens } from "./context-usage.ts";
 
 // Visual layout adapted from oh-my-pi's MIT-licensed editor status line.
 const LEGACY_SESSION_NAME_STATUS_KEY = "ventris-session-name";
 const LEGACY_TPS_STATUS_KEY = "ventris-tps";
 const PERMISSION_STATUS_KEY = "pi-permission-system";
+const PRIME_AGENT_WIDGET_KEY = "tokyo-night-footer";
 const TITLE_GENERATION_TIMEOUT_MS = 20_000;
 const TPS_ICON_NERD = "󰓅";
 const TPS_ICON_FALLBACK = "⚡";
@@ -106,8 +108,11 @@ interface StatusSegment {
 interface StatusLineState {
   latestTps: number | undefined;
   liveContextTokens: number | undefined;
+  loadedContextTokens: number | undefined;
   footerData: ReadonlyFooterDataProvider | undefined;
   gitStatus: GitStatusTracker;
+  primeAgentContext: ExtensionContext | undefined;
+  primeAgentWidgetText: string | undefined;
   runtimeActive: boolean;
   runtimeGeneration: number;
   titleGenerationAbortController: AbortController;
@@ -279,28 +284,53 @@ function renderStatusGroup(
   return ` ${segments.map((segment) => segment.content).join(` ${separator} `)} `;
 }
 
+function estimateLoadedContext(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  systemPromptOverride?: string,
+): number | undefined {
+  const compatContext = ctx as { getSystemPrompt?: () => string };
+  const systemPrompt = systemPromptOverride ?? compatContext.getSystemPrompt?.();
+  if (systemPrompt === undefined) return undefined;
+
+  const compatPi = pi as {
+    getActiveTools?: ExtensionAPI["getActiveTools"];
+    getAllTools?: ExtensionAPI["getAllTools"];
+  };
+  return estimateLoadedContextTokens(
+    systemPrompt,
+    compatPi.getAllTools?.() ?? [],
+    compatPi.getActiveTools?.() ?? [],
+  );
+}
+
 function contextSegment(
   ctx: ExtensionContext,
   theme: Theme,
   liveContextTokens: number | undefined,
+  loadedContextTokens: number | undefined,
   nerdIcons: boolean,
 ): string {
   const usage = ctx.getContextUsage();
   const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-  const contextTokens = liveContextTokens ?? usage?.tokens;
+  const reportedContextTokens = liveContextTokens ?? usage?.tokens;
+  const isLoadedContextEstimate =
+    liveContextTokens === undefined &&
+    reportedContextTokens === 0 &&
+    loadedContextTokens !== undefined;
+  const contextTokens = isLoadedContextEstimate
+    ? loadedContextTokens
+    : reportedContextTokens;
   const percent =
-    liveContextTokens !== undefined && contextWindow > 0
-      ? (liveContextTokens / contextWindow) * 100
-      : usage?.percent ??
-        (contextTokens !== null && contextTokens !== undefined && contextWindow > 0
-          ? (contextTokens / contextWindow) * 100
-          : 0);
+    contextTokens !== null && contextTokens !== undefined && contextWindow > 0
+      ? (contextTokens / contextWindow) * 100
+      : 0;
   const display =
     contextWindow <= 0
       ? "?/?"
       : contextTokens === null || contextTokens === undefined
         ? `?/${formatTokens(contextWindow)}`
-        : `${formatTokens(contextTokens)}/${formatTokens(contextWindow)}`;
+        : `${isLoadedContextEstimate ? "~" : ""}${formatTokens(contextTokens)}/${formatTokens(contextWindow)}`;
   const text = withIcon(nerdIcons ? CONTEXT_ICON_NERD : CONTEXT_ICON_FALLBACK, display);
 
   if (percent > 90) return theme.fg("error", text);
@@ -400,7 +430,13 @@ function buildLeftSegments(
   segments.push(...otherStatuses);
   segments.push({
     id: "context",
-    content: contextSegment(ctx, theme, state.liveContextTokens, nerdIcons),
+    content: contextSegment(
+      ctx,
+      theme,
+      state.liveContextTokens,
+      state.loadedContextTokens,
+      nerdIcons,
+    ),
   });
 
   if (state.latestTps !== undefined) {
@@ -414,6 +450,11 @@ function buildLeftSegments(
   return segments;
 }
 
+function currentAgentTitle(pi: ExtensionAPI): string | undefined {
+  const sessionName = pi.getSessionName();
+  return sessionName === undefined ? undefined : normalizeAgentTitle(sessionName);
+}
+
 function renderTopBorder(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -423,9 +464,9 @@ function renderTopBorder(
   width: number,
 ): string {
   const theme = ctx.ui.theme;
-  const sessionName = sanitizeSingleLine(pi.getSessionName() ?? "");
-  const border = sessionName
-    ? (text: string) => sessionAccent(theme, sessionName, text)
+  const agentTitle = currentAgentTitle(pi);
+  const border = agentTitle
+    ? (text: string) => sessionAccent(theme, agentTitle, text)
     : fallbackBorder;
 
   if (width <= 0) return "";
@@ -444,15 +485,15 @@ function renderTopBorder(
     availableWidth,
     scrollIndicator,
   );
-  const maxSessionWidth = Math.max(1, Math.min(60, availableWidth - 2));
-  const rightSegments: StatusSegment[] = sessionName
+  const maxTitleWidth = Math.max(1, Math.min(60, availableWidth - 2));
+  const rightSegments: StatusSegment[] = agentTitle
     ? [
         {
-          id: "session",
+          id: "title",
           content: sessionAccent(
             theme,
-            sessionName,
-            theme.bold(truncateToWidth(sessionName, maxSessionWidth, "…")),
+            agentTitle,
+            theme.bold(truncateToWidth(agentTitle, maxTitleWidth, "…")),
           ),
         },
       ]
@@ -461,7 +502,7 @@ function renderTopBorder(
   let left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
   const right = renderStatusGroup(rightSegments, "right", theme, nerdIcons);
 
-  // Keep the right-aligned session title visible while progressively removing
+  // Keep the right-aligned agent title visible while progressively removing
   // lower-priority status details.
   while (visibleWidth(left) + visibleWidth(right) > availableWidth && leftSegments.length > 1) {
     leftSegments.splice(leastImportantSegmentIndex(leftSegments), 1);
@@ -488,6 +529,29 @@ function renderTopBorder(
 
   const gapWidth = Math.max(0, availableWidth - visibleWidth(left) - visibleWidth(right));
   return `${border("╭──")}${left}${border("─".repeat(gapWidth))}${right}${border("──╮")}`;
+}
+
+function updatePrimeAgentWidget(pi: ExtensionAPI, state: StatusLineState): void {
+  const ctx = state.primeAgentContext;
+  if (!ctx) return;
+
+  const nerdIcons = supportsNerdIcons();
+  const segments = buildLeftSegments(pi, ctx, ctx.ui.theme, state, nerdIcons, 160, undefined);
+  const agentTitle = currentAgentTitle(pi);
+  if (agentTitle) {
+    segments.push({
+      id: "title",
+      content: sessionAccent(ctx.ui.theme, agentTitle, ctx.ui.theme.bold(agentTitle)),
+    });
+  }
+  const text = renderStatusGroup(segments, "left", ctx.ui.theme, nerdIcons);
+  if (text === state.primeAgentWidgetText) return;
+
+  state.primeAgentWidgetText = text;
+  // Prime Agent's daemon protocol cannot carry custom footer/editor factories,
+  // but it does support serializable widgets. Place the same status information
+  // directly below the editor as its daemon-safe footer.
+  ctx.ui.setWidget(PRIME_AGENT_WIDGET_KEY, [text], { placement: "belowEditor" });
 }
 
 function findBottomBorderIndex(lines: readonly string[]): number {
@@ -542,9 +606,9 @@ class TokyoNightStatusEditor extends CustomEditor {
 
   render(width: number): string[] {
     this.#refreshGitStatus();
-    const sessionName = sanitizeSingleLine(this.#pi.getSessionName() ?? "");
-    this.borderColor = sessionName
-      ? (text: string) => sessionAccent(this.#ctx.ui.theme, sessionName, text)
+    const agentTitle = currentAgentTitle(this.#pi);
+    this.borderColor = agentTitle
+      ? (text: string) => sessionAccent(this.#ctx.ui.theme, agentTitle, text)
       : (text: string) => this.#ctx.ui.theme.fg("border", text);
 
     if (width < 8) return super.render(width);
@@ -590,8 +654,11 @@ export default function (pi: ExtensionAPI): void {
   const state: StatusLineState = {
     latestTps: undefined,
     liveContextTokens: undefined,
+    loadedContextTokens: undefined,
     footerData: undefined,
     gitStatus: createGitStatusTracker(process.cwd()),
+    primeAgentContext: undefined,
+    primeAgentWidgetText: undefined,
     runtimeActive: false,
     runtimeGeneration: 0,
     titleGenerationAbortController: new AbortController(),
@@ -651,13 +718,19 @@ export default function (pi: ExtensionAPI): void {
   };
 
   pi.on("session_start", (_event, ctx) => {
-    if (ctx.mode !== "tui") return;
+    // Prime Agent 0.7 predates ctx.mode. Current Pi uses it to distinguish the
+    // TUI from other UI-capable transports such as RPC.
+    const mode = (ctx as { mode?: string }).mode;
+    if (mode === undefined ? !ctx.hasUI : mode !== "tui") return;
 
     invalidateGitStatus(state.gitStatus);
     state.latestTps = undefined;
     state.liveContextTokens = undefined;
+    state.loadedContextTokens = estimateLoadedContext(pi, ctx);
     state.footerData = undefined;
     state.gitStatus = createGitStatusTracker(ctx.cwd);
+    state.primeAgentContext = undefined;
+    state.primeAgentWidgetText = undefined;
     state.runtimeActive = true;
     state.runtimeGeneration++;
     state.titleGenerationAbortController.abort();
@@ -667,6 +740,15 @@ export default function (pi: ExtensionAPI): void {
     turnStartedAt = undefined;
     ctx.ui.setStatus(LEGACY_SESSION_NAME_STATUS_KEY, undefined);
     ctx.ui.setStatus(LEGACY_TPS_STATUS_KEY, undefined);
+
+    if (mode === undefined) {
+      state.primeAgentContext = ctx;
+      requestRender = () => updatePrimeAgentWidget(pi, state);
+      requestRender();
+      refreshGitStatus(true);
+      maybeGenerateAgentTitle(ctx);
+      return;
+    }
 
     ctx.ui.setFooter((tui, _theme, footerData) => {
       const render = () => tui.requestRender();
@@ -703,7 +785,9 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    state.loadedContextTokens = estimateLoadedContext(pi, ctx, event.systemPrompt);
     maybeGenerateAgentTitle(ctx, event.prompt);
+    requestRender?.();
   });
 
   pi.on("turn_start", () => {
@@ -780,11 +864,17 @@ export default function (pi: ExtensionAPI): void {
     state.runtimeGeneration++;
     state.titleGenerationAbortController.abort();
     state.titleGenerationInFlight = false;
+    state.primeAgentContext?.ui.setWidget(PRIME_AGENT_WIDGET_KEY, undefined, {
+      placement: "belowEditor",
+    });
     invalidateGitStatus(state.gitStatus);
     state.gitStatus = createGitStatusTracker(process.cwd());
     requestRender = undefined;
     state.footerData = undefined;
     state.liveContextTokens = undefined;
+    state.loadedContextTokens = undefined;
+    state.primeAgentContext = undefined;
+    state.primeAgentWidgetText = undefined;
     turnStartedAt = undefined;
   });
 }
