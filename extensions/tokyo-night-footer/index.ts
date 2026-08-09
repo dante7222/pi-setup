@@ -17,6 +17,11 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
+import {
+  firstUserPrompt,
+  generateAgentTitle,
+  normalizeAgentTitle,
+} from "./agent-title.ts";
 import { isCodexFastModeEffective } from "./codex-fast-mode.ts";
 import {
   createGitStatusTracker,
@@ -29,6 +34,7 @@ import {
 const LEGACY_SESSION_NAME_STATUS_KEY = "ventris-session-name";
 const LEGACY_TPS_STATUS_KEY = "ventris-tps";
 const PERMISSION_STATUS_KEY = "pi-permission-system";
+const TITLE_GENERATION_TIMEOUT_MS = 20_000;
 const TPS_ICON_NERD = "󰓅";
 const TPS_ICON_FALLBACK = "⚡";
 const CONTEXT_ICON_NERD = "";
@@ -102,6 +108,10 @@ interface StatusLineState {
   liveContextTokens: number | undefined;
   footerData: ReadonlyFooterDataProvider | undefined;
   gitStatus: GitStatusTracker;
+  runtimeActive: boolean;
+  runtimeGeneration: number;
+  titleGenerationAbortController: AbortController;
+  titleGenerationInFlight: boolean;
 }
 
 function sanitizeSingleLine(text: string): string {
@@ -582,6 +592,10 @@ export default function (pi: ExtensionAPI): void {
     liveContextTokens: undefined,
     footerData: undefined,
     gitStatus: createGitStatusTracker(process.cwd()),
+    runtimeActive: false,
+    runtimeGeneration: 0,
+    titleGenerationAbortController: new AbortController(),
+    titleGenerationInFlight: false,
   };
   let requestRender: (() => void) | undefined;
   let turnStartedAt: number | undefined;
@@ -594,6 +608,48 @@ export default function (pi: ExtensionAPI): void {
     });
   };
 
+  const maybeGenerateAgentTitle = (
+    ctx: ExtensionContext,
+    submittedPrompt?: string,
+  ): void => {
+    if (!state.runtimeActive || state.titleGenerationInFlight || pi.getSessionName()) return;
+
+    const prompt =
+      (submittedPrompt === undefined ? undefined : normalizeAgentTitle(submittedPrompt)) ??
+      firstUserPrompt(ctx.sessionManager.getBranch());
+    const model = ctx.model;
+    if (!prompt || !model) return;
+
+    const runtimeGeneration = state.runtimeGeneration;
+    const signal = AbortSignal.any([
+      state.titleGenerationAbortController.signal,
+      AbortSignal.timeout(TITLE_GENERATION_TIMEOUT_MS),
+    ]);
+    state.titleGenerationInFlight = true;
+
+    void generateAgentTitle(ctx.modelRegistry, model, prompt, signal)
+      .then((title) => {
+        if (
+          !title ||
+          signal.aborted ||
+          !state.runtimeActive ||
+          state.runtimeGeneration !== runtimeGeneration
+        ) {
+          return;
+        }
+        if (!pi.getSessionName()) pi.setSessionName(title);
+      })
+      .catch(() => {
+        // Title generation is best-effort; leave the session unnamed so a later
+        // submitted prompt can retry.
+      })
+      .finally(() => {
+        if (state.runtimeGeneration === runtimeGeneration) {
+          state.titleGenerationInFlight = false;
+        }
+      });
+  };
+
   pi.on("session_start", (_event, ctx) => {
     if (ctx.mode !== "tui") return;
 
@@ -602,6 +658,11 @@ export default function (pi: ExtensionAPI): void {
     state.liveContextTokens = undefined;
     state.footerData = undefined;
     state.gitStatus = createGitStatusTracker(ctx.cwd);
+    state.runtimeActive = true;
+    state.runtimeGeneration++;
+    state.titleGenerationAbortController.abort();
+    state.titleGenerationAbortController = new AbortController();
+    state.titleGenerationInFlight = false;
     requestRender = undefined;
     turnStartedAt = undefined;
     ctx.ui.setStatus(LEGACY_SESSION_NAME_STATUS_KEY, undefined);
@@ -638,6 +699,11 @@ export default function (pi: ExtensionAPI): void {
         },
       ),
     );
+    maybeGenerateAgentTitle(ctx);
+  });
+
+  pi.on("before_agent_start", (event, ctx) => {
+    maybeGenerateAgentTitle(ctx, event.prompt);
   });
 
   pi.on("turn_start", () => {
@@ -693,6 +759,7 @@ export default function (pi: ExtensionAPI): void {
     turnStartedAt = undefined;
     refreshGitStatus(true);
   });
+  pi.on("agent_settled", (_event, ctx) => maybeGenerateAgentTitle(ctx));
   pi.on("session_info_changed", () => requestRender?.());
   pi.on("model_select", () => {
     state.liveContextTokens = undefined;
@@ -703,11 +770,16 @@ export default function (pi: ExtensionAPI): void {
     state.liveContextTokens = undefined;
     requestRender?.();
   });
-  pi.on("session_tree", () => {
+  pi.on("session_tree", (_event, ctx) => {
     state.liveContextTokens = undefined;
     requestRender?.();
+    maybeGenerateAgentTitle(ctx);
   });
   pi.on("session_shutdown", () => {
+    state.runtimeActive = false;
+    state.runtimeGeneration++;
+    state.titleGenerationAbortController.abort();
+    state.titleGenerationInFlight = false;
     invalidateGitStatus(state.gitStatus);
     state.gitStatus = createGitStatusTracker(process.cwd());
     requestRender = undefined;
