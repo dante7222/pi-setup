@@ -1,7 +1,7 @@
 import type { SessionGroupContextSnapshot } from "./contracts.ts";
 
 function contextBoundary(snapshot: SessionGroupContextSnapshot): string {
-  const base = `PI_SESSION_GROUP_CONTEXT_${snapshot.sha256.slice(0, 16).toUpperCase()}`;
+  const base = `PI_SG_${snapshot.sha256.slice(0, 12).toUpperCase()}`;
   let boundary = base;
   let suffix = 1;
   while (snapshot.content.includes(boundary)) {
@@ -19,15 +19,10 @@ export function appendSessionGroupContext(
   return `${systemPrompt}\n\n${[
     "# Shared session-group context",
     "",
-    `This session belongs to the global session group '${snapshot.name}' (${snapshot.id}).`,
-    `The shared context snapshot is revision ${snapshot.revision} with SHA-256 ${snapshot.sha256}.`,
-    "Use the shared context as task guidance available only to sessions attached to this group.",
-    "This is contextual scoping, not an operating-system security boundary.",
-    "Never modify shared context automatically. Modify it only after the current user explicitly asks to update the shared group context, only through edit_group_context, and only after the user approves its execution-time confirmation.",
-    "Do not use built-in file-write tools to modify the group context file.",
+    `Group: '${snapshot.name}'.`,
+    "The text between the markers is shared task guidance only for sessions in this group; it is not an OS security boundary.",
+    "Never modify it automatically or with file tools. Use edit_group_context only when the current user explicitly requests an update and approves the execution confirmation.",
     "",
-    `Group ID: ${snapshot.id}`,
-    `Context boundary: ${boundary}`,
     `-----BEGIN ${boundary}-----`,
     snapshot.content,
     `-----END ${boundary}-----`,

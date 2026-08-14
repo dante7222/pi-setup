@@ -114,6 +114,7 @@ interface StatusLineState {
   loadedContextTokens: number | undefined;
   footerData: ReadonlyFooterDataProvider | undefined;
   gitStatus: GitStatusTracker;
+  runtimeContext: ExtensionContext | undefined;
   primeAgentContext: ExtensionContext | undefined;
   primeAgentWidgetText: string | undefined;
   runtimeActive: boolean;
@@ -727,6 +728,7 @@ export default function (pi: ExtensionAPI): void {
     loadedContextTokens: undefined,
     footerData: undefined,
     gitStatus: createGitStatusTracker(process.cwd()),
+    runtimeContext: undefined,
     primeAgentContext: undefined,
     primeAgentWidgetText: undefined,
     runtimeActive: false,
@@ -740,6 +742,9 @@ export default function (pi: ExtensionAPI): void {
   subscribeToSessionGroupPresentation(pi, (presentation) => {
     if (presentation.sessionId !== state.sessionId) return;
     state.sessionGroupName = presentation.group?.name;
+    if (state.runtimeContext) {
+      state.loadedContextTokens = estimateLoadedContext(pi, state.runtimeContext);
+    }
     requestRender?.();
   });
 
@@ -804,9 +809,13 @@ export default function (pi: ExtensionAPI): void {
     state.sessionGroupName = undefined;
     state.latestTps = undefined;
     state.liveContextTokens = undefined;
-    state.loadedContextTokens = estimateLoadedContext(pi, ctx);
+    // Session Groups loads after the footer and applies membership-specific tool
+    // gating later in session_start. Wait for its presentation event instead of
+    // measuring the transient registration-time tool set.
+    state.loadedContextTokens = undefined;
     state.footerData = undefined;
     state.gitStatus = createGitStatusTracker(ctx.cwd);
+    state.runtimeContext = ctx;
     state.primeAgentContext = undefined;
     state.primeAgentWidgetText = undefined;
     state.runtimeActive = true;
@@ -863,8 +872,14 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", (event, ctx) => {
-    state.loadedContextTokens = estimateLoadedContext(pi, ctx, event.systemPrompt);
     maybeGenerateAgentTitle(ctx, event.prompt);
+  });
+
+  pi.on("agent_start", (_event, ctx) => {
+    if (!state.runtimeActive) return;
+    // This runs after every extension's before_agent_start handler, so both the
+    // effective system prompt and active tool schemas match the agent request.
+    state.loadedContextTokens = estimateLoadedContext(pi, ctx);
     requestRender?.();
   });
 
@@ -953,6 +968,7 @@ export default function (pi: ExtensionAPI): void {
     state.footerData = undefined;
     state.liveContextTokens = undefined;
     state.loadedContextTokens = undefined;
+    state.runtimeContext = undefined;
     state.primeAgentContext = undefined;
     state.primeAgentWidgetText = undefined;
     turnStartedAt = undefined;

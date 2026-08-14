@@ -140,6 +140,18 @@ test("exposes the context-edit tool only while the session is grouped", async ()
     assert.equal(tool.promptGuidelines, undefined);
     assert.equal(changelogTool.promptSnippet, undefined);
     assert.equal(changelogTool.promptGuidelines, undefined);
+    assert.deepEqual(Object.keys(tool.parameters.properties), [
+      "userRequestQuote",
+      "edits",
+    ]);
+    const serializedGroupTools = JSON.stringify(
+      [tool, changelogTool].map(({ name, description, parameters }) => ({
+        name,
+        description,
+        parameters,
+      })),
+    );
+    assert.ok(Math.ceil(serializedGroupTools.length / 4) <= 210);
     await handlers.get("session_start")({ reason: "startup" }, ctx);
     assert.deepEqual(activeTools, ["read", "bash"]);
 
@@ -246,7 +258,7 @@ test("refreshes and injects group context on every prompt without session copies
       ctx,
     );
     assert.match(first.systemPrompt, /# partitioning/);
-    assert.match(first.systemPrompt, /only through edit_group_context/);
+    assert.match(first.systemPrompt, /Use edit_group_context only/);
     assert.equal("message" in first, false);
     assert.equal(entries.length, membershipEntryCount);
 
@@ -448,14 +460,10 @@ test("agent tool requires current direct authorization and returns a visible dif
       { prompt: "continue", systemPrompt: "base", systemPromptOptions: {} },
       ctx,
     );
-    const snapshot = await store.readContext(group.id);
     confirmationAnswers.push(true);
     const result = await tool.execute(
       "tool-call",
       {
-        groupId: group.id,
-        expectedRevision: snapshot.revision,
-        expectedSha256: snapshot.sha256,
         userRequestQuote: "Add the monthly partition decision",
         edits: [
           {
@@ -480,9 +488,6 @@ test("agent tool requires current direct authorization and returns a visible dif
       tool.execute(
         "stale-tool-call",
         {
-          groupId: group.id,
-          expectedRevision: snapshot.revision,
-          expectedSha256: snapshot.sha256,
           userRequestQuote: "Add the monthly partition decision",
           edits: [{ oldText: "## Notes\n", newText: "## Notes\n\nMore\n" }],
         },
@@ -512,11 +517,7 @@ test("agent tool rejects mismatched and extension-originated authorization", asy
       { prompt: "continue", systemPrompt: "base", systemPromptOptions: {} },
       ctx,
     );
-    const snapshot = await store.readContext(group.id);
     const args = {
-      groupId: group.id,
-      expectedRevision: snapshot.revision,
-      expectedSha256: snapshot.sha256,
       userRequestQuote: "update shared context",
       edits: [{ oldText: "## Notes\n", newText: "## Notes\n\nMore\n" }],
     };
@@ -561,9 +562,6 @@ test("requires confirmation when message wording contains negative intent", asyn
       tool.execute(
         "negative-intent",
         {
-          groupId: group.id,
-          expectedRevision: snapshot.revision,
-          expectedSha256: snapshot.sha256,
           userRequestQuote: "update shared context",
           edits: [
             {
@@ -608,11 +606,7 @@ test("associates streaming authorization only when its user message is delivered
       },
       ctx,
     );
-    const snapshot = await store.readContext(group.id);
     const args = {
-      groupId: group.id,
-      expectedRevision: snapshot.revision,
-      expectedSha256: snapshot.sha256,
       userRequestQuote: "Add a steering note",
       edits: [{ oldText: "## Notes\n", newText: "## Notes\n\n- Steering note.\n" }],
     };
@@ -669,14 +663,10 @@ test("fails closed on ambiguous streaming authorization sources", async () => {
       },
       ctx,
     );
-    const snapshot = await store.readContext(group.id);
     await assert.rejects(
       tool.execute(
         "ambiguous",
         {
-          groupId: group.id,
-          expectedRevision: snapshot.revision,
-          expectedSha256: snapshot.sha256,
           userRequestQuote: "Add the same note",
           edits: [{ oldText: "## Notes\n", newText: "## Notes\n\n- note\n" }],
         },

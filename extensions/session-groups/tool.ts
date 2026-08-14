@@ -22,19 +22,9 @@ export const EDIT_GROUP_CONTEXT_TOOL_NAME = "edit_group_context";
 export const GROUP_CHANGELOG_TOOL_NAME = "group_changelog";
 
 const editGroupContextSchema = Type.Object({
-  groupId: Type.String({ description: "Stable ID from the injected group snapshot" }),
-  expectedRevision: Type.Integer({
-    minimum: 0,
-    description: "Revision from the injected group snapshot",
-  }),
-  expectedSha256: Type.String({
-    pattern: "^[0-9a-f]{64}$",
-    description: "SHA-256 from the injected group snapshot",
-  }),
   userRequestQuote: Type.String({
     minLength: 1,
-    description:
-      "Exact quote from the current raw user message explicitly requesting this shared-context update",
+    description: "Exact quote authorizing this shared-context update",
   }),
   edits: Type.Array(
     Type.Object({
@@ -93,7 +83,7 @@ export function registerSessionGroupTool(
     name: EDIT_GROUP_CONTEXT_TOOL_NAME,
     label: "Edit Group Context",
     description:
-      "Edit the current session group's shared context after the current user explicitly requests that shared-context update and approves the execution-time confirmation. Requires the injected revision/hash and exact unique replacements; stale writes fail instead of overwriting newer context.",
+      "Apply exact replacements to this group's shared context only after an explicit user request and confirmation; stale writes fail.",
     parameters: editGroupContextSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const groupId = controller.getCurrentGroupId();
@@ -102,17 +92,6 @@ export function registerSessionGroupTool(
       if (groupId === null || !snapshot || snapshot.id !== groupId) {
         throw new Error(
           "Shared group context is unavailable for this agent run. Wait for the next user turn after repairing it.",
-        );
-      }
-      if (params.groupId !== groupId) {
-        throw new Error("edit_group_context can modify only the current session's group.");
-      }
-      if (
-        params.expectedRevision !== snapshot.revision ||
-        params.expectedSha256 !== snapshot.sha256
-      ) {
-        throw new Error(
-          "edit_group_context arguments do not match the context snapshot injected for this run.",
         );
       }
       if (!authorization || authorization.source === "extension") {
@@ -201,7 +180,7 @@ export function registerSessionGroupTool(
     },
     renderCall(args, theme) {
       return new Text(
-        `${theme.fg("toolTitle", theme.bold("edit_group_context"))} ${theme.fg("muted", `revision ${args.expectedRevision}`)}`,
+        `${theme.fg("toolTitle", theme.bold("edit_group_context"))} ${theme.fg("muted", `${args.edits.length} replacement${args.edits.length === 1 ? "" : "s"}`)}`,
         0,
         0,
       );
@@ -234,7 +213,7 @@ export function registerSessionGroupChangelogTool(
     name: GROUP_CHANGELOG_TOOL_NAME,
     label: "Group Changelog",
     description:
-      "Read recent entries or append completed work to the current session group's optional changelog. Use only when the current user asks about group history or asks to record completed work.",
+      "Read recent group history or append completed work when the user asks.",
     parameters: groupChangelogSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const groupId = controller.getCurrentGroupId();
