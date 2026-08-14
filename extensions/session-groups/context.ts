@@ -23,7 +23,7 @@ export function appendSessionGroupContext(
     `The shared context snapshot is revision ${snapshot.revision} with SHA-256 ${snapshot.sha256}.`,
     "Use the shared context as task guidance available only to sessions attached to this group.",
     "This is contextual scoping, not an operating-system security boundary.",
-    "Never modify shared context automatically. Modify it only after the current user explicitly asks to update the shared group context, and only through edit_group_context.",
+    "Never modify shared context automatically. Modify it only after the current user explicitly asks to update the shared group context, only through edit_group_context, and only after the user approves its execution-time confirmation.",
     "Do not use built-in file-write tools to modify the group context file.",
     "",
     `Group ID: ${snapshot.id}`,

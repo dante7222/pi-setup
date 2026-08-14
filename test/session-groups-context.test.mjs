@@ -21,6 +21,7 @@ test("appends complete scoped context and explicit-update policy", () => {
   assert.match(prompt, /global session group 'partitioning'/);
   assert.match(prompt, /contextual scoping, not an operating-system security boundary/);
   assert.match(prompt, /only through edit_group_context/);
+  assert.match(prompt, /approves its execution-time confirmation/);
   assert.match(prompt, /Use monthly partitions/);
   assert.match(prompt, new RegExp(snapshot.sha256));
   assert.doesNotMatch(prompt, /\/private\/context\.md/);

@@ -9,7 +9,10 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import type { SessionGroupContextSnapshot } from "./contracts.ts";
-import type { SessionGroupStore } from "./store.ts";
+import {
+  applyExactSessionGroupContextEdits,
+  type SessionGroupStore,
+} from "./store.ts";
 
 export const EDIT_GROUP_CONTEXT_TOOL_NAME = "edit_group_context";
 
@@ -65,13 +68,13 @@ export function registerSessionGroupTool(
   store: SessionGroupStore,
   controller: SessionGroupToolController,
 ): void {
-  pi.registerTool({
+  pi.registerTool<typeof editGroupContextSchema, EditGroupContextDetails>({
     name: EDIT_GROUP_CONTEXT_TOOL_NAME,
     label: "Edit Group Context",
     description:
-      "Edit the current session group's shared context after the current user explicitly requests that shared-context update. Requires the injected revision/hash and exact unique replacements; stale writes fail instead of overwriting newer context.",
+      "Edit the current session group's shared context after the current user explicitly requests that shared-context update and approves the execution-time confirmation. Requires the injected revision/hash and exact unique replacements; stale writes fail instead of overwriting newer context.",
     parameters: editGroupContextSchema,
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const groupId = controller.getCurrentGroupId();
       const snapshot = controller.getCurrentContextSnapshot();
       const authorization = controller.getCurrentUserAuthorization();
@@ -103,6 +106,38 @@ export function registerSessionGroupTool(
         throw new Error(
           "userRequestQuote must be a non-empty exact substring of the current raw user message that explicitly requests the shared-context update.",
         );
+      }
+      if (!ctx.hasUI) {
+        throw new Error(
+          "Updating shared group context requires interactive user confirmation.",
+        );
+      }
+
+      const proposedContent = applyExactSessionGroupContextEdits(
+        snapshot.content,
+        params.edits,
+      );
+      const { diff: proposedDiff } = generateDiffString(
+        snapshot.content,
+        proposedContent,
+      );
+      const diffPreview =
+        proposedDiff.length <= 4_000
+          ? proposedDiff
+          : `${proposedDiff.slice(0, 4_000)}\n… diff preview truncated`;
+      const approved = await ctx.ui.confirm(
+        "Update shared session-group context?",
+        [
+          `Allow this agent to update '${snapshot.name}' for every attached session?`,
+          `Revision: ${snapshot.revision}`,
+          `User request: ${JSON.stringify(params.userRequestQuote)}`,
+          `Exact replacements: ${params.edits.length}`,
+          "",
+          diffPreview,
+        ].join("\n"),
+      );
+      if (!approved) {
+        throw new Error("The user did not approve the shared-context update.");
       }
 
       const contextPath = store.contextPath(groupId);

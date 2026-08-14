@@ -67,6 +67,7 @@ async function withExtension(run) {
     },
   };
   const notifications = [];
+  const confirmations = [];
   const confirmationAnswers = [];
   const ctx = {
     mode: "tui",
@@ -82,7 +83,10 @@ async function withExtension(run) {
       notify(message, type) {
         notifications.push({ message, type });
       },
-      confirm: async () => confirmationAnswers.shift() ?? false,
+      confirm: async (title, message) => {
+        confirmations.push({ title, message });
+        return confirmationAnswers.shift() ?? false;
+      },
       select: async () => undefined,
       input: async () => undefined,
       custom: async () => undefined,
@@ -101,6 +105,7 @@ async function withExtension(run) {
       activeTools,
       emitted,
       notifications,
+      confirmations,
       confirmationAnswers,
       ctx,
     });
@@ -317,7 +322,14 @@ test("distinguishes repairable context loss from metadata corruption", async () 
 });
 
 test("agent tool requires current direct authorization and returns a visible diff", async () => {
-  await withExtension(async ({ store, handlers, tool, ctx }) => {
+  await withExtension(async ({
+    store,
+    handlers,
+    tool,
+    confirmations,
+    confirmationAnswers,
+    ctx,
+  }) => {
     const group = await store.createGroup("partitioning");
     await store.setActiveGroup(group.id);
     await handlers.get("session_start")({ reason: "startup" }, ctx);
@@ -334,6 +346,7 @@ test("agent tool requires current direct authorization and returns a visible dif
       ctx,
     );
     const snapshot = await store.readContext(group.id);
+    confirmationAnswers.push(true);
     const result = await tool.execute(
       "tool-call",
       {
@@ -356,7 +369,10 @@ test("agent tool requires current direct authorization and returns a visible dif
     assert.match(result.details.diff, /Use monthly partitions/);
     assert.match(result.details.patch, /context\.md/);
     assert.match((await store.readContext(group.id)).content, /Use monthly partitions/);
+    assert.match(confirmations.at(-1).title, /Update shared session-group context/);
+    assert.match(confirmations.at(-1).message, /Use monthly partitions/);
 
+    confirmationAnswers.push(true);
     await assert.rejects(
       tool.execute(
         "stale-tool-call",
@@ -422,8 +438,54 @@ test("agent tool rejects mismatched and extension-originated authorization", asy
   });
 });
 
+test("requires confirmation when message wording contains negative intent", async () => {
+  await withExtension(async ({ store, handlers, tool, confirmations, ctx }) => {
+    const group = await store.createGroup("partitioning");
+    await store.setActiveGroup(group.id);
+    await handlers.get("session_start")({ reason: "startup" }, ctx);
+    const userMessage = "Do not update shared context; just explain the current plan.";
+    await handlers.get("input")(
+      { text: userMessage, source: "interactive" },
+      ctx,
+    );
+    await handlers.get("before_agent_start")(
+      { prompt: userMessage, systemPrompt: "base", systemPromptOptions: {} },
+      ctx,
+    );
+    const snapshot = await store.readContext(group.id);
+
+    await assert.rejects(
+      tool.execute(
+        "negative-intent",
+        {
+          groupId: group.id,
+          expectedRevision: snapshot.revision,
+          expectedSha256: snapshot.sha256,
+          userRequestQuote: "update shared context",
+          edits: [
+            {
+              oldText: "## Notes\n",
+              newText: "## Notes\n\n- This must not be written.\n",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      /did not approve/,
+    );
+    assert.equal(confirmations.length, 1);
+    assert.equal((await store.readContext(group.id)).revision, snapshot.revision);
+    assert.doesNotMatch(
+      (await store.readContext(group.id)).content,
+      /This must not be written/,
+    );
+  });
+});
+
 test("associates streaming authorization only when its user message is delivered", async () => {
-  await withExtension(async ({ store, handlers, tool, ctx }) => {
+  await withExtension(async ({ store, handlers, tool, confirmationAnswers, ctx }) => {
     const group = await store.createGroup("partitioning");
     await store.setActiveGroup(group.id);
     await handlers.get("session_start")({ reason: "startup" }, ctx);
@@ -466,6 +528,7 @@ test("associates streaming authorization only when its user message is delivered
       },
       ctx,
     );
+    confirmationAnswers.push(true);
     await tool.execute("delivered", args, undefined, undefined, ctx);
     assert.match((await store.readContext(group.id)).content, /Steering note/);
   });
