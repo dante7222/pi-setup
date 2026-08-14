@@ -34,6 +34,7 @@
       "./extensions/compaction-transcript/index.ts",
       "./extensions/rg-only/index.ts",
       "./extensions/tokyo-night-footer/index.ts",
+      "./extensions/session-groups/index.ts",
       "./extensions/web-access-toggle/index.ts",
       "./extensions/yellow-file-headers/index.ts"
     ],
