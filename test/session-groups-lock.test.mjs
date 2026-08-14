@@ -547,10 +547,10 @@ test("concurrent same-revision writers allow exactly one commit", async () => {
     const snapshot = await first.readContext(group.id);
     const results = await Promise.allSettled([
       first.editContext(group.id, snapshot.revision, snapshot.sha256, [
-        { oldText: "## Notes\n", newText: "## Notes\n\n- first\n" },
+        { oldText: "# partitioning\n", newText: "# partitioning\n\n- first\n" },
       ]),
       second.editContext(group.id, snapshot.revision, snapshot.sha256, [
-        { oldText: "## Notes\n", newText: "## Notes\n\n- second\n" },
+        { oldText: "# partitioning\n", newText: "# partitioning\n\n- second\n" },
       ]),
     ]);
     assert.equal(results.filter(({ status }) => status === "fulfilled").length, 1);

@@ -422,7 +422,7 @@ test("distinguishes repairable context loss from metadata corruption", async () 
 
     await handlers.get("agent_settled")({}, ctx);
     await command.handler("edit", ctx);
-    assert.match((await store.readContext(group.id)).content, /^# partitioning/);
+    assert.equal((await store.readContext(group.id)).content, "# partitioning\n");
 
     await writeFile(store.metadataPath(group.id), "{}\n", "utf8");
     await handlers.get("agent_settled")({}, ctx);
@@ -467,8 +467,8 @@ test("agent tool requires current direct authorization and returns a visible dif
         userRequestQuote: "Add the monthly partition decision",
         edits: [
           {
-            oldText: "## Decisions\n",
-            newText: "## Decisions\n\n- Use monthly partitions.\n",
+            oldText: "# partitioning\n",
+            newText: "# partitioning\n\n- Use monthly partitions.\n",
           },
         ],
       },
@@ -489,7 +489,7 @@ test("agent tool requires current direct authorization and returns a visible dif
         "stale-tool-call",
         {
           userRequestQuote: "Add the monthly partition decision",
-          edits: [{ oldText: "## Notes\n", newText: "## Notes\n\nMore\n" }],
+          edits: [{ oldText: "# partitioning\n", newText: "# partitioning\n\nMore\n" }],
         },
         undefined,
         undefined,
@@ -519,7 +519,7 @@ test("agent tool rejects mismatched and extension-originated authorization", asy
     );
     const args = {
       userRequestQuote: "update shared context",
-      edits: [{ oldText: "## Notes\n", newText: "## Notes\n\nMore\n" }],
+      edits: [{ oldText: "# partitioning\n", newText: "# partitioning\n\nMore\n" }],
     };
     await assert.rejects(
       tool.execute("tool-call", args, undefined, undefined, ctx),
@@ -565,8 +565,8 @@ test("requires confirmation when message wording contains negative intent", asyn
           userRequestQuote: "update shared context",
           edits: [
             {
-              oldText: "## Notes\n",
-              newText: "## Notes\n\n- This must not be written.\n",
+              oldText: "# partitioning\n",
+              newText: "# partitioning\n\n- This must not be written.\n",
             },
           ],
         },
@@ -608,7 +608,7 @@ test("associates streaming authorization only when its user message is delivered
     );
     const args = {
       userRequestQuote: "Add a steering note",
-      edits: [{ oldText: "## Notes\n", newText: "## Notes\n\n- Steering note.\n" }],
+      edits: [{ oldText: "# partitioning\n", newText: "# partitioning\n\n- Steering note.\n" }],
     };
     await assert.rejects(
       tool.execute("early", args, undefined, undefined, ctx),
@@ -668,7 +668,7 @@ test("fails closed on ambiguous streaming authorization sources", async () => {
         "ambiguous",
         {
           userRequestQuote: "Add the same note",
-          edits: [{ oldText: "## Notes\n", newText: "## Notes\n\n- note\n" }],
+          edits: [{ oldText: "# partitioning\n", newText: "# partitioning\n\n- note\n" }],
         },
         undefined,
         undefined,

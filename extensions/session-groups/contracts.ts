@@ -135,27 +135,7 @@ export function groupNameKey(name: string): string {
 }
 
 export function createGroupContextTemplate(name: string): string {
-  const normalizedName = normalizeGroupName(name);
-  return [
-    `# ${normalizedName}`,
-    "",
-    "## Objective",
-    "",
-    "## Background",
-    "",
-    "## Current state",
-    "",
-    "## Decisions",
-    "",
-    "## Constraints",
-    "",
-    "## Important references",
-    "",
-    "## Next steps",
-    "",
-    "## Notes",
-    "",
-  ].join("\n");
+  return `# ${normalizeGroupName(name)}\n`;
 }
 
 export function parseSessionGroupsState(value: unknown): SessionGroupsState {

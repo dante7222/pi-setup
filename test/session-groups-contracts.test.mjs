@@ -38,29 +38,7 @@ test("normalizes group names and rejects ambiguous path-like names", () => {
 });
 
 test("creates the approved Markdown context template", () => {
-  assert.equal(
-    createGroupContextTemplate("partitioning"),
-    [
-      "# partitioning",
-      "",
-      "## Objective",
-      "",
-      "## Background",
-      "",
-      "## Current state",
-      "",
-      "## Decisions",
-      "",
-      "## Constraints",
-      "",
-      "## Important references",
-      "",
-      "## Next steps",
-      "",
-      "## Notes",
-      "",
-    ].join("\n"),
-  );
+  assert.equal(createGroupContextTemplate("partitioning"), "# partitioning\n");
   assert.equal(SESSION_GROUP_CONTEXT_MAX_BYTES, 65_536);
   assert.equal(SESSION_GROUP_CHANGELOG_MAX_BYTES, 262_144);
   assert.equal(SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES, 16_384);

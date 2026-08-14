@@ -78,7 +78,7 @@ test("initializes private global storage and creates a complete group atomically
     const groups = await store.listGroups();
 
     assert.equal(snapshot.name, "partitioning");
-    assert.match(snapshot.content, /^# partitioning\n\n## Objective/);
+    assert.equal(snapshot.content, "# partitioning\n");
     assert.equal(snapshot.revision, 0);
     assert.equal(snapshot.sha256, metadata.contextSha256);
     assert.deepEqual(groups.map(({ id, name }) => ({ id, name })), [
@@ -414,7 +414,7 @@ test("edits context with optimistic revision checks and enforces result byte lim
       group.id,
       before.revision,
       before.sha256,
-      [{ oldText: "## Notes\n", newText: "## Notes\n\n- Shared note.\n" }],
+      [{ oldText: "# partitioning\n", newText: "# partitioning\n\n- Shared note.\n" }],
     );
     assert.equal(result.after.revision, before.revision + 1);
     assert.notEqual(result.after.sha256, before.sha256);
@@ -422,7 +422,7 @@ test("edits context with optimistic revision checks and enforces result byte lim
 
     await assert.rejects(
       store.editContext(group.id, before.revision, before.sha256, [
-        { oldText: "## Constraints\n", newText: "## Constraints\n\n- stale\n" },
+        { oldText: "# partitioning\n", newText: "# partitioning\n\n- stale\n" },
       ]),
       SessionGroupContextConflictError,
     );
@@ -431,8 +431,8 @@ test("edits context with optimistic revision checks and enforces result byte lim
     await assert.rejects(
       store.editContext(group.id, current.revision, current.sha256, [
         {
-          oldText: "## Notes\n",
-          newText: `## Notes\n${"é".repeat(SESSION_GROUP_CONTEXT_MAX_BYTES / 2)}`,
+          oldText: "- Shared note.\n",
+          newText: `${"é".repeat(SESSION_GROUP_CONTEXT_MAX_BYTES / 2)}\n`,
         },
       ]),
       SessionGroupContextTooLargeError,
