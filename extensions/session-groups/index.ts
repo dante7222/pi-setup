@@ -21,11 +21,13 @@ import {
 } from "./context.ts";
 import { publishSessionGroupPresentation } from "./events.ts";
 import {
+  appendSessionGroupChangelogToolState,
   appendSessionGroupMembership,
   appendSessionGroupToolState,
   consumeSessionGroupTransition,
   readSessionGroupMembership,
   readSessionGroupMembershipFromFile,
+  readSessionGroupChangelogToolState,
   readSessionGroupToolState,
   recordSessionGroupTransition,
   resolveSessionStartMembership,
@@ -40,6 +42,8 @@ import {
 } from "./store.ts";
 import {
   EDIT_GROUP_CONTEXT_TOOL_NAME,
+  GROUP_CHANGELOG_TOOL_NAME,
+  registerSessionGroupChangelogTool,
   registerSessionGroupTool,
   type SessionGroupUserAuthorization,
 } from "./tool.ts";
@@ -124,22 +128,33 @@ export default function sessionGroups(pi: ExtensionAPI): void {
   let currentGroupId: string | null = null;
   let toolMembershipInitialized = false;
   let restoredContextEditToolActive: boolean | undefined;
+  let restoredChangelogToolActive: boolean | undefined;
   let currentContextSnapshot: SessionGroupContextSnapshot | undefined;
   let unavailableContextSnapshot: UnavailableContextSnapshot | undefined;
   let currentUserAuthorization: SessionGroupUserAuthorization | undefined;
   let pendingStreamingAuthorizations: SessionGroupUserAuthorization[] = [];
   const authorizationStorage = new AsyncLocalStorage<SessionGroupUserAuthorization>();
 
-  const synchronizeContextEditTool = (groupId: string | null): void => {
+  const sessionGroupToolNames = [
+    EDIT_GROUP_CONTEXT_TOOL_NAME,
+    GROUP_CHANGELOG_TOOL_NAME,
+  ] as const;
+  const setSessionGroupTools = (enabledNames: readonly string[]): void => {
     const activeTools = pi.getActiveTools();
-    const isActive = activeTools.includes(EDIT_GROUP_CONTEXT_TOOL_NAME);
-    const shouldBeActive = groupId !== null;
-    if (isActive === shouldBeActive) return;
-    pi.setActiveTools(
-      shouldBeActive
-        ? [...activeTools, EDIT_GROUP_CONTEXT_TOOL_NAME]
-        : activeTools.filter((name) => name !== EDIT_GROUP_CONTEXT_TOOL_NAME),
-    );
+    const enabled = new Set(enabledNames);
+    const nextTools = [
+      ...activeTools.filter(
+        (name) => !sessionGroupToolNames.includes(name as typeof sessionGroupToolNames[number]),
+      ),
+      ...sessionGroupToolNames.filter((name) => enabled.has(name)),
+    ];
+    if (
+      nextTools.length === activeTools.length &&
+      nextTools.every((name, index) => name === activeTools[index])
+    ) {
+      return;
+    }
+    pi.setActiveTools(nextTools);
   };
 
   const present = (
@@ -151,12 +166,20 @@ export default function sessionGroups(pi: ExtensionAPI): void {
       // Registration makes custom tools active by default. On grouped startup,
       // preserve Pi's current selection so /tools and CLI allowlists remain
       // authoritative across reload. Ungrouped startup must remove our tool.
-      if (nextGroupId === null || restoredContextEditToolActive === false) {
-        synchronizeContextEditTool(null);
+      if (nextGroupId === null) {
+        setSessionGroupTools([]);
+      } else {
+        const enabled = pi.getActiveTools().filter(
+          (name) =>
+            sessionGroupToolNames.includes(name as typeof sessionGroupToolNames[number]) &&
+            !(name === EDIT_GROUP_CONTEXT_TOOL_NAME && restoredContextEditToolActive === false) &&
+            !(name === GROUP_CHANGELOG_TOOL_NAME && restoredChangelogToolActive === false),
+        );
+        setSessionGroupTools(enabled);
       }
       toolMembershipInitialized = true;
     } else if (currentGroupId !== nextGroupId) {
-      synchronizeContextEditTool(nextGroupId);
+      setSessionGroupTools(nextGroupId === null ? [] : sessionGroupToolNames);
     }
     if (currentGroupId !== nextGroupId) {
       currentContextSnapshot = undefined;
@@ -177,10 +200,16 @@ export default function sessionGroups(pi: ExtensionAPI): void {
   ): void => {
     if (!toolMembershipInitialized) {
       // Keep an explicit inactive-tool selection when a grouped session reloads.
-      if (restoredContextEditToolActive === false) synchronizeContextEditTool(null);
+      const enabled = pi.getActiveTools().filter(
+        (name) =>
+          sessionGroupToolNames.includes(name as typeof sessionGroupToolNames[number]) &&
+          !(name === EDIT_GROUP_CONTEXT_TOOL_NAME && restoredContextEditToolActive === false) &&
+          !(name === GROUP_CHANGELOG_TOOL_NAME && restoredChangelogToolActive === false),
+      );
+      setSessionGroupTools(enabled);
       toolMembershipInitialized = true;
     } else if (currentGroupId !== groupId) {
-      synchronizeContextEditTool(groupId);
+      setSessionGroupTools(sessionGroupToolNames);
     }
     currentGroupId = groupId;
     publishSessionGroupPresentation(pi, ctx.sessionManager.getSessionId(), {
@@ -204,11 +233,13 @@ export default function sessionGroups(pi: ExtensionAPI): void {
   };
 
   registerSessionGroupCommands(pi, store, controller);
-  registerSessionGroupTool(pi, store, {
+  const toolController = {
     getCurrentGroupId: () => currentGroupId,
     getCurrentContextSnapshot: () => currentContextSnapshot,
     getCurrentUserAuthorization: () => currentUserAuthorization,
-  });
+  };
+  registerSessionGroupTool(pi, store, toolController);
+  registerSessionGroupChangelogTool(pi, store, toolController);
 
   pi.on("input", (event) => {
     const authorization = { text: event.text, source: event.source };
@@ -227,6 +258,7 @@ export default function sessionGroups(pi: ExtensionAPI): void {
     currentGroupId = null;
     toolMembershipInitialized = false;
     restoredContextEditToolActive = undefined;
+    restoredChangelogToolActive = undefined;
     currentContextSnapshot = undefined;
     unavailableContextSnapshot = undefined;
     currentUserAuthorization = undefined;
@@ -245,7 +277,17 @@ export default function sessionGroups(pi: ExtensionAPI): void {
     } catch (error) {
       notify(
         ctx,
-        `Could not restore the session-group tool selection: ${error instanceof Error ? error.message : String(error)}`,
+        `Could not restore the context-edit tool selection: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+    try {
+      restoredChangelogToolActive =
+        readSessionGroupChangelogToolState(entries)?.active;
+    } catch (error) {
+      notify(
+        ctx,
+        `Could not restore the changelog tool selection: ${error instanceof Error ? error.message : String(error)}`,
         "warning",
       );
     }
@@ -385,7 +427,7 @@ export default function sessionGroups(pi: ExtensionAPI): void {
     if (currentGroupId === null) {
       // Other extensions and /tools can change the active set after startup.
       // Enforce zero Session Groups schema overhead at the provider boundary.
-      synchronizeContextEditTool(null);
+      setSessionGroupTools([]);
       return;
     }
     if (currentContextSnapshot?.id === currentGroupId) {
@@ -524,9 +566,14 @@ export default function sessionGroups(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", (event, ctx) => {
     if (currentGroupId !== null) {
+      const activeTools = pi.getActiveTools();
       appendSessionGroupToolState(
         pi,
-        pi.getActiveTools().includes(EDIT_GROUP_CONTEXT_TOOL_NAME),
+        activeTools.includes(EDIT_GROUP_CONTEXT_TOOL_NAME),
+      );
+      appendSessionGroupChangelogToolState(
+        pi,
+        activeTools.includes(GROUP_CHANGELOG_TOOL_NAME),
       );
     }
     currentContextSnapshot = undefined;

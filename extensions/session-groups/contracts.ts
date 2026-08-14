@@ -4,8 +4,13 @@ export const SESSION_GROUPS_VERSION = 1 as const;
 export const SESSION_GROUPS_DIRECTORY_NAME = "session-groups";
 export const SESSION_GROUP_MEMBERSHIP_ENTRY = "ventris-session-group-membership";
 export const SESSION_GROUP_TOOL_STATE_ENTRY = "ventris-session-group-tool-state";
+export const SESSION_GROUP_CHANGELOG_TOOL_STATE_ENTRY =
+  "ventris-session-group-changelog-tool-state";
 export const SESSION_GROUP_PRESENTATION_EVENT = "ventris:session-groups:presentation";
 export const SESSION_GROUP_CONTEXT_MAX_BYTES = 64 * 1024;
+export const SESSION_GROUP_CHANGELOG_MAX_BYTES = 256 * 1024;
+export const SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES = 16 * 1024;
+export const SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES = 8 * 1024;
 export const SESSION_GROUP_NAME_MAX_LENGTH = 80;
 
 const UUID_PATTERN =

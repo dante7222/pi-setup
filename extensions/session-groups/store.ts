@@ -10,6 +10,7 @@ import {
   rm,
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   createGroupContextTemplate,
@@ -18,6 +19,9 @@ import {
   normalizeGroupName,
   parseSessionGroupMetadata,
   parseSessionGroupsState,
+  SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES,
+  SESSION_GROUP_CHANGELOG_MAX_BYTES,
+  SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES,
   SESSION_GROUP_CONTEXT_MAX_BYTES,
   SESSION_GROUPS_DIRECTORY_NAME,
   SESSION_GROUPS_VERSION,
@@ -45,6 +49,23 @@ export interface SessionGroupContextEdit {
 export interface SessionGroupContextEditResult {
   before: SessionGroupContextSnapshot;
   after: SessionGroupContextSnapshot;
+}
+
+export interface SessionGroupChangelogTail {
+  path: string;
+  exists: boolean;
+  content: string;
+  totalBytes: number;
+  returnedBytes: number;
+  truncated: boolean;
+}
+
+export interface SessionGroupChangelogAppendResult {
+  path: string;
+  timestamp: string;
+  sessionName: string;
+  entryBytes: number;
+  totalBytes: number;
 }
 
 interface SessionGroupContextEditTransactionBase {
@@ -89,6 +110,8 @@ const GROUPS_DIRECTORY_NAME = "groups";
 const LOCKS_DIRECTORY_NAME = "locks";
 const METADATA_FILE_NAME = "metadata.json";
 const CONTEXT_FILE_NAME = "context.md";
+const CHANGELOG_FILE_NAME = "changelog.md";
+const CHANGELOG_TEMPLATE = "# Changelog\n\n";
 const CONTEXT_EDIT_TRANSACTION_FILE_NAME = ".context-edit-transaction.json";
 const ARTIFACT_STALE_MS = 5 * 60 * 1_000;
 const JSON_FILE_MAX_BYTES = 64 * 1024;
@@ -145,6 +168,37 @@ export class SessionGroupContextEncodingError extends Error {
     super(`Session-group context is not valid UTF-8: ${path}`);
     this.name = "SessionGroupContextEncodingError";
     this.path = path;
+  }
+}
+
+export class SessionGroupChangelogTooLargeError extends Error {
+  readonly path: string;
+  readonly bytes: number;
+
+  constructor(path: string, bytes: number) {
+    super(
+      `Session-group changelog is ${bytes} bytes; the limit is ${SESSION_GROUP_CHANGELOG_MAX_BYTES} bytes: ${path}`,
+    );
+    this.name = "SessionGroupChangelogTooLargeError";
+    this.path = path;
+    this.bytes = bytes;
+  }
+}
+
+export class SessionGroupChangelogEncodingError extends Error {
+  readonly path: string;
+
+  constructor(path: string) {
+    super(`Session-group changelog is not valid UTF-8: ${path}`);
+    this.name = "SessionGroupChangelogEncodingError";
+    this.path = path;
+  }
+}
+
+export class SessionGroupChangelogEntryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionGroupChangelogEntryError";
   }
 }
 
@@ -558,6 +612,41 @@ async function readContextFile(path: string): Promise<RawContextFile> {
   };
 }
 
+interface RawChangelogFile {
+  path: string;
+  content: string;
+  contentBytes: Buffer;
+}
+
+async function readChangelogFile(path: string): Promise<RawChangelogFile> {
+  await assertRegularFile(path);
+  const contentBytes = await readPrivateFile(
+    path,
+    SESSION_GROUP_CHANGELOG_MAX_BYTES,
+    (size) => new SessionGroupChangelogTooLargeError(path, size),
+  );
+  let content: string;
+  try {
+    content = new TextDecoder("utf-8", { fatal: true }).decode(contentBytes);
+  } catch {
+    throw new SessionGroupChangelogEncodingError(path);
+  }
+  return { path, content, contentBytes };
+}
+
+function normalizeChangelogSessionName(value: string | undefined): string {
+  const normalized = stripVTControlCharacters(value ?? "")
+    .normalize("NFKC")
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return "Unnamed session";
+  const characters = Array.from(normalized);
+  return characters.length <= 120
+    ? normalized
+    : `${characters.slice(0, 119).join("")}…`;
+}
+
 async function readJson(
   path: string,
   maxBytes = JSON_FILE_MAX_BYTES,
@@ -676,6 +765,10 @@ export class SessionGroupStore {
     return join(this.groupDirectory(groupId), CONTEXT_FILE_NAME);
   }
 
+  changelogPath(groupId: string): string {
+    return join(this.groupDirectory(groupId), CHANGELOG_FILE_NAME);
+  }
+
   private async assertBaseHierarchy(): Promise<void> {
     await assertDirectory(this.rootDirectory);
     await assertDirectory(this.groupsDirectory);
@@ -740,11 +833,18 @@ export class SessionGroupStore {
             await recoverContextEditTransaction(path, entry.name);
             const metadataPath = join(path, METADATA_FILE_NAME);
             const contextPath = join(path, CONTEXT_FILE_NAME);
+            const changelogPath = join(path, CHANGELOG_FILE_NAME);
             await assertRegularFile(metadataPath);
             await chmod(metadataPath, FILE_MODE);
             try {
               await assertRegularFile(contextPath);
               await chmod(contextPath, FILE_MODE);
+            } catch (error) {
+              if (!isNotFound(error)) throw error;
+            }
+            try {
+              await assertRegularFile(changelogPath);
+              await chmod(changelogPath, FILE_MODE);
             } catch (error) {
               if (!isNotFound(error)) throw error;
             }
@@ -1160,6 +1260,122 @@ export class SessionGroupStore {
       await this.reconcileContext(groupId);
     }
     return path;
+    });
+  }
+
+  async readChangelogTail(groupId: string): Promise<SessionGroupChangelogTail> {
+    return this.withGroupLock(groupId, "changelog-read", async () => {
+      await this.readMetadata(groupId);
+      const path = this.changelogPath(groupId);
+      let changelog: RawChangelogFile;
+      try {
+        changelog = await readChangelogFile(path);
+      } catch (error) {
+        if (isNotFound(error)) {
+          return {
+            path,
+            exists: false,
+            content: "",
+            totalBytes: 0,
+            returnedBytes: 0,
+            truncated: false,
+          };
+        }
+        throw error;
+      }
+
+      const truncated =
+        changelog.contentBytes.byteLength > SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES;
+      let start = truncated
+        ? changelog.contentBytes.byteLength - SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES
+        : 0;
+      while (
+        start < changelog.contentBytes.byteLength &&
+        (changelog.contentBytes[start]! & 0xc0) === 0x80
+      ) {
+        start++;
+      }
+      const returned = changelog.contentBytes.subarray(start);
+      return {
+        path,
+        exists: true,
+        content: new TextDecoder("utf-8", { fatal: true }).decode(returned),
+        totalBytes: changelog.contentBytes.byteLength,
+        returnedBytes: returned.byteLength,
+        truncated,
+      };
+    });
+  }
+
+  async prepareChangelogForManualEdit(groupId: string): Promise<string> {
+    return this.withGroupLock(groupId, "changelog-edit", async () => {
+      await this.readMetadata(groupId);
+      const path = this.changelogPath(groupId);
+      try {
+        await assertRegularFile(path);
+        await chmod(path, FILE_MODE);
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+        await atomicWritePrivateFile(path, CHANGELOG_TEMPLATE);
+      }
+      return path;
+    });
+  }
+
+  async validateChangelogAfterManualEdit(groupId: string): Promise<number> {
+    return this.withGroupLock(groupId, "changelog-edit", async () => {
+      await this.readMetadata(groupId);
+      const changelog = await readChangelogFile(this.changelogPath(groupId));
+      await chmod(changelog.path, FILE_MODE);
+      return changelog.contentBytes.byteLength;
+    });
+  }
+
+  async appendChangelog(
+    groupId: string,
+    entryInput: string,
+    sessionNameInput: string | undefined,
+  ): Promise<SessionGroupChangelogAppendResult> {
+    return this.withGroupLock(groupId, "changelog-append", async () => {
+      await this.readMetadata(groupId);
+      const entry = entryInput.trim();
+      if (!entry) {
+        throw new SessionGroupChangelogEntryError(
+          "A non-empty changelog entry is required.",
+        );
+      }
+      const entryBytes = Buffer.from(entry, "utf8");
+      if (entryBytes.byteLength > SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES) {
+        throw new SessionGroupChangelogEntryError(
+          `Changelog entry is ${entryBytes.byteLength} bytes; the limit is ${SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES} bytes.`,
+        );
+      }
+
+      const path = this.changelogPath(groupId);
+      let existing = CHANGELOG_TEMPLATE;
+      try {
+        existing = (await readChangelogFile(path)).content;
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+      }
+      const timestamp = new Date().toISOString();
+      const sessionName = normalizeChangelogSessionName(sessionNameInput);
+      const prefix = existing.endsWith("\n") ? existing : `${existing}\n`;
+      const separator = prefix.endsWith("\n\n") ? "" : "\n";
+      const record = `## ${timestamp} — ${sessionName}\n\n${entry}\n`;
+      const updated = `${prefix}${separator}${record}`;
+      const updatedBytes = Buffer.from(updated, "utf8");
+      if (updatedBytes.byteLength > SESSION_GROUP_CHANGELOG_MAX_BYTES) {
+        throw new SessionGroupChangelogTooLargeError(path, updatedBytes.byteLength);
+      }
+      await atomicWritePrivateFile(path, updatedBytes);
+      return {
+        path,
+        timestamp,
+        sessionName,
+        entryBytes: entryBytes.byteLength,
+        totalBytes: updatedBytes.byteLength,
+      };
     });
   }
 

@@ -108,6 +108,11 @@ test("creates, edits, activates, renames, leaves, rejoins, and deletes groups", 
       assert.equal((await store.readContext(created.id)).revision, 1);
       assert.match(await readFile(zedPath, "utf8"), /Edited in Zed/);
 
+      await command.handler("changelog", ctx);
+      assert.equal(zedPath, store.changelogPath(created.id));
+      assert.match(await readFile(zedPath, "utf8"), /# Changelog/);
+      assert.match(await readFile(zedPath, "utf8"), /Edited in Zed/);
+
       await command.handler("rename Orders partitioning", ctx);
       assert.equal(current().id, created.id);
       assert.equal(current().name, "Orders partitioning");
@@ -207,6 +212,9 @@ test("autocompletes subcommands and existing group names", async () => {
     await store.createGroup("Table partitioning");
     assert.deepEqual(await command.getArgumentCompletions("cr"), [
       { value: "create", label: "create" },
+    ]);
+    assert.deepEqual(await command.getArgumentCompletions("ch"), [
+      { value: "changelog", label: "changelog" },
     ]);
     assert.deepEqual(await command.getArgumentCompletions("join Ta"), [
       { value: "join Table partitioning", label: "Table partitioning" },

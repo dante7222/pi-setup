@@ -16,12 +16,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES,
+  SESSION_GROUP_CHANGELOG_MAX_BYTES,
+  SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES,
   SESSION_GROUP_CONTEXT_MAX_BYTES,
   SESSION_GROUPS_VERSION,
 } from "../extensions/session-groups/contracts.ts";
 import {
   applyExactSessionGroupContextEdits,
   SessionGroupAlreadyExistsError,
+  SessionGroupChangelogEntryError,
+  SessionGroupChangelogEncodingError,
+  SessionGroupChangelogTooLargeError,
   SessionGroupContextConflictError,
   SessionGroupContextEditError,
   SessionGroupContextEncodingError,
@@ -95,6 +101,95 @@ test("initializes private global storage and creates a complete group atomically
   });
 });
 
+test("creates and reads the optional changelog only on demand", async () => {
+  await withStore(async (store) => {
+    const group = await store.createGroup("partitioning");
+    const absent = await store.readChangelogTail(group.id);
+    assert.equal(absent.exists, false);
+    assert.equal(
+      (await readdir(store.groupDirectory(group.id))).includes("changelog.md"),
+      false,
+    );
+
+    const path = await store.prepareChangelogForManualEdit(group.id);
+    assert.equal(path, store.changelogPath(group.id));
+    assert.equal(await readFile(path, "utf8"), "# Changelog\n\n");
+    if (process.platform !== "win32") {
+      assert.equal((await stat(path)).mode & 0o777, 0o600);
+    }
+
+    const appended = await store.appendChangelog(
+      group.id,
+      "- Completed the monthly backfill.",
+      "Partition table\nunsafe line",
+    );
+    assert.equal(appended.sessionName, "Partition table unsafe line");
+    assert.match(appended.timestamp, /^\d{4}-\d{2}-\d{2}T/);
+    const tail = await store.readChangelogTail(group.id);
+    assert.equal(tail.exists, true);
+    assert.equal(tail.truncated, false);
+    assert.match(tail.content, /Completed the monthly backfill/);
+    assert.match(tail.content, /Partition table unsafe line/);
+  });
+});
+
+test("bounds changelog entries, files, and UTF-8-safe recent reads", async () => {
+  await withStore(async (store) => {
+    const group = await store.createGroup("partitioning");
+    await assert.rejects(
+      store.appendChangelog(group.id, " ", "session"),
+      SessionGroupChangelogEntryError,
+    );
+    await assert.rejects(
+      store.appendChangelog(
+        group.id,
+        "é".repeat(SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES / 2 + 1),
+        "session",
+      ),
+      SessionGroupChangelogEntryError,
+    );
+
+    const longValid = `# Changelog\n\n${"é".repeat(
+      SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES / 2 + 200,
+    )}`;
+    await writeFile(store.changelogPath(group.id), longValid, { mode: 0o600 });
+    const tail = await store.readChangelogTail(group.id);
+    assert.equal(tail.truncated, true);
+    assert.equal(tail.returnedBytes <= SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES, true);
+    assert.doesNotThrow(() => new TextDecoder("utf-8", { fatal: true }).decode(
+      Buffer.from(tail.content, "utf8"),
+    ));
+
+    await writeFile(store.changelogPath(group.id), Buffer.from([0xc3, 0x28]));
+    await assert.rejects(
+      store.readChangelogTail(group.id),
+      SessionGroupChangelogEncodingError,
+    );
+    await writeFile(
+      store.changelogPath(group.id),
+      Buffer.alloc(SESSION_GROUP_CHANGELOG_MAX_BYTES + 1, 0x61),
+    );
+    await assert.rejects(
+      store.readChangelogTail(group.id),
+      SessionGroupChangelogTooLargeError,
+    );
+  });
+});
+
+test("serializes concurrent changelog appends without losing entries", async () => {
+  await withStore(async (store, rootDirectory) => {
+    const group = await store.createGroup("partitioning");
+    const second = new SessionGroupStore({ rootDirectory });
+    await Promise.all([
+      store.appendChangelog(group.id, "- First append.", "first session"),
+      second.appendChangelog(group.id, "- Second append.", "second session"),
+    ]);
+    const content = await readFile(store.changelogPath(group.id), "utf8");
+    assert.match(content, /First append/);
+    assert.match(content, /Second append/);
+  });
+});
+
 test("enforces unique normalized names and preserves stable IDs across rename", async () => {
   await withStore(async (store) => {
     const first = await store.createGroup("Partitioning");
@@ -120,6 +215,7 @@ test("sets and clears the global active group without retaining deleted context"
     assert.equal(active.activeGroupId, group.id);
     assert.equal(active.revision, initial.revision + 1);
     assert.equal((await store.getActiveGroup()).id, group.id);
+    await store.appendChangelog(group.id, "- Work completed.", "session");
 
     assert.deepEqual(await store.deleteGroup(group.id), {
       id: group.id,
@@ -129,6 +225,7 @@ test("sets and clears the global active group without retaining deleted context"
     assert.equal((await store.readState()).activeGroupId, null);
     assert.deepEqual(await store.listGroups(), []);
     await assert.rejects(store.readMetadata(group.id), SessionGroupNotFoundError);
+    await assert.rejects(readFile(store.changelogPath(group.id)), /ENOENT/);
   });
 });
 
@@ -196,6 +293,15 @@ test("rejects symlinks instead of following storage paths outside the root", asy
 
     await assert.rejects(store.readContext(group.id), /not a private regular file/);
     assert.equal(await readFile(outsidePath, "utf8"), "outside");
+
+    const outsideChangelog = join(rootDirectory, "outside-changelog.md");
+    await writeFile(outsideChangelog, "outside changelog", "utf8");
+    await symlink(outsideChangelog, store.changelogPath(group.id));
+    await assert.rejects(
+      store.readChangelogTail(group.id),
+      /not a private regular file/,
+    );
+    assert.equal(await readFile(outsideChangelog, "utf8"), "outside changelog");
   });
 
   await withStore(async (store, rootDirectory) => {

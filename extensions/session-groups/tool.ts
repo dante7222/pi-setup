@@ -6,15 +6,20 @@ import {
   withFileMutationQueue,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import type { SessionGroupContextSnapshot } from "./contracts.ts";
+import {
+  SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES,
+  type SessionGroupContextSnapshot,
+} from "./contracts.ts";
 import {
   applyExactSessionGroupContextEdits,
   type SessionGroupStore,
 } from "./store.ts";
 
 export const EDIT_GROUP_CONTEXT_TOOL_NAME = "edit_group_context";
+export const GROUP_CHANGELOG_TOOL_NAME = "group_changelog";
 
 const editGroupContextSchema = Type.Object({
   groupId: Type.String({ description: "Stable ID from the injected group snapshot" }),
@@ -40,7 +45,13 @@ const editGroupContextSchema = Type.Object({
   ),
 });
 
+const groupChangelogSchema = Type.Object({
+  action: StringEnum(["read", "append"] as const),
+  entry: Type.Optional(Type.String()),
+});
+
 export type EditGroupContextInput = Static<typeof editGroupContextSchema>;
+export type GroupChangelogInput = Static<typeof groupChangelogSchema>;
 
 export interface SessionGroupUserAuthorization {
   text: string;
@@ -55,6 +66,16 @@ export interface EditGroupContextDetails {
   newRevision: number;
   oldSha256: string;
   newSha256: string;
+}
+
+export interface GroupChangelogDetails {
+  action: "read" | "append";
+  path: string;
+  totalBytes: number;
+  returnedBytes?: number;
+  truncated?: boolean;
+  timestamp?: string;
+  sessionName?: string;
 }
 
 export interface SessionGroupToolController {
@@ -197,6 +218,138 @@ export function registerSessionGroupTool(
       }
       return new Text(
         `${theme.fg("success", `Updated group context to revision ${details.newRevision}`)}\n${renderDiff(details.diff, { filePath: details.path })}`,
+        0,
+        0,
+      );
+    },
+  });
+}
+
+export function registerSessionGroupChangelogTool(
+  pi: ExtensionAPI,
+  store: SessionGroupStore,
+  controller: SessionGroupToolController,
+): void {
+  pi.registerTool<typeof groupChangelogSchema, GroupChangelogDetails>({
+    name: GROUP_CHANGELOG_TOOL_NAME,
+    label: "Group Changelog",
+    description:
+      "Read recent entries or append completed work to the current session group's optional changelog. Use only when the current user asks about group history or asks to record completed work.",
+    parameters: groupChangelogSchema,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const groupId = controller.getCurrentGroupId();
+      if (groupId === null) {
+        throw new Error("This session does not belong to a group.");
+      }
+
+      if (params.action === "read") {
+        if (params.entry !== undefined) {
+          throw new Error("group_changelog read does not accept an entry.");
+        }
+        const tail = await store.readChangelogTail(groupId);
+        const details: GroupChangelogDetails = {
+          action: "read",
+          path: tail.path,
+          totalBytes: tail.totalBytes,
+          returnedBytes: tail.returnedBytes,
+          truncated: tail.truncated,
+        };
+        if (!tail.exists) {
+          return {
+            content: [{ type: "text", text: "No changelog exists for this group." }],
+            details,
+          };
+        }
+        const omission = tail.truncated
+          ? `[Older changelog content omitted; showing the latest ${tail.returnedBytes} of ${tail.totalBytes} bytes.]\n\n`
+          : "";
+        return {
+          content: [{ type: "text", text: `${omission}${tail.content}` }],
+          details,
+        };
+      }
+
+      if (params.entry === undefined || !params.entry.trim()) {
+        throw new Error("group_changelog append requires a non-empty entry.");
+      }
+      const entry = params.entry;
+      const entryBytes = Buffer.byteLength(entry.trim(), "utf8");
+      if (entryBytes > SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES) {
+        throw new Error(
+          `group_changelog entry is ${entryBytes} bytes; the limit is ${SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES} bytes.`,
+        );
+      }
+      if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(entry)) {
+        throw new Error("group_changelog entry contains terminal control characters.");
+      }
+      const authorization = controller.getCurrentUserAuthorization();
+      if (!authorization || authorization.source === "extension") {
+        throw new Error(
+          "The current turn does not contain direct interactive or RPC user authorization to append the group changelog.",
+        );
+      }
+      if (!ctx.hasUI) {
+        throw new Error("Appending the group changelog requires interactive user confirmation.");
+      }
+      const sessionName = pi.getSessionName();
+      const approved = await ctx.ui.confirm(
+        "Append to shared group changelog?",
+        [
+          "Append this entry for every session attached to the current group?",
+          `Session: ${sessionName ?? "Unnamed session"}`,
+          "",
+          entry,
+        ].join("\n"),
+      );
+      if (!approved) {
+        throw new Error("The user did not approve the changelog entry.");
+      }
+
+      const path = store.changelogPath(groupId);
+      const appended = await withFileMutationQueue(path, () =>
+        store.appendChangelog(groupId, entry, sessionName),
+      );
+      const details: GroupChangelogDetails = {
+        action: "append",
+        path: appended.path,
+        totalBytes: appended.totalBytes,
+        timestamp: appended.timestamp,
+        sessionName: appended.sessionName,
+      };
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Appended ${appended.entryBytes} bytes to the group changelog at ${appended.timestamp}.`,
+          },
+        ],
+        details,
+      };
+    },
+    renderCall(args, theme) {
+      return new Text(
+        `${theme.fg("toolTitle", theme.bold("group_changelog"))} ${theme.fg("muted", args.action)}`,
+        0,
+        0,
+      );
+    },
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return new Text(theme.fg("warning", "Using group changelog…"), 0, 0);
+      const details = result.details;
+      if (!details) {
+        const text = result.content
+          .filter((block): block is { type: "text"; text: string } => block.type === "text")
+          .map((block) => block.text)
+          .join("\n");
+        return new Text(text, 0, 0);
+      }
+      return new Text(
+        theme.fg(
+          details.action === "append" ? "success" : "accent",
+          details.action === "append"
+            ? `Appended group changelog (${details.totalBytes} bytes total)`
+            : `Read group changelog (${details.returnedBytes ?? 0}/${details.totalBytes} bytes)`,
+        ),
         0,
         0,
       );

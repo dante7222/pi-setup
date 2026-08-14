@@ -25,6 +25,7 @@ const SUBCOMMANDS = [
   "join",
   "leave",
   "edit",
+  "changelog",
   "show",
   "list",
   "rename",
@@ -36,6 +37,7 @@ const ACTION_CREATE = "Create a group";
 const ACTION_JOIN = "Join a group";
 const ACTION_LEAVE = "Leave the current group";
 const ACTION_EDIT = "Edit the current context in Zed";
+const ACTION_CHANGELOG = "Edit the current changelog in Zed";
 const ACTION_SHOW = "Show the current context";
 const ACTION_LIST = "List groups";
 const ACTION_RENAME = "Rename the current group";
@@ -263,6 +265,23 @@ async function editGroup(
   );
 }
 
+async function editChangelog(
+  pi: ExtensionAPI,
+  store: SessionGroupStore,
+  controller: SessionGroupCommandController,
+  editContextInZed: NonNullable<SessionGroupCommandDependencies["editContextInZed"]>,
+  ctx: ExtensionCommandContext,
+): Promise<void> {
+  if (!requireTui(ctx, "/group changelog")) return;
+  const group = await currentGroup(store, controller);
+  const bytes = await store.withGroupLock(group.id, "changelog-edit", async (lock) => {
+    const path = await store.prepareChangelogForManualEdit(group.id);
+    await editContextInZed(pi, path, (pid) => lock.setEditorPid(pid));
+    return store.validateChangelogAfterManualEdit(group.id);
+  });
+  report(ctx, `Updated '${group.name}' changelog (${bytes} bytes).`, "info");
+}
+
 async function showGroup(
   store: SessionGroupStore,
   controller: SessionGroupCommandController,
@@ -326,7 +345,7 @@ async function deleteGroup(
     !(await confirm(
       ctx,
       "Permanently delete session group?",
-      `Delete '${group.name}' and its context.md permanently? Session JSONL files will remain.`,
+      `Delete '${group.name}', its context.md, and its optional changelog.md permanently? Session JSONL files will remain.`,
     ))
   ) {
     return;
@@ -394,6 +413,10 @@ async function executeOperation(
       if (value) throw new Error("Usage: /group edit");
       await editGroup(pi, store, controller, editContextInZed, ctx);
       return;
+    case "changelog":
+      if (value) throw new Error("Usage: /group changelog");
+      await editChangelog(pi, store, controller, editContextInZed, ctx);
+      return;
     case "show":
       if (value) throw new Error("Usage: /group show");
       await showGroup(store, controller, ctx);
@@ -413,7 +436,7 @@ async function executeOperation(
       return;
     default:
       throw new Error(
-        "Usage: /group [create|join|leave|edit|show|list|rename|delete|active]",
+        "Usage: /group [create|join|leave|edit|changelog|show|list|rename|delete|active]",
       );
   }
 }
@@ -441,7 +464,7 @@ async function actionMenu(
   if (!ctx.hasUI) {
     report(
       ctx,
-      "Usage: /group [create|join|leave|edit|show|list|rename|delete|active]",
+      "Usage: /group [create|join|leave|edit|changelog|show|list|rename|delete|active]",
       "info",
     );
     return;
@@ -452,6 +475,7 @@ async function actionMenu(
     ACTION_JOIN,
     ACTION_LEAVE,
     ACTION_EDIT,
+    ACTION_CHANGELOG,
     ACTION_SHOW,
     ACTION_LIST,
     ACTION_RENAME,
@@ -478,6 +502,10 @@ async function actionMenu(
   }
   if (action === ACTION_EDIT) {
     await editGroup(pi, store, controller, editContextInZed, ctx);
+    return;
+  }
+  if (action === ACTION_CHANGELOG) {
+    await editChangelog(pi, store, controller, editContextInZed, ctx);
     return;
   }
   if (action === ACTION_SHOW) {
@@ -537,7 +565,7 @@ export function registerSessionGroupCommands(
   const editContextInZed =
     dependencies.editContextInZed ?? editSessionGroupContextInZed;
   pi.registerCommand("group", {
-    description: "Create, join, edit, and manage shared session groups",
+    description: "Create, join, edit, and manage shared session groups and changelogs",
     getArgumentCompletions: async (prefix) => {
       const leading = prefix.trimStart();
       const separator = leading.indexOf(" ");

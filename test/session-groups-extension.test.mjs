@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -54,6 +54,7 @@ async function withExtension(run) {
         data,
       });
     },
+    getSessionName: () => "Partition production table",
     exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
     events: {
       emit(channel, data) {
@@ -102,6 +103,7 @@ async function withExtension(run) {
       handlers,
       command: commands.get("group"),
       tool: tools.get("edit_group_context"),
+      changelogTool: tools.get("group_changelog"),
       activeTools,
       emitted,
       notifications,
@@ -125,13 +127,23 @@ async function withExtension(run) {
 }
 
 test("exposes the context-edit tool only while the session is grouped", async () => {
-  await withExtension(async ({ store, handlers, command, tool, activeTools, ctx }) => {
+  await withExtension(async ({
+    store,
+    handlers,
+    command,
+    tool,
+    changelogTool,
+    activeTools,
+    ctx,
+  }) => {
     assert.equal(tool.promptSnippet, undefined);
     assert.equal(tool.promptGuidelines, undefined);
+    assert.equal(changelogTool.promptSnippet, undefined);
+    assert.equal(changelogTool.promptGuidelines, undefined);
     await handlers.get("session_start")({ reason: "startup" }, ctx);
     assert.deepEqual(activeTools, ["read", "bash"]);
 
-    activeTools.push("edit_group_context");
+    activeTools.push("edit_group_context", "group_changelog");
     await handlers.get("before_agent_start")(
       { prompt: "continue", systemPrompt: "base", systemPromptOptions: {} },
       ctx,
@@ -141,12 +153,22 @@ test("exposes the context-edit tool only while the session is grouped", async ()
     await store.createGroup("partitioning");
     await command.handler("join partitioning", ctx);
     assert.equal(activeTools.includes("edit_group_context"), true);
+    assert.equal(activeTools.includes("group_changelog"), true);
 
     activeTools.splice(activeTools.indexOf("edit_group_context"), 1);
     await handlers.get("session_shutdown")({ reason: "reload" }, ctx);
     activeTools.push("edit_group_context");
     await handlers.get("session_start")({ reason: "reload" }, ctx);
     assert.equal(activeTools.includes("edit_group_context"), false);
+    assert.equal(activeTools.includes("group_changelog"), true);
+
+    activeTools.push("edit_group_context");
+    activeTools.splice(activeTools.indexOf("group_changelog"), 1);
+    await handlers.get("session_shutdown")({ reason: "reload" }, ctx);
+    activeTools.push("group_changelog");
+    await handlers.get("session_start")({ reason: "reload" }, ctx);
+    assert.equal(activeTools.includes("edit_group_context"), true);
+    assert.equal(activeTools.includes("group_changelog"), false);
 
     await command.handler("leave", ctx);
     assert.deepEqual(activeTools, ["read", "bash"]);
@@ -203,6 +225,7 @@ test("fresh startup automatically joins the global active group", async () => {
     await handlers.get("session_start")({ reason: "startup" }, ctx);
     assert.equal(readSessionGroupMembership(entries).groupId, group.id);
     assert.equal(activeTools.includes("edit_group_context"), true);
+    assert.equal(activeTools.includes("group_changelog"), true);
     assert.equal(emitted.at(-1).data.group.name, "partitioning");
     assert.equal(
       notifications.some(({ message }) => message.includes("global active session group")),
@@ -250,6 +273,86 @@ test("refreshes and injects group context on every prompt without session copies
     assert.equal(emitted.at(-1).data.group.name, "orders partitioning");
     assert.equal((await store.readContext(group.id)).revision, 1);
     assert.equal(entries.length, membershipEntryCount);
+  });
+});
+
+test("reads and appends the optional changelog only on demand", async () => {
+  await withExtension(async ({
+    store,
+    handlers,
+    changelogTool,
+    confirmations,
+    confirmationAnswers,
+    ctx,
+  }) => {
+    const group = await store.createGroup("partitioning");
+    await store.setActiveGroup(group.id);
+    await handlers.get("session_start")({ reason: "startup" }, ctx);
+
+    const absent = await changelogTool.execute(
+      "read-absent",
+      { action: "read" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(absent.content[0].text, /No changelog exists/);
+
+    const request = "Add our completed backfill work to the group changelog.";
+    await handlers.get("input")({ text: request, source: "interactive" }, ctx);
+    const before = await handlers.get("before_agent_start")(
+      { prompt: request, systemPrompt: "base", systemPromptOptions: {} },
+      ctx,
+    );
+    assert.doesNotMatch(before.systemPrompt, /Completed historical backfill/);
+
+    confirmationAnswers.push(true);
+    const appended = await changelogTool.execute(
+      "append",
+      {
+        action: "append",
+        entry: "- Completed historical backfill.\n- Added failure monitoring.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.doesNotMatch(appended.content[0].text, /Completed historical backfill/);
+    assert.match(confirmations.at(-1).title, /Append to shared group changelog/);
+    const stored = await readFile(store.changelogPath(group.id), "utf8");
+    assert.match(stored, /Partition production table/);
+    assert.match(stored, /Completed historical backfill/);
+
+    await assert.rejects(
+      changelogTool.execute(
+        "declined-append",
+        { action: "append", entry: "- This entry must not be stored." },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      /did not approve/,
+    );
+    assert.doesNotMatch(
+      await readFile(store.changelogPath(group.id), "utf8"),
+      /must not be stored/,
+    );
+
+    const read = await changelogTool.execute(
+      "read",
+      { action: "read" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(read.content[0].text, /Completed historical backfill/);
+
+    await handlers.get("agent_settled")({}, ctx);
+    const next = await handlers.get("before_agent_start")(
+      { prompt: "continue", systemPrompt: "base", systemPromptOptions: {} },
+      ctx,
+    );
+    assert.doesNotMatch(next.systemPrompt, /Completed historical backfill/);
   });
 });
 

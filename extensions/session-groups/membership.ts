@@ -9,6 +9,7 @@ import {
 import {
   parseSessionGroupMembership,
   parseSessionGroupToolState,
+  SESSION_GROUP_CHANGELOG_TOOL_STATE_ENTRY,
   SESSION_GROUP_MEMBERSHIP_ENTRY,
   SESSION_GROUP_TOOL_STATE_ENTRY,
   SESSION_GROUPS_VERSION,
@@ -86,23 +87,34 @@ export function readSessionGroupMembershipFromFile(
   return readSessionGroupMembership(SessionManager.open(sessionFile).getEntries());
 }
 
-export function readSessionGroupToolState(
+function readToolState(
   entries: readonly SessionEntry[],
+  customType: string,
 ): SessionGroupToolState | undefined {
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index]!;
-    if (entry.type !== "custom" || entry.customType !== SESSION_GROUP_TOOL_STATE_ENTRY) {
-      continue;
-    }
+    if (entry.type !== "custom" || entry.customType !== customType) continue;
     const state = parseSessionGroupToolState(entry.data);
     if (!state) {
       throw new SessionGroupMembershipError(
-        `Invalid ${SESSION_GROUP_TOOL_STATE_ENTRY} entry at ${entry.id}.`,
+        `Invalid ${customType} entry at ${entry.id}.`,
       );
     }
     return state;
   }
   return undefined;
+}
+
+export function readSessionGroupToolState(
+  entries: readonly SessionEntry[],
+): SessionGroupToolState | undefined {
+  return readToolState(entries, SESSION_GROUP_TOOL_STATE_ENTRY);
+}
+
+export function readSessionGroupChangelogToolState(
+  entries: readonly SessionEntry[],
+): SessionGroupToolState | undefined {
+  return readToolState(entries, SESSION_GROUP_CHANGELOG_TOOL_STATE_ENTRY);
 }
 
 export function recordSessionGroupTransition(
@@ -213,8 +225,9 @@ export function resolveSessionStartMembership(
   };
 }
 
-export function appendSessionGroupToolState(
+function appendToolState(
   pi: ExtensionAPI,
+  customType: string,
   active: boolean,
 ): SessionGroupToolState {
   const state = parseSessionGroupToolState({
@@ -222,8 +235,22 @@ export function appendSessionGroupToolState(
     active,
   });
   if (!state) throw new SessionGroupMembershipError("Invalid session-group tool state.");
-  pi.appendEntry<SessionGroupToolState>(SESSION_GROUP_TOOL_STATE_ENTRY, state);
+  pi.appendEntry<SessionGroupToolState>(customType, state);
   return state;
+}
+
+export function appendSessionGroupToolState(
+  pi: ExtensionAPI,
+  active: boolean,
+): SessionGroupToolState {
+  return appendToolState(pi, SESSION_GROUP_TOOL_STATE_ENTRY, active);
+}
+
+export function appendSessionGroupChangelogToolState(
+  pi: ExtensionAPI,
+  active: boolean,
+): SessionGroupToolState {
+  return appendToolState(pi, SESSION_GROUP_CHANGELOG_TOOL_STATE_ENTRY, active);
 }
 
 export function appendSessionGroupMembership(

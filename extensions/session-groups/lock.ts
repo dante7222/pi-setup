@@ -28,6 +28,9 @@ export type SessionGroupLockKind =
   | "context-read"
   | "agent-edit"
   | "zed-edit"
+  | "changelog-read"
+  | "changelog-append"
+  | "changelog-edit"
   | "rename"
   | "delete";
 

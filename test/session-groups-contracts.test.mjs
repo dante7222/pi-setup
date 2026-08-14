@@ -9,6 +9,9 @@ import {
   parseSessionGroupPresentation,
   parseSessionGroupsState,
   parseSessionGroupToolState,
+  SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES,
+  SESSION_GROUP_CHANGELOG_MAX_BYTES,
+  SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES,
   SESSION_GROUP_CONTEXT_MAX_BYTES,
   SESSION_GROUPS_VERSION,
 } from "../extensions/session-groups/contracts.ts";
@@ -59,6 +62,9 @@ test("creates the approved Markdown context template", () => {
     ].join("\n"),
   );
   assert.equal(SESSION_GROUP_CONTEXT_MAX_BYTES, 65_536);
+  assert.equal(SESSION_GROUP_CHANGELOG_MAX_BYTES, 262_144);
+  assert.equal(SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES, 16_384);
+  assert.equal(SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES, 8_192);
 });
 
 test("parses strict state and metadata contracts", () => {
