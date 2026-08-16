@@ -39,7 +39,8 @@
       "./extensions/yellow-file-headers/index.ts"
     ],
     "skills": [
-      "./skills"
+      "./skills",
+      "./integrations/herdr-pi-subagents/patch-herdr-subagent-state"
     ],
     "prompts": [
       "./prompts"

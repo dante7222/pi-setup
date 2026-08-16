@@ -18,6 +18,7 @@ Included now:
 - **rg Only** extension (`extensions/rg-only/index.ts`)
 - **Session Groups** extension (`extensions/session-groups/index.ts`)
 - **Web Access Toggle** extension (`extensions/web-access-toggle/index.ts`)
+- **Herdr Pi Subagent State** portable bundle (`integrations/herdr-pi-subagents/`) — patched integration and manual repair skill
 - **Permissions** extension (`extensions/permissions/index.ts`) — retained but disabled
 
 ## Compaction transcripts
