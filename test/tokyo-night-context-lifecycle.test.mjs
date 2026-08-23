@@ -37,6 +37,7 @@ test("calculates context after session-group tool gating and prompt injection", 
   ];
   let activeToolNames = tools.map(({ name }) => name);
   let effectiveSystemPrompt = "base system prompt";
+  let reportedContextTokens = 0;
 
   const pi = {
     on(name, handler) {
@@ -75,7 +76,11 @@ test("calculates context after session-group tool gating and prompt injection", 
       contextWindow: 230_000,
       reasoning: false,
     },
-    getContextUsage: () => ({ tokens: 0, contextWindow: 230_000, percent: 0 }),
+    getContextUsage: () => ({
+      tokens: reportedContextTokens,
+      contextWindow: ctx.model.contextWindow,
+      percent: (reportedContextTokens / ctx.model.contextWindow) * 100,
+    }),
     getSystemPrompt: () => effectiveSystemPrompt,
     sessionManager: {
       getSessionId: () => "session-1",
@@ -128,6 +133,85 @@ test("calculates context after session-group tool gating and prompt injection", 
     );
     assert.match(widgets.at(-1), new RegExp(`~${formatExpectedTokens(requestEstimate)}/230k`));
     assert.notEqual(requestEstimate, startupEstimate);
+
+    reportedContextTokens = 5;
+    const userMessage = { role: "user", content: "12345678", timestamp: 1 };
+    await handlers.get("context")({ type: "context", messages: [userMessage] }, ctx);
+    const requestWithUserEstimate = requestEstimate + 2;
+    assert.match(
+      widgets.at(-1),
+      new RegExp(`~${formatExpectedTokens(requestWithUserEstimate)}/230k`),
+    );
+
+    const zeroUsage = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+    const streamingAssistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "x".repeat(4_000) }],
+      api: "test",
+      provider: "test",
+      model: "test-model",
+      usage: zeroUsage,
+      stopReason: "pending",
+      timestamp: 2,
+    };
+    await handlers.get("message_start")(
+      { type: "message_start", message: streamingAssistant },
+      ctx,
+    );
+    await handlers.get("message_update")(
+      {
+        type: "message_update",
+        message: streamingAssistant,
+        assistantMessageEvent: { type: "text_delta", delta: "x".repeat(4_000) },
+      },
+      ctx,
+    );
+    assert.match(
+      widgets.at(-1),
+      new RegExp(`~${formatExpectedTokens(requestWithUserEstimate + 1_000)}/230k`),
+    );
+
+    const completedAssistant = {
+      ...streamingAssistant,
+      usage: { ...zeroUsage, input: 11_000, output: 1_000, totalTokens: 12_000 },
+      stopReason: "stop",
+    };
+    reportedContextTokens = 12_000;
+    await handlers.get("message_end")(
+      { type: "message_end", message: completedAssistant },
+      ctx,
+    );
+    assert.match(widgets.at(-1), /◫ 12k\/230k/);
+    assert.doesNotMatch(widgets.at(-1), /~12k\/230k/);
+
+    ctx.model = {
+      ...ctx.model,
+      id: "new-model",
+      name: "New Model",
+      contextWindow: 100_000,
+    };
+    await handlers.get("model_select")(
+      { type: "model_select", model: ctx.model, source: "select" },
+      ctx,
+    );
+    assert.match(widgets.at(-1), /◫ \?\/100k/);
+
+    await handlers.get("context")(
+      { type: "context", messages: [completedAssistant] },
+      ctx,
+    );
+    assert.match(
+      widgets.at(-1),
+      new RegExp(`~${formatExpectedTokens(requestEstimate + 1_000)}/100k`),
+    );
+    assert.doesNotMatch(widgets.at(-1), /12k\/100k/);
   } finally {
     if (previousNerdFonts === undefined) {
       delete process.env.POWERLINE_NERD_FONTS;

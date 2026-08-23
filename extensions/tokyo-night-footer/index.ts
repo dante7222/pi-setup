@@ -1,6 +1,5 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import type { Usage } from "@earendil-works/pi-ai";
 import {
   CustomEditor,
   type ExtensionAPI,
@@ -30,7 +29,15 @@ import {
   invalidateGitStatus,
 } from "./git-status.ts";
 import { subscribeToSessionGroupPresentation } from "../session-groups/events.ts";
-import { estimateLoadedContextTokens } from "./context-usage.ts";
+import {
+  assistantMatchesModel,
+  type ContextTokenEstimate,
+  estimateContextWithMessage,
+  estimateLoadedContextTokens,
+  estimateRequestContextTokens,
+  estimateStreamingContextTokens,
+  usageTokenTotal,
+} from "./context-usage.ts";
 
 // Visual layout adapted from oh-my-pi's MIT-licensed editor status line.
 const LEGACY_SESSION_NAME_STATUS_KEY = "ventris-session-name";
@@ -110,8 +117,13 @@ interface StatusLineState {
   sessionId: string | undefined;
   sessionGroupName: string | undefined;
   latestTps: number | undefined;
-  liveContextTokens: number | undefined;
+  contextEstimate: ContextTokenEstimate | undefined;
+  requestContextEstimate: ContextTokenEstimate | undefined;
   loadedContextTokens: number | undefined;
+  authoritativeLoadedContextTokens: number | undefined;
+  streamingContextChars: number;
+  streamingContentChars: Map<number, number>;
+  contextUsageInvalidated: boolean;
   footerData: ReadonlyFooterDataProvider | undefined;
   gitStatus: GitStatusTracker;
   runtimeContext: ExtensionContext | undefined;
@@ -311,20 +323,22 @@ function estimateLoadedContext(
 function contextSegment(
   ctx: ExtensionContext,
   theme: Theme,
-  liveContextTokens: number | undefined,
+  contextEstimate: ContextTokenEstimate | undefined,
   loadedContextTokens: number | undefined,
+  contextUsageInvalidated: boolean,
   nerdIcons: boolean,
 ): string {
   const usage = ctx.getContextUsage();
   const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-  const reportedContextTokens = liveContextTokens ?? usage?.tokens;
+  const reportedContextTokens = contextUsageInvalidated ? undefined : usage?.tokens;
   const isLoadedContextEstimate =
-    liveContextTokens === undefined &&
+    contextEstimate === undefined &&
     reportedContextTokens === 0 &&
     loadedContextTokens !== undefined;
-  const contextTokens = isLoadedContextEstimate
-    ? loadedContextTokens
-    : reportedContextTokens;
+  const contextTokens =
+    contextEstimate?.tokens ??
+    (isLoadedContextEstimate ? loadedContextTokens : reportedContextTokens);
+  const isEstimate = contextEstimate?.estimated ?? isLoadedContextEstimate;
   const percent =
     contextTokens !== null && contextTokens !== undefined && contextWindow > 0
       ? (contextTokens / contextWindow) * 100
@@ -334,16 +348,12 @@ function contextSegment(
       ? "?/?"
       : contextTokens === null || contextTokens === undefined
         ? `?/${formatTokens(contextWindow)}`
-        : `${isLoadedContextEstimate ? "~" : ""}${formatTokens(contextTokens)}/${formatTokens(contextWindow)}`;
+        : `${isEstimate ? "~" : ""}${formatTokens(contextTokens)}/${formatTokens(contextWindow)}`;
   const text = withIcon(nerdIcons ? CONTEXT_ICON_NERD : CONTEXT_ICON_FALLBACK, display);
 
   if (percent > 90) return theme.fg("error", text);
   if (percent > 70) return theme.fg("warning", text);
   return tone(theme, "context", text);
-}
-
-function usageTokenTotal(usage: Usage): number {
-  return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
 
 function modelName(ctx: ExtensionContext): string {
@@ -437,8 +447,9 @@ function buildLeftSegments(
     content: contextSegment(
       ctx,
       theme,
-      state.liveContextTokens,
+      state.contextEstimate,
       state.loadedContextTokens,
+      state.contextUsageInvalidated,
       nerdIcons,
     ),
   });
@@ -724,8 +735,13 @@ export default function (pi: ExtensionAPI): void {
     sessionId: undefined,
     sessionGroupName: undefined,
     latestTps: undefined,
-    liveContextTokens: undefined,
+    contextEstimate: undefined,
+    requestContextEstimate: undefined,
     loadedContextTokens: undefined,
+    authoritativeLoadedContextTokens: undefined,
+    streamingContextChars: 0,
+    streamingContentChars: new Map(),
+    contextUsageInvalidated: false,
     footerData: undefined,
     gitStatus: createGitStatusTracker(process.cwd()),
     runtimeContext: undefined,
@@ -739,11 +755,51 @@ export default function (pi: ExtensionAPI): void {
   let requestRender: (() => void) | undefined;
   let turnStartedAt: number | undefined;
 
+  const contextRenderKey = (estimate: ContextTokenEstimate | undefined): string => {
+    if (!estimate) return "unknown";
+    const contextWindow = state.runtimeContext?.model?.contextWindow ?? 0;
+    const percent = contextWindow > 0 ? (estimate.tokens / contextWindow) * 100 : 0;
+    const level = percent > 90 ? "error" : percent > 70 ? "warning" : "normal";
+    return `${estimate.estimated ? "estimated" : "reported"}:${formatTokens(estimate.tokens)}:${level}`;
+  };
+
+  const setContextEstimate = (estimate: ContextTokenEstimate | undefined): void => {
+    const previousKey = contextRenderKey(state.contextEstimate);
+    state.contextEstimate = estimate;
+    if (contextRenderKey(estimate) !== previousKey) requestRender?.();
+  };
+
+  const updateLoadedContext = (loadedContextTokens: number | undefined): void => {
+    const previous = state.loadedContextTokens;
+    state.loadedContextTokens = loadedContextTokens;
+    if (
+      previous === undefined ||
+      loadedContextTokens === undefined ||
+      previous === loadedContextTokens
+    ) {
+      return;
+    }
+
+    const delta = loadedContextTokens - previous;
+    if (state.requestContextEstimate) {
+      state.requestContextEstimate = {
+        tokens: Math.max(0, state.requestContextEstimate.tokens + delta),
+        estimated: true,
+      };
+    }
+    if (state.contextEstimate) {
+      setContextEstimate({
+        tokens: Math.max(0, state.contextEstimate.tokens + delta),
+        estimated: true,
+      });
+    }
+  };
+
   subscribeToSessionGroupPresentation(pi, (presentation) => {
     if (presentation.sessionId !== state.sessionId) return;
     state.sessionGroupName = presentation.group?.name;
     if (state.runtimeContext) {
-      state.loadedContextTokens = estimateLoadedContext(pi, state.runtimeContext);
+      updateLoadedContext(estimateLoadedContext(pi, state.runtimeContext));
     }
     requestRender?.();
   });
@@ -808,7 +864,12 @@ export default function (pi: ExtensionAPI): void {
     state.sessionId = ctx.sessionManager.getSessionId();
     state.sessionGroupName = undefined;
     state.latestTps = undefined;
-    state.liveContextTokens = undefined;
+    state.contextEstimate = undefined;
+    state.requestContextEstimate = undefined;
+    state.authoritativeLoadedContextTokens = undefined;
+    state.streamingContextChars = 0;
+    state.streamingContentChars.clear();
+    state.contextUsageInvalidated = false;
     // Session Groups loads after the footer and applies membership-specific tool
     // gating later in session_start. Wait for its presentation event instead of
     // measuring the transient registration-time tool set.
@@ -879,42 +940,135 @@ export default function (pi: ExtensionAPI): void {
     if (!state.runtimeActive) return;
     // This runs after every extension's before_agent_start handler, so both the
     // effective system prompt and active tool schemas match the agent request.
-    state.loadedContextTokens = estimateLoadedContext(pi, ctx);
+    updateLoadedContext(estimateLoadedContext(pi, ctx));
     requestRender?.();
   });
 
+  pi.on("context", (event, ctx) => {
+    if (!state.runtimeActive) return;
+    const loadedContextTokens =
+      state.loadedContextTokens ?? estimateLoadedContext(pi, ctx);
+    if (loadedContextTokens === undefined) return;
+    if (state.loadedContextTokens === undefined) updateLoadedContext(loadedContextTokens);
+
+    const estimate = estimateRequestContextTokens(
+      event.messages,
+      loadedContextTokens,
+      { provider: ctx.model?.provider, id: ctx.model?.id },
+      state.authoritativeLoadedContextTokens,
+    );
+    state.requestContextEstimate = estimate;
+    setContextEstimate(estimate);
+  });
+
   pi.on("turn_start", () => {
-    state.liveContextTokens = undefined;
     turnStartedAt = performance.now();
   });
 
   pi.on("message_start", (event) => {
     if (event.message.role !== "assistant") return;
-    state.liveContextTokens = undefined;
+    state.streamingContextChars = 0;
+    state.streamingContentChars.clear();
+    if (state.requestContextEstimate) setContextEstimate(state.requestContextEstimate);
     if (turnStartedAt === undefined) turnStartedAt = performance.now();
   });
 
-  pi.on("message_update", (event) => {
+  pi.on("message_update", (event, ctx) => {
     if (event.message.role !== "assistant") return;
+    const streamEvent = event.assistantMessageEvent;
+    if (
+      streamEvent.type === "text_delta" ||
+      streamEvent.type === "thinking_delta" ||
+      streamEvent.type === "toolcall_delta"
+    ) {
+      const previous = state.streamingContentChars.get(streamEvent.contentIndex) ?? 0;
+      const current = previous + streamEvent.delta.length;
+      state.streamingContentChars.set(streamEvent.contentIndex, current);
+      state.streamingContextChars += streamEvent.delta.length;
+    } else if (
+      streamEvent.type === "text_end" ||
+      streamEvent.type === "thinking_end" ||
+      streamEvent.type === "toolcall_end"
+    ) {
+      const previous = state.streamingContentChars.get(streamEvent.contentIndex) ?? 0;
+      let current = previous;
+      if (streamEvent.type === "text_end" || streamEvent.type === "thinking_end") {
+        current = streamEvent.content.length;
+      } else {
+        try {
+          current =
+            streamEvent.toolCall.name.length +
+            JSON.stringify(streamEvent.toolCall.arguments).length;
+        } catch {
+          // Keep the streamed character count if unusual tool arguments cannot serialize.
+        }
+      }
+      state.streamingContentChars.set(streamEvent.contentIndex, current);
+      state.streamingContextChars = Math.max(
+        0,
+        state.streamingContextChars + current - previous,
+      );
+    }
+
     const contextTokens = usageTokenTotal(event.message.usage);
-    if (contextTokens > 0) state.liveContextTokens = contextTokens;
-    requestRender?.();
+    if (
+      contextTokens > 0 &&
+      assistantMatchesModel(event.message, {
+        provider: ctx.model?.provider,
+        id: ctx.model?.id,
+      })
+    ) {
+      state.contextUsageInvalidated = false;
+      setContextEstimate({ tokens: contextTokens, estimated: false });
+      return;
+    }
+    if (state.requestContextEstimate) {
+      setContextEstimate(
+        estimateStreamingContextTokens(
+          state.requestContextEstimate,
+          state.streamingContextChars,
+        ),
+      );
+    }
   });
 
-  pi.on("message_end", (event) => {
-    if (event.message.role !== "assistant") return;
+  pi.on("message_end", (event, ctx) => {
+    if (event.message.role !== "assistant") {
+      if (state.contextEstimate) {
+        setContextEstimate(estimateContextWithMessage(state.contextEstimate, event.message));
+      }
+      return;
+    }
 
     const elapsedMs = turnStartedAt === undefined ? 0 : performance.now() - turnStartedAt;
     const outputTokens = event.message.usage.output;
+    const contextTokens = usageTokenTotal(event.message.usage);
     const completed =
       event.message.stopReason !== "error" && event.message.stopReason !== "aborted";
+    const hasCurrentModelUsage =
+      completed &&
+      contextTokens > 0 &&
+      assistantMatchesModel(event.message, {
+        provider: ctx.model?.provider,
+        id: ctx.model?.id,
+      });
 
     if (completed && outputTokens > 0 && elapsedMs >= 100) {
       state.latestTps = outputTokens / (elapsedMs / 1_000);
     }
-    state.liveContextTokens = undefined;
+    if (hasCurrentModelUsage) {
+      state.contextUsageInvalidated = false;
+      state.authoritativeLoadedContextTokens = state.loadedContextTokens;
+      setContextEstimate({ tokens: contextTokens, estimated: false });
+    } else if (state.requestContextEstimate) {
+      setContextEstimate(
+        estimateContextWithMessage(state.requestContextEstimate, event.message),
+      );
+    }
+    state.requestContextEstimate = undefined;
+    state.streamingContextChars = 0;
+    state.streamingContentChars.clear();
     turnStartedAt = undefined;
-    requestRender?.();
   });
 
   pi.on("tool_result", (event) => {
@@ -939,16 +1093,31 @@ export default function (pi: ExtensionAPI): void {
   pi.on("agent_settled", (_event, ctx) => maybeGenerateAgentTitle(ctx));
   pi.on("session_info_changed", () => requestRender?.());
   pi.on("model_select", () => {
-    state.liveContextTokens = undefined;
+    state.contextEstimate = undefined;
+    state.requestContextEstimate = undefined;
+    state.authoritativeLoadedContextTokens = undefined;
+    state.streamingContextChars = 0;
+    state.streamingContentChars.clear();
+    state.contextUsageInvalidated = true;
     requestRender?.();
   });
   pi.on("thinking_level_select", () => requestRender?.());
   pi.on("session_compact", () => {
-    state.liveContextTokens = undefined;
+    state.contextEstimate = undefined;
+    state.requestContextEstimate = undefined;
+    state.authoritativeLoadedContextTokens = undefined;
+    state.streamingContextChars = 0;
+    state.streamingContentChars.clear();
+    state.contextUsageInvalidated = false;
     requestRender?.();
   });
   pi.on("session_tree", (_event, ctx) => {
-    state.liveContextTokens = undefined;
+    state.contextEstimate = undefined;
+    state.requestContextEstimate = undefined;
+    state.authoritativeLoadedContextTokens = undefined;
+    state.streamingContextChars = 0;
+    state.streamingContentChars.clear();
+    state.contextUsageInvalidated = false;
     requestRender?.();
     maybeGenerateAgentTitle(ctx);
   });
@@ -966,8 +1135,13 @@ export default function (pi: ExtensionAPI): void {
     state.gitStatus = createGitStatusTracker(process.cwd());
     requestRender = undefined;
     state.footerData = undefined;
-    state.liveContextTokens = undefined;
+    state.contextEstimate = undefined;
+    state.requestContextEstimate = undefined;
     state.loadedContextTokens = undefined;
+    state.authoritativeLoadedContextTokens = undefined;
+    state.streamingContextChars = 0;
+    state.streamingContentChars.clear();
+    state.contextUsageInvalidated = false;
     state.runtimeContext = undefined;
     state.primeAgentContext = undefined;
     state.primeAgentWidgetText = undefined;
