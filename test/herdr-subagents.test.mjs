@@ -411,7 +411,7 @@ test("extension adds zero tools/prompt messages; settle closes only consumed pan
   const handlers = new Map();
   const commands = new Map();
   extension({ on: (name, fn) => handlers.set(name, fn), registerCommand: (name, fn) => commands.set(name, fn) });
-  assert.deepEqual([...handlers.keys()], ["agent_settled", "session_shutdown"]);
+  assert.deepEqual([...handlers.keys()], ["session_start", "before_agent_start", "agent_start", "session_before_compact", "agent_end", "agent_settled", "session_shutdown"]);
   const [read, unread] = await spawnTasks(scope, [task("read"), task("unread")]);
   await completed(scope, read, "ok");
   await collect(scope, 0, async () => {});
