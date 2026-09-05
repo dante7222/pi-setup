@@ -17,12 +17,14 @@ import { open, rm } from "node:fs/promises";
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const projectBin = join(projectRoot, "node_modules", ".bin");
 const lockPath = join(projectRoot, ".pi-runtime-sync.lock");
-const packageNames = [
+const bundledPackageNames = [
   "@earendil-works/pi-ai",
   "@earendil-works/pi-coding-agent",
   "@earendil-works/pi-tui",
   "typebox",
 ];
+const versionCoupledPackageNames = ["@earendil-works/pi-server"];
+const packageNames = [...bundledPackageNames, ...versionCoupledPackageNames];
 
 function readJson(filePath) {
   return JSON.parse(readFileSync(filePath, "utf8"));
@@ -80,7 +82,7 @@ function activeRuntime() {
   if (!piExecutable) return undefined;
   const piRoot = packageRootFromEntry(piExecutable, "@earendil-works/pi-coding-agent");
   const versions = new Map();
-  for (const packageName of packageNames) {
+  for (const packageName of bundledPackageNames) {
     const packageRoot = packageName === "@earendil-works/pi-coding-agent"
       ? piRoot
       : join(piRoot, "node_modules", ...packageName.split("/"));
@@ -92,6 +94,9 @@ function activeRuntime() {
   }
   const cliVersion = execFileSync(piExecutable, ["--version"], { encoding: "utf8" }).trim();
   const packageVersion = versions.get("@earendil-works/pi-coding-agent");
+  for (const packageName of versionCoupledPackageNames) {
+    versions.set(packageName, packageVersion);
+  }
   if (cliVersion !== packageVersion) {
     throw new Error(`Pi CLI reports ${cliVersion}, but ${piRoot}/package.json reports ${packageVersion}.`);
   }

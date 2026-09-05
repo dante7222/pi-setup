@@ -15,9 +15,9 @@ Included now:
 - **Tokyo Night** theme (`themes/tokyo-night.json`)
 - **Tokyo Night Status Border** extension (`extensions/tokyo-night-footer/index.ts`)
 - **Yellow File Headers** extension (`extensions/yellow-file-headers/index.ts`)
-- **rg Only** extension (`extensions/rg-only/index.ts`)
 - **Session Groups** extension (`extensions/session-groups/index.ts`)
 - **Web Access Toggle** extension (`extensions/web-access-toggle/index.ts`)
+- **Herdr Subagents** skill and cleanup extension (`skills/herdr-subagents/`, `extensions/herdr-subagents/`)
 - **Herdr Pi Subagent State** portable bundle (`integrations/herdr-pi-subagents/`) — patched integration and manual repair skill
 - **Permissions** extension (`extensions/permissions/index.ts`) — retained but disabled
 
@@ -64,15 +64,31 @@ The status border owns Pi's custom editor and custom footer slots, so another ex
 
 The extension preserves Pi's built-in `edit` and `write` behavior and rendering, changing only each tool name and path to Tokyo Night pale yellow (`#e0af68`).
 
-## rg only
-
-The extension exposes Pi's ripgrep-backed content-search tool as `rg` instead of `grep`, adds an explicit search policy to the agent prompt, and blocks assistant bash commands that invoke `grep`, `git grep`, or common wrapped forms. Commands that merely search for the word `grep` with `rg` remain allowed.
-
 ## Web access toggle
 
 The always-loaded `/web-access` command controls the globally registered `npm:pi-web-access` package without uninstalling it. With no arguments it opens an On/Off selector; `/web-access on`, `/web-access off`, and `/web-access status` are also available. Changing state updates global Pi settings and reloads Pi automatically.
 
 Off mode retains the package entry using `autoload: false`, so Pi continues to track the installation while loading none of its extensions or skills. The toggle remains available because it belongs to this setup package rather than `pi-web-access` itself.
+
+## On-demand Herdr subagents
+
+After `/reload`, ask Pi to delegate independent work, or invoke `/skill:herdr-subagents`. For example: “Spawn two reviewers and a tester in Herdr; collect their findings and close them.”
+
+Only the skill's discovery entry (name, description and path) enters the normal system prompt. The extension registers no tools and injects no messages: no coordinator, shared history, peer chat, automatic follow-up turns, or background model calls. The [operational skill](skills/herdr-subagents/SKILL.md) loads only when needed and stays under 1,800 characters; [optional details](skills/herdr-subagents/reference.md) load only for advanced options or troubleshooting. Discovery, instruction budgets, safety rules and the CLI example have regression tests. Loaded instructions and collected reports still occupy parent context until compaction; closing panes does not remove them.
+
+Each task runs a fresh one-shot Pi process in a named side pane, with an explicit prompt and optional role, model, thinking level, working directory, timeout, and local provider extensions. The default model/thinking comes from the dispatching session. Up to 16 panes are supported; the main pane keeps its left half while the right half is subdivided into a balanced layout. Creation preserves focus and never creates tabs/worktrees implicitly. Very small terminals can reject splits; failed batches roll back their new panes.
+
+Workers use the parent's Pi config directory and normal Pi resource discovery: configured extensions, skills, prompt templates, AGENTS.md, models and saved authentication remain available. There is no subagent-specific tool allowlist; roles are prompt guidance, not permission restrictions. Optional `extensions` paths add to normal discovery. Project resources follow Pi's trust rules for the task's cwd; session-only extension state is not copied. Extensions can add their usual tools and context to each worker. Concurrent writes require disjoint files or caller-provided worktrees. Herdr supplies the shell environment; credentials set only inside the parent process are not copied to disk or forwarded.
+
+Workers remain ordinary named terminal panes, not registered Herdr agents, so they do not enter Herdr's Agents/priority list or contribute agent-attention notifications/counts. The foreground Node supervisor keeps Pi detached, and Herdr's installed Pi integration skips JSON mode. Task status comes from the runner's files (`/subagents` or CLI `status`), not Herdr agent state; reports, cancellation and cleanup do not depend on registration.
+
+The runner captures Pi's JSON stream directly, displays text/tool progress in the pane, and saves final reports independently of terminal size. Herdr's `pane read`/`agent read` use available viewport/scrollback and cannot recover text lost from an alternate screen. Collection therefore reads the saved final reports, not the terminal. It returns at most 12 KB per call, with lossless continuation for longer reports; raw tool events and reasoning stay out of the parent context.
+
+The agent collects every report and closes the panes before replying. The cleanup extension also closes fully collected panes when the parent settles; unread panes are preserved. `/subagents` shows status, `/subagents close` closes collected panes, and `/subagents cancel` confirms cancellation of all owned panes. Reload preserves running jobs; quitting, forking or switching the parent session cancels its remaining workers. Cancelled collection waits leave workers running. Each task has a 30-minute default deadline. Cancellation first requests worker shutdown and waits for its acknowledgement before closing the terminal; an unacknowledged worker's pane is retained rather than risking an orphaned process. Use `/subagents cancel`, not forced pane closure, for running workers. Forced process termination or a crashed Herdr server can bypass cleanup and leave subprocesses; inspect remaining processes explicitly in that case.
+
+Private artifacts remain under `~/.pi/agent/herdr-subagents/<scope>/<job>/` (or `PI_CODING_AGENT_DIR`): `result.md`, `events.jsonl`, `stderr.log`, and launch/state files. They can contain sensitive prompts/project data; they are not committed or automatically deleted. Delete obsolete scope directories only after their panes have closed. This implementation does not use or require the older `@tintinweb/pi-subagents` integration patch retained below `integrations/`.
+
+Requires macOS/Linux, Node 22.18+ (native TypeScript stripping), and the current Pi CLI/Herdr pane commands. Validated with Pi 0.85.0 and Herdr 0.8.2. Child model usage remains in their saved events, not the parent's token/cost totals.
 
 ## Permissions (disabled)
 
@@ -117,11 +133,11 @@ An `ask` prompt offers deny, allow once, or allow for the current Pi session. Se
 
 Use `/yolo` to toggle the bypass for the current session; the choice persists across `/reload`. Start Pi with `pi --yolo` to force YOLO from startup—`/yolo` cannot disable it until Pi is restarted without the flag. YOLO bypasses every permission check, including configured denies, prompts, config loading, and known-tool input classification. The footer stays silent during normal permission enforcement and shows a colored `YOLO mode` warning only while the bypass is active; `/permissions` reports full status.
 
-This extension is an approval gate, not a security sandbox. It does not mediate user `!`/`!!` commands, direct RPC bash commands, extension filesystem/process access, native skill/template expansion, or operations hidden inside a custom tool. A `skill` rule gates a registered tool named `skill`, not Pi's native `/skill:name` expansion. Bash checks split unquoted `&&`, `||`, pipes, semicolons, background operators, and newlines so every command in a chain must resolve; dynamic substitutions and grouping require approval. This is conservative classification, not a complete shell parser. Path checks are lexical rather than symlink-safe. The separate **rg Only** extension still blocks assistant Bash invocations of `grep` even if the permission policy allows `grep *`. A disabled gate provides no protection, and later-loaded extensions can mutate already approved tool input. Use a container or OS sandbox when enforcement against untrusted code is required.
+This extension is an approval gate, not a security sandbox. It does not mediate user `!`/`!!` commands, direct RPC bash commands, extension filesystem/process access, native skill/template expansion, or operations hidden inside a custom tool. A `skill` rule gates a registered tool named `skill`, not Pi's native `/skill:name` expansion. Bash checks split unquoted `&&`, `||`, pipes, semicolons, background operators, and newlines so every command in a chain must resolve; dynamic substitutions and grouping require approval. This is conservative classification, not a complete shell parser. Path checks are lexical rather than symlink-safe. A disabled gate provides no protection, and later-loaded extensions can mutate already approved tool input. Use a container or OS sandbox when enforcement against untrusted code is required.
 
 ## Local development
 
-The active `pi` executable on `PATH` is the development-runtime source of truth. `npm test` and `npm run typecheck` first run the runtime synchronizer, which skips this project's `node_modules/.bin`, reads the exact `pi-ai`, `pi-coding-agent`, `pi-tui`, and TypeBox versions bundled with the active Pi installation, and synchronizes the exact local development dependencies and lockfile. Without an external Pi executable, validation uses the committed local pins without network access. Published compatibility remains expressed through `"*"` peer ranges. After upgrading Pi, the next local validation updates `package.json` and `package-lock.json`; review and commit those generated changes. Set `PI_RUNTIME_BIN` to an explicit Pi executable when testing a non-default installation.
+The active `pi` executable on `PATH` is the development-runtime source of truth. `npm test` and `npm run typecheck` first run the runtime synchronizer, which skips this project's `node_modules/.bin`, reads the exact `pi-ai`, `pi-coding-agent`, `pi-tui`, and TypeBox versions bundled with the active Pi installation, couples `pi-server` to that Pi release, and synchronizes the exact local development dependencies and lockfile. Without an external Pi executable, validation uses the committed local pins without network access. Published compatibility remains expressed through `"*"` peer ranges. After upgrading Pi, the next local validation updates `package.json` and `package-lock.json`; review and commit those generated changes. Set `PI_RUNTIME_BIN` to an explicit Pi executable when testing a non-default installation.
 
 Install this checkout globally by path:
 
