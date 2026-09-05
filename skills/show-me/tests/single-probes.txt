@@ -1,0 +1,20 @@
+Final isolated Mini request: Show the proposed move from src/features/session-management/components/SessionConversationTimeline.tsx to packages/conversation-ui/src/SessionConversationTimeline.tsx.
+
+Exact response:
+```text
+src/features/session-management/components/SessionConversationTimeline.tsx
+-> packages/conversation-ui/src/SessionConversationTimeline.tsx
+```
+
+A component move from feature-local code into shared conversation UI.
+
+Appraisal: path-width/alias rule violated.
+
+Final isolated Spark request: Show the flow 用户 -> 验证 -> 成功 in my 40-column Pi pane.
+
+Exact response:
+```text
+用户 -> 验证 -> 成功
+```
+
+Appraisal: correct, compact, no invented nodes.

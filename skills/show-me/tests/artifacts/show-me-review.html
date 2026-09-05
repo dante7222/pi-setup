@@ -1,0 +1,30 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Show-me · visual review</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#121820;color:#eef2f7;font:16px/1.6 system-ui,sans-serif}main{max-width:1050px;padding:clamp(16px,4vw,48px);margin:auto}h1{font-size:clamp(32px,5vw,52px);line-height:1.15;margin:12px 0 20px}h2{font-size:23px;margin-top:36px}h3{font-size:17px;margin:0 0 18px}.lede{max-width:65ch;color:#bac7d7}.label{color:#a9c0ff;text-transform:uppercase;font-size:12px;letter-spacing:.1em;font-weight:700;margin:0 0 8px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{min-width:0;background:#1c2633;border:1px solid #63748b;border-radius:12px;padding:20px}.improved{border-top:3px solid #a9c0ff}pre{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;overflow:auto;margin:0;white-space:pre}a{color:#a9c0ff}a:focus-visible,pre:focus-visible{outline:3px solid #a9c0ff;outline-offset:4px}.facts{display:flex;gap:12px;flex-wrap:wrap;margin:28px 0}.facts span{border:1px solid #63748b;border-radius:6px;padding:6px 12px}.note{border-left:3px solid #a9c0ff;padding-left:18px;margin-top:28px}footer{border-top:1px solid #63748b;margin-top:32px;padding-top:20px;color:#bac7d7}h1,h2,h3,p,a{overflow-wrap:anywhere}@media(max-width:720px){.grid{grid-template-columns:1fr}.card{padding:16px}}@media(max-width:380px){pre{font-size:11px}}
+</style></head><body><main><p class="label">Show-me / Pi visual review</p><h1>Small diagrams.<br>Clear meaning.</h1><p class="lede">Same simple intent: show the smallest view that explains the point. Safer defaults for narrow panes, explicit branches and ownership, and HTML only when it earns its place.</p><div class="facts"><span>16 independent agent jobs</span><span>688 render snapshots</span><span>144 Mermaid cases</span><span>24 browser cases</span></div>
+<h2>01 / A flow that fits the pane</h2><p class="lede">Actual Pi output at 40 columns, with ANSI colors removed. The original sequence falls back to wrapped Mermaid source; a short message list keeps the relationships readable.</p><div class="grid"><section class="card "><p class="label">Original example</p><h3>Source fallback, not a diagram</h3><pre tabindex="0"> ```mermaid                             
+   sequenceDiagram                      
+       participant User                 
+       participant UI                   
+       participant Daemon               
+       User-&gt;&gt;UI: choose command        
+       UI-&gt;&gt;Daemon: send expanded       
+ prompt                                 
+       Daemon--&gt;&gt;UI: stream result      
+ ```                                    </pre></section><section class="card improved"><p class="label">Revised example</p><h3>One message per line</h3><pre tabindex="0"> ```text                                
+   1. User -&gt; UI: choose command        
+   2. UI -&gt; Daemon: send prompt         
+   3. Daemon -&gt; UI: stream (reply)      
+ ```                                    </pre></section></div>
+<h2>02 / Structure is not executable code</h2><p class="lede">Hooks are owned behavior, not rendered children. Structural sketches now use text fences and mark ownership directly.</p><div class="grid"><section class="card "><p class="label">Original example</p><h3>TSX-looking sketch; long annotation wraps</h3><pre tabindex="0"> ```tsx                                 
+   &lt;SessionPage&gt;                        
+ (apps/example/src/routes/session.tsx)  
+     useSessionEvents()                 
+     &lt;SessionToolbar&gt;                   
+       &lt;RunSkillButton&gt; (packages/ui)   
+ ```                                    </pre></section><section class="card improved"><p class="label">Revised example</p><h3>Explicit ownership; no fake TSX</h3><pre tabindex="0"> ```text                                
+   Page [owns hook: useSave]            
+   \-- Toolbar                          
+       \-- SaveButton                   
+ ```                                    </pre></section></div>
+<h2>03 / Check what numbers miss</h2><p class="lede">Browser tests covered 320, 375, and 1280 pixels, both themes, doubled text size, long labels, and literal markup injection. Screenshot review found cramped mobile padding even though there was no overflow; the template was corrected and retested.</p><p><a href="../../assets/visual.html">Open the responsive HTML template</a> · <a href="html-320-light-200pct.png">Inspect 320px / doubled text</a></p>
+<div class="note"><strong>Improved, not infallible.</strong><p>Mini and Spark still occasionally ignored path-width or semantic instructions. Their unedited failures are retained. Passing renderer checks proves the examples fit—not that every future model output will be correct.</p></div><footer><a href="render-gallery.html">Full render gallery</a> · <a href="mermaid-gallery.html">Mermaid geometry and fallback</a> · <a href="../README.md">Method, results, and limitations</a><p>The core skill remains a Markdown instruction file. No runtime extension or mandatory browser dependency was added.</p></footer></main></body></html>

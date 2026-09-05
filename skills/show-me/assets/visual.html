@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Save flow</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #f5f6f8; --surface: #fff; --ink: #192333; --muted: #475569; --line: #b6c1cf; --accent: #254fc4; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 1rem/1.6 system-ui, sans-serif; }
+    main { max-width: 64rem; margin: auto; padding: clamp(1rem, 4vw, 3rem); }
+    h1 { font-size: clamp(1.75rem, 4vw, 2.75rem); line-height: 1.15; margin: 0 0 1rem; }
+    h2 { font-size: 1.125rem; line-height: 1.4; margin: 0 0 .5rem; }
+    p { margin: 0 0 1rem; }
+    .summary { max-width: 65ch; color: var(--muted); }
+    .flow { padding-left: 1.75rem; margin: 2rem 0; }
+    .flow > li { padding: 1rem; margin: 0 0 1rem; border: 1px solid var(--line); border-radius: .625rem; background: var(--surface); }
+    .flow > li::marker { color: var(--accent); font-weight: 700; }
+    .branches { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+    .branch { border-left: .2rem solid var(--accent); padding-left: 1rem; min-width: 0; }
+    li > :last-child, .branch > :last-child { margin-bottom: 0; }
+    h1, h2, p, li, code { overflow-wrap: anywhere; }
+    code { font-size: .95em; }
+    a { color: var(--accent); }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+    @media (max-width: 40rem) {
+      main { padding: 16px; }
+      .flow { padding-left: 0; list-style-position: inside; }
+      .flow > li { padding: 12px; }
+      .flow > li > h2 { display: inline; }
+      .flow > li > p, .branches { margin-top: .75rem; }
+      .branches { grid-template-columns: 1fr; }
+      .branch { border-left: 0; border-top: 2px solid var(--accent); padding: .5rem 0 0; }
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #121820; --surface: #1c2633; --ink: #eef2f7; --muted: #bac7d7; --line: #63748b; --accent: #a9c0ff; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Save flow</h1>
+    <p class="summary">Unchanged content returns the cached result. Changed content is written before returning a fresh result.</p>
+    <ol class="flow">
+      <li><h2>Receive save</h2><p>Compare the content with the saved version.</p></li>
+      <li>
+        <h2>Choose one branch</h2>
+        <div class="branches">
+          <section class="branch"><h2>If unchanged</h2><p>Return cached result. Stop.</p></section>
+          <section class="branch"><h2>If changed</h2><p>Write content, then return fresh result.</p></section>
+        </div>
+      </li>
+    </ol>
+  </main>
+</body>
+</html>

@@ -1,0 +1,119 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pi Mermaid rendering</title><style>body{background:#121820;color:#eef2f7;font:16px/1.5 system-ui;margin:0;padding:24px}main{max-width:1100px;margin:auto}article{padding:16px;border:1px solid #63748b;margin:16px 0}h2{font-size:18px}pre{font:14px/1.4 ui-monospace,monospace;overflow:auto}a{color:#a9c0ff}</style><main><h1>Pi Mermaid: real rendered geometry</h1><p>Installed transform + Markdown output. ANSI stripped, not a full terminal screenshot. Narrow or unsupported diagrams fall back to source.</p><article><h2>originalSequence · 40 columns · source fallback</h2><pre> ```mermaid                             
+   sequenceDiagram                      
+       participant User                 
+       participant UI                   
+       participant Daemon               
+       User-&gt;&gt;UI: choose command        
+       UI-&gt;&gt;Daemon: send expanded       
+ prompt                                 
+       Daemon--&gt;&gt;UI: stream result      
+ ```                                    </pre></article><article><h2>compactFlow · 40 columns · rendered</h2><pre>   ┌──────┐                             
+   │ Save │                             
+   └───┬──┘                             
+       │                                
+       ▼                                
+ ┌──────────┐                           
+ │ Validate │                           
+ └─────┬────┘                           
+       │                                
+       ▼                                
+  ┌────────┐                            
+  │ Result │                            
+  └────────┘                            </pre></article><article><h2>unsupported · 40 columns · source fallback</h2><pre> ```mermaid                             
+   pie title Pets                       
+     &quot;Cats&quot; : 3                         
+     &quot;Dogs&quot; : 2                         
+ ```                                    </pre></article><article><h2>originalSequence · 60 columns · rendered</h2><pre> ┌──────┐         ┌────┐              ┌────────┐            
+ │ User │         │ UI │              │ Daemon │            
+ └───┬──┘         └──┬─┘              └────┬───┘            
+     │               │                     │                
+     │choose command │                     │                
+     ├──────────────▶│                     │                
+     │               │                     │                
+     │               │send expanded prompt │                
+     │               ├────────────────────▶│                
+     │               │                     │                
+     │               │    stream result    │                
+     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                
+     │               │                     │                
+ ┌───┴──┐         ┌──┴─┐              ┌────┴───┐            
+ │ User │         │ UI │              │ Daemon │            
+ └──────┘         └────┘              └────────┘            </pre></article><article><h2>compactFlow · 60 columns · rendered</h2><pre>   ┌──────┐                                                 
+   │ Save │                                                 
+   └───┬──┘                                                 
+       │                                                    
+       ▼                                                    
+ ┌──────────┐                                               
+ │ Validate │                                               
+ └─────┬────┘                                               
+       │                                                    
+       ▼                                                    
+  ┌────────┐                                                
+  │ Result │                                                
+  └────────┘                                                </pre></article><article><h2>unsupported · 60 columns · source fallback</h2><pre> ```mermaid                                                 
+   pie title Pets                                           
+     &quot;Cats&quot; : 3                                             
+     &quot;Dogs&quot; : 2                                             
+ ```                                                        </pre></article><article><h2>originalSequence · 80 columns · rendered</h2><pre> ┌──────┐         ┌────┐              ┌────────┐                                
+ │ User │         │ UI │              │ Daemon │                                
+ └───┬──┘         └──┬─┘              └────┬───┘                                
+     │               │                     │                                    
+     │choose command │                     │                                    
+     ├──────────────▶│                     │                                    
+     │               │                     │                                    
+     │               │send expanded prompt │                                    
+     │               ├────────────────────▶│                                    
+     │               │                     │                                    
+     │               │    stream result    │                                    
+     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                    
+     │               │                     │                                    
+ ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                
+ │ User │         │ UI │              │ Daemon │                                
+ └──────┘         └────┘              └────────┘                                </pre></article><article><h2>compactFlow · 80 columns · rendered</h2><pre>   ┌──────┐                                                                     
+   │ Save │                                                                     
+   └───┬──┘                                                                     
+       │                                                                        
+       ▼                                                                        
+ ┌──────────┐                                                                   
+ │ Validate │                                                                   
+ └─────┬────┘                                                                   
+       │                                                                        
+       ▼                                                                        
+  ┌────────┐                                                                    
+  │ Result │                                                                    
+  └────────┘                                                                    </pre></article><article><h2>unsupported · 80 columns · source fallback</h2><pre> ```mermaid                                                                     
+   pie title Pets                                                               
+     &quot;Cats&quot; : 3                                                                 
+     &quot;Dogs&quot; : 2                                                                 
+ ```                                                                            </pre></article><article><h2>originalSequence · 120 columns · rendered</h2><pre> ┌──────┐         ┌────┐              ┌────────┐                                                                        
+ │ User │         │ UI │              │ Daemon │                                                                        
+ └───┬──┘         └──┬─┘              └────┬───┘                                                                        
+     │               │                     │                                                                            
+     │choose command │                     │                                                                            
+     ├──────────────▶│                     │                                                                            
+     │               │                     │                                                                            
+     │               │send expanded prompt │                                                                            
+     │               ├────────────────────▶│                                                                            
+     │               │                     │                                                                            
+     │               │    stream result    │                                                                            
+     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                                                            
+     │               │                     │                                                                            
+ ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                                                        
+ │ User │         │ UI │              │ Daemon │                                                                        
+ └──────┘         └────┘              └────────┘                                                                        </pre></article><article><h2>compactFlow · 120 columns · rendered</h2><pre>   ┌──────┐                                                                                                             
+   │ Save │                                                                                                             
+   └───┬──┘                                                                                                             
+       │                                                                                                                
+       ▼                                                                                                                
+ ┌──────────┐                                                                                                           
+ │ Validate │                                                                                                           
+ └─────┬────┘                                                                                                           
+       │                                                                                                                
+       ▼                                                                                                                
+  ┌────────┐                                                                                                            
+  │ Result │                                                                                                            
+  └────────┘                                                                                                            </pre></article><article><h2>unsupported · 120 columns · source fallback</h2><pre> ```mermaid                                                                                                             
+   pie title Pets                                                                                                       
+     &quot;Cats&quot; : 3                                                                                                         
+     &quot;Dogs&quot; : 2                                                                                                         
+ ```                                                                                                                    </pre></article></main></html>

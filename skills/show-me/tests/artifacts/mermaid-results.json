@@ -1,0 +1,1298 @@
+[
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   flowchart TD                         \n     A[\"Save\"] --> B[\"Validate\"]        \n     B --> C[\"Result\"]                  \n ```                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   flowchart TD                         \n     A[\"Save\"] --> B[\"Validate\"]        \n     B --> C[\"Result\"]                  \n ```                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                             \n   │ Save │                             \n   └───┬──┘                             \n       │                                \n       ▼                                \n ┌──────────┐                           \n │ Validate │                           \n └─────┬────┘                           \n       │                                \n       ▼                                \n  ┌────────┐                            \n  │ Result │                            \n  └────────┘                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   flowchart TD                         \n     A[\"Save\"] --> B[\"Validate\"]        \n     B --> C[\"Result\"]                  \n ```                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                             \n   │ Save │                             \n   └───┬──┘                             \n       │                                \n       ▼                                \n ┌──────────┐                           \n │ Validate │                           \n └─────┬────┘                           \n       │                                \n       ▼                                \n  ┌────────┐                            \n  │ Result │                            \n  └────────┘                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                             \n   │ Save │                             \n   └───┬──┘                             \n       │                                \n       ▼                                \n ┌──────────┐                           \n │ Validate │                           \n └─────┬────┘                           \n       │                                \n       ▼                                \n  ┌────────┐                            \n  │ Result │                            \n  └────────┘                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   sequenceDiagram                                          \n       participant User                                     \n       participant UI                                       \n       participant Daemon                                   \n       User->>UI: choose command                            \n       UI->>Daemon: send expanded prompt                    \n       Daemon-->>UI: stream result                          \n ```                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   flowchart TD                                             \n     A[\"Save\"] --> B[\"Validate\"]                            \n     B --> C[\"Result\"]                                      \n ```                                                        "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   sequenceDiagram                                          \n       participant User                                     \n       participant UI                                       \n       participant Daemon                                   \n       User->>UI: choose command                            \n       UI->>Daemon: send expanded prompt                    \n       Daemon-->>UI: stream result                          \n ```                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   flowchart TD                                             \n     A[\"Save\"] --> B[\"Validate\"]                            \n     B --> C[\"Result\"]                                      \n ```                                                        "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐            \n │ User │         │ UI │              │ Daemon │            \n └───┬──┘         └──┬─┘              └────┬───┘            \n     │               │                     │                \n     │choose command │                     │                \n     ├──────────────▶│                     │                \n     │               │                     │                \n     │               │send expanded prompt │                \n     │               ├────────────────────▶│                \n     │               │                     │                \n     │               │    stream result    │                \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                \n     │               │                     │                \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐            \n │ User │         │ UI │              │ Daemon │            \n └──────┘         └────┘              └────────┘            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                 \n   │ Save │                                                 \n   └───┬──┘                                                 \n       │                                                    \n       ▼                                                    \n ┌──────────┐                                               \n │ Validate │                                               \n └─────┬────┘                                               \n       │                                                    \n       ▼                                                    \n  ┌────────┐                                                \n  │ Result │                                                \n  └────────┘                                                "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   sequenceDiagram                                          \n       participant User                                     \n       participant UI                                       \n       participant Daemon                                   \n       User->>UI: choose command                            \n       UI->>Daemon: send expanded prompt                    \n       Daemon-->>UI: stream result                          \n ```                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   flowchart TD                                             \n     A[\"Save\"] --> B[\"Validate\"]                            \n     B --> C[\"Result\"]                                      \n ```                                                        "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐            \n │ User │         │ UI │              │ Daemon │            \n └───┬──┘         └──┬─┘              └────┬───┘            \n     │               │                     │                \n     │choose command │                     │                \n     ├──────────────▶│                     │                \n     │               │                     │                \n     │               │send expanded prompt │                \n     │               ├────────────────────▶│                \n     │               │                     │                \n     │               │    stream result    │                \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                \n     │               │                     │                \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐            \n │ User │         │ UI │              │ Daemon │            \n └──────┘         └────┘              └────────┘            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                 \n   │ Save │                                                 \n   └───┬──┘                                                 \n       │                                                    \n       ▼                                                    \n ┌──────────┐                                               \n │ Validate │                                               \n └─────┬────┘                                               \n       │                                                    \n       ▼                                                    \n  ┌────────┐                                                \n  │ Result │                                                \n  └────────┘                                                "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐            \n │ User │         │ UI │              │ Daemon │            \n └───┬──┘         └──┬─┘              └────┬───┘            \n     │               │                     │                \n     │choose command │                     │                \n     ├──────────────▶│                     │                \n     │               │                     │                \n     │               │send expanded prompt │                \n     │               ├────────────────────▶│                \n     │               │                     │                \n     │               │    stream result    │                \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                \n     │               │                     │                \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐            \n │ User │         │ UI │              │ Daemon │            \n └──────┘         └────┘              └────────┘            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                 \n   │ Save │                                                 \n   └───┬──┘                                                 \n       │                                                    \n       ▼                                                    \n ┌──────────┐                                               \n │ Validate │                                               \n └─────┬────┘                                               \n       │                                                    \n       ▼                                                    \n  ┌────────┐                                                \n  │ Result │                                                \n  └────────┘                                                "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   sequenceDiagram                                                              \n       participant User                                                         \n       participant UI                                                           \n       participant Daemon                                                       \n       User->>UI: choose command                                                \n       UI->>Daemon: send expanded prompt                                        \n       Daemon-->>UI: stream result                                              \n ```                                                                            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   flowchart TD                                                                 \n     A[\"Save\"] --> B[\"Validate\"]                                                \n     B --> C[\"Result\"]                                                          \n ```                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   sequenceDiagram                                                              \n       participant User                                                         \n       participant UI                                                           \n       participant Daemon                                                       \n       User->>UI: choose command                                                \n       UI->>Daemon: send expanded prompt                                        \n       Daemon-->>UI: stream result                                              \n ```                                                                            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   flowchart TD                                                                 \n     A[\"Save\"] --> B[\"Validate\"]                                                \n     B --> C[\"Result\"]                                                          \n ```                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                \n │ User │         │ UI │              │ Daemon │                                \n └───┬──┘         └──┬─┘              └────┬───┘                                \n     │               │                     │                                    \n     │choose command │                     │                                    \n     ├──────────────▶│                     │                                    \n     │               │                     │                                    \n     │               │send expanded prompt │                                    \n     │               ├────────────────────▶│                                    \n     │               │                     │                                    \n     │               │    stream result    │                                    \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                    \n     │               │                     │                                    \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                \n │ User │         │ UI │              │ Daemon │                                \n └──────┘         └────┘              └────────┘                                "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                     \n   │ Save │                                                                     \n   └───┬──┘                                                                     \n       │                                                                        \n       ▼                                                                        \n ┌──────────┐                                                                   \n │ Validate │                                                                   \n └─────┬────┘                                                                   \n       │                                                                        \n       ▼                                                                        \n  ┌────────┐                                                                    \n  │ Result │                                                                    \n  └────────┘                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   sequenceDiagram                                                              \n       participant User                                                         \n       participant UI                                                           \n       participant Daemon                                                       \n       User->>UI: choose command                                                \n       UI->>Daemon: send expanded prompt                                        \n       Daemon-->>UI: stream result                                              \n ```                                                                            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   flowchart TD                                                                 \n     A[\"Save\"] --> B[\"Validate\"]                                                \n     B --> C[\"Result\"]                                                          \n ```                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                \n │ User │         │ UI │              │ Daemon │                                \n └───┬──┘         └──┬─┘              └────┬───┘                                \n     │               │                     │                                    \n     │choose command │                     │                                    \n     ├──────────────▶│                     │                                    \n     │               │                     │                                    \n     │               │send expanded prompt │                                    \n     │               ├────────────────────▶│                                    \n     │               │                     │                                    \n     │               │    stream result    │                                    \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                    \n     │               │                     │                                    \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                \n │ User │         │ UI │              │ Daemon │                                \n └──────┘         └────┘              └────────┘                                "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                     \n   │ Save │                                                                     \n   └───┬──┘                                                                     \n       │                                                                        \n       ▼                                                                        \n ┌──────────┐                                                                   \n │ Validate │                                                                   \n └─────┬────┘                                                                   \n       │                                                                        \n       ▼                                                                        \n  ┌────────┐                                                                    \n  │ Result │                                                                    \n  └────────┘                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                \n │ User │         │ UI │              │ Daemon │                                \n └───┬──┘         └──┬─┘              └────┬───┘                                \n     │               │                     │                                    \n     │choose command │                     │                                    \n     ├──────────────▶│                     │                                    \n     │               │                     │                                    \n     │               │send expanded prompt │                                    \n     │               ├────────────────────▶│                                    \n     │               │                     │                                    \n     │               │    stream result    │                                    \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                    \n     │               │                     │                                    \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                \n │ User │         │ UI │              │ Daemon │                                \n └──────┘         └────┘              └────────┘                                "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                     \n   │ Save │                                                                     \n   └───┬──┘                                                                     \n       │                                                                        \n       ▼                                                                        \n ┌──────────┐                                                                   \n │ Validate │                                                                   \n └─────┬────┘                                                                   \n       │                                                                        \n       ▼                                                                        \n  ┌────────┐                                                                    \n  │ Result │                                                                    \n  └────────┘                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   sequenceDiagram                                                                                                      \n       participant User                                                                                                 \n       participant UI                                                                                                   \n       participant Daemon                                                                                               \n       User->>UI: choose command                                                                                        \n       UI->>Daemon: send expanded prompt                                                                                \n       Daemon-->>UI: stream result                                                                                      \n ```                                                                                                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   flowchart TD                                                                                                         \n     A[\"Save\"] --> B[\"Validate\"]                                                                                        \n     B --> C[\"Result\"]                                                                                                  \n ```                                                                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   sequenceDiagram                                                                                                      \n       participant User                                                                                                 \n       participant UI                                                                                                   \n       participant Daemon                                                                                               \n       User->>UI: choose command                                                                                        \n       UI->>Daemon: send expanded prompt                                                                                \n       Daemon-->>UI: stream result                                                                                      \n ```                                                                                                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   flowchart TD                                                                                                         \n     A[\"Save\"] --> B[\"Validate\"]                                                                                        \n     B --> C[\"Result\"]                                                                                                  \n ```                                                                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └───┬──┘         └──┬─┘              └────┬───┘                                                                        \n     │               │                     │                                                                            \n     │choose command │                     │                                                                            \n     ├──────────────▶│                     │                                                                            \n     │               │                     │                                                                            \n     │               │send expanded prompt │                                                                            \n     │               ├────────────────────▶│                                                                            \n     │               │                     │                                                                            \n     │               │    stream result    │                                                                            \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                                                            \n     │               │                     │                                                                            \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └──────┘         └────┘              └────────┘                                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                                                             \n   │ Save │                                                                                                             \n   └───┬──┘                                                                                                             \n       │                                                                                                                \n       ▼                                                                                                                \n ┌──────────┐                                                                                                           \n │ Validate │                                                                                                           \n └─────┬────┘                                                                                                           \n       │                                                                                                                \n       ▼                                                                                                                \n  ┌────────┐                                                                                                            \n  │ Result │                                                                                                            \n  └────────┘                                                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   sequenceDiagram                                                                                                      \n       participant User                                                                                                 \n       participant UI                                                                                                   \n       participant Daemon                                                                                               \n       User->>UI: choose command                                                                                        \n       UI->>Daemon: send expanded prompt                                                                                \n       Daemon-->>UI: stream result                                                                                      \n ```                                                                                                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   flowchart TD                                                                                                         \n     A[\"Save\"] --> B[\"Validate\"]                                                                                        \n     B --> C[\"Result\"]                                                                                                  \n ```                                                                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └───┬──┘         └──┬─┘              └────┬───┘                                                                        \n     │               │                     │                                                                            \n     │choose command │                     │                                                                            \n     ├──────────────▶│                     │                                                                            \n     │               │                     │                                                                            \n     │               │send expanded prompt │                                                                            \n     │               ├────────────────────▶│                                                                            \n     │               │                     │                                                                            \n     │               │    stream result    │                                                                            \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                                                            \n     │               │                     │                                                                            \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └──────┘         └────┘              └────────┘                                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                                                             \n   │ Save │                                                                                                             \n   └───┬──┘                                                                                                             \n       │                                                                                                                \n       ▼                                                                                                                \n ┌──────────┐                                                                                                           \n │ Validate │                                                                                                           \n └─────┬────┘                                                                                                           \n       │                                                                                                                \n       ▼                                                                                                                \n  ┌────────┐                                                                                                            \n  │ Result │                                                                                                            \n  └────────┘                                                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "light",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └───┬──┘         └──┬─┘              └────┬───┘                                                                        \n     │               │                     │                                                                            \n     │choose command │                     │                                                                            \n     ├──────────────▶│                     │                                                                            \n     │               │                     │                                                                            \n     │               │send expanded prompt │                                                                            \n     │               ├────────────────────▶│                                                                            \n     │               │                     │                                                                            \n     │               │    stream result    │                                                                            \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                                                            \n     │               │                     │                                                                            \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └──────┘         └────┘              └────────┘                                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "light",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                                                             \n   │ Save │                                                                                                             \n   └───┬──┘                                                                                                             \n       │                                                                                                                \n       ▼                                                                                                                \n ┌──────────┐                                                                                                           \n │ Validate │                                                                                                           \n └─────┬────┘                                                                                                           \n       │                                                                                                                \n       ▼                                                                                                                \n  ┌────────┐                                                                                                            \n  │ Result │                                                                                                            \n  └────────┘                                                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "light",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   flowchart TD                         \n     A[\"Save\"] --> B[\"Validate\"]        \n     B --> C[\"Result\"]                  \n ```                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   flowchart TD                         \n     A[\"Save\"] --> B[\"Validate\"]        \n     B --> C[\"Result\"]                  \n ```                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 40,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                             \n   │ Save │                             \n   └───┬──┘                             \n       │                                \n       ▼                                \n ┌──────────┐                           \n │ Validate │                           \n └─────┬────┘                           \n       │                                \n       ▼                                \n  ┌────────┐                            \n  │ Result │                            \n  └────────┘                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   flowchart TD                         \n     A[\"Save\"] --> B[\"Validate\"]        \n     B --> C[\"Result\"]                  \n ```                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 40,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                             \n   │ Save │                             \n   └───┬──┘                             \n       │                                \n       ▼                                \n ┌──────────┐                           \n │ Validate │                           \n └─────┬────┘                           \n       │                                \n       ▼                                \n  ┌────────┐                            \n  │ Result │                            \n  └────────┘                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   sequenceDiagram                      \n       participant User                 \n       participant UI                   \n       participant Daemon               \n       User->>UI: choose command        \n       UI->>Daemon: send expanded       \n prompt                                 \n       Daemon-->>UI: stream result      \n ```                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                             \n   │ Save │                             \n   └───┬──┘                             \n       │                                \n       ▼                                \n ┌──────────┐                           \n │ Validate │                           \n └─────┬────┘                           \n       │                                \n       ▼                                \n  ┌────────┐                            \n  │ Result │                            \n  └────────┘                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 40,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                             \n   pie title Pets                       \n     \"Cats\" : 3                         \n     \"Dogs\" : 2                         \n ```                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   sequenceDiagram                                          \n       participant User                                     \n       participant UI                                       \n       participant Daemon                                   \n       User->>UI: choose command                            \n       UI->>Daemon: send expanded prompt                    \n       Daemon-->>UI: stream result                          \n ```                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   flowchart TD                                             \n     A[\"Save\"] --> B[\"Validate\"]                            \n     B --> C[\"Result\"]                                      \n ```                                                        "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   sequenceDiagram                                          \n       participant User                                     \n       participant UI                                       \n       participant Daemon                                   \n       User->>UI: choose command                            \n       UI->>Daemon: send expanded prompt                    \n       Daemon-->>UI: stream result                          \n ```                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   flowchart TD                                             \n     A[\"Save\"] --> B[\"Validate\"]                            \n     B --> C[\"Result\"]                                      \n ```                                                        "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 60,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐            \n │ User │         │ UI │              │ Daemon │            \n └───┬──┘         └──┬─┘              └────┬───┘            \n     │               │                     │                \n     │choose command │                     │                \n     ├──────────────▶│                     │                \n     │               │                     │                \n     │               │send expanded prompt │                \n     │               ├────────────────────▶│                \n     │               │                     │                \n     │               │    stream result    │                \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                \n     │               │                     │                \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐            \n │ User │         │ UI │              │ Daemon │            \n └──────┘         └────┘              └────────┘            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                 \n   │ Save │                                                 \n   └───┬──┘                                                 \n       │                                                    \n       ▼                                                    \n ┌──────────┐                                               \n │ Validate │                                               \n └─────┬────┘                                               \n       │                                                    \n       ▼                                                    \n  ┌────────┐                                                \n  │ Result │                                                \n  └────────┘                                                "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   sequenceDiagram                                          \n       participant User                                     \n       participant UI                                       \n       participant Daemon                                   \n       User->>UI: choose command                            \n       UI->>Daemon: send expanded prompt                    \n       Daemon-->>UI: stream result                          \n ```                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   flowchart TD                                             \n     A[\"Save\"] --> B[\"Validate\"]                            \n     B --> C[\"Result\"]                                      \n ```                                                        "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 60,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐            \n │ User │         │ UI │              │ Daemon │            \n └───┬──┘         └──┬─┘              └────┬───┘            \n     │               │                     │                \n     │choose command │                     │                \n     ├──────────────▶│                     │                \n     │               │                     │                \n     │               │send expanded prompt │                \n     │               ├────────────────────▶│                \n     │               │                     │                \n     │               │    stream result    │                \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                \n     │               │                     │                \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐            \n │ User │         │ UI │              │ Daemon │            \n └──────┘         └────┘              └────────┘            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                 \n   │ Save │                                                 \n   └───┬──┘                                                 \n       │                                                    \n       ▼                                                    \n ┌──────────┐                                               \n │ Validate │                                               \n └─────┬────┘                                               \n       │                                                    \n       ▼                                                    \n  ┌────────┐                                                \n  │ Result │                                                \n  └────────┘                                                "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐            \n │ User │         │ UI │              │ Daemon │            \n └───┬──┘         └──┬─┘              └────┬───┘            \n     │               │                     │                \n     │choose command │                     │                \n     ├──────────────▶│                     │                \n     │               │                     │                \n     │               │send expanded prompt │                \n     │               ├────────────────────▶│                \n     │               │                     │                \n     │               │    stream result    │                \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                \n     │               │                     │                \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐            \n │ User │         │ UI │              │ Daemon │            \n └──────┘         └────┘              └────────┘            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                 \n   │ Save │                                                 \n   └───┬──┘                                                 \n       │                                                    \n       ▼                                                    \n ┌──────────┐                                               \n │ Validate │                                               \n └─────┬────┘                                               \n       │                                                    \n       ▼                                                    \n  ┌────────┐                                                \n  │ Result │                                                \n  └────────┘                                                "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 60,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                 \n   pie title Pets                                           \n     \"Cats\" : 3                                             \n     \"Dogs\" : 2                                             \n ```                                                        "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   sequenceDiagram                                                              \n       participant User                                                         \n       participant UI                                                           \n       participant Daemon                                                       \n       User->>UI: choose command                                                \n       UI->>Daemon: send expanded prompt                                        \n       Daemon-->>UI: stream result                                              \n ```                                                                            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   flowchart TD                                                                 \n     A[\"Save\"] --> B[\"Validate\"]                                                \n     B --> C[\"Result\"]                                                          \n ```                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   sequenceDiagram                                                              \n       participant User                                                         \n       participant UI                                                           \n       participant Daemon                                                       \n       User->>UI: choose command                                                \n       UI->>Daemon: send expanded prompt                                        \n       Daemon-->>UI: stream result                                              \n ```                                                                            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   flowchart TD                                                                 \n     A[\"Save\"] --> B[\"Validate\"]                                                \n     B --> C[\"Result\"]                                                          \n ```                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 80,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                \n │ User │         │ UI │              │ Daemon │                                \n └───┬──┘         └──┬─┘              └────┬───┘                                \n     │               │                     │                                    \n     │choose command │                     │                                    \n     ├──────────────▶│                     │                                    \n     │               │                     │                                    \n     │               │send expanded prompt │                                    \n     │               ├────────────────────▶│                                    \n     │               │                     │                                    \n     │               │    stream result    │                                    \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                    \n     │               │                     │                                    \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                \n │ User │         │ UI │              │ Daemon │                                \n └──────┘         └────┘              └────────┘                                "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                     \n   │ Save │                                                                     \n   └───┬──┘                                                                     \n       │                                                                        \n       ▼                                                                        \n ┌──────────┐                                                                   \n │ Validate │                                                                   \n └─────┬────┘                                                                   \n       │                                                                        \n       ▼                                                                        \n  ┌────────┐                                                                    \n  │ Result │                                                                    \n  └────────┘                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   sequenceDiagram                                                              \n       participant User                                                         \n       participant UI                                                           \n       participant Daemon                                                       \n       User->>UI: choose command                                                \n       UI->>Daemon: send expanded prompt                                        \n       Daemon-->>UI: stream result                                              \n ```                                                                            "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   flowchart TD                                                                 \n     A[\"Save\"] --> B[\"Validate\"]                                                \n     B --> C[\"Result\"]                                                          \n ```                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 80,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                \n │ User │         │ UI │              │ Daemon │                                \n └───┬──┘         └──┬─┘              └────┬───┘                                \n     │               │                     │                                    \n     │choose command │                     │                                    \n     ├──────────────▶│                     │                                    \n     │               │                     │                                    \n     │               │send expanded prompt │                                    \n     │               ├────────────────────▶│                                    \n     │               │                     │                                    \n     │               │    stream result    │                                    \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                    \n     │               │                     │                                    \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                \n │ User │         │ UI │              │ Daemon │                                \n └──────┘         └────┘              └────────┘                                "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                     \n   │ Save │                                                                     \n   └───┬──┘                                                                     \n       │                                                                        \n       ▼                                                                        \n ┌──────────┐                                                                   \n │ Validate │                                                                   \n └─────┬────┘                                                                   \n       │                                                                        \n       ▼                                                                        \n  ┌────────┐                                                                    \n  │ Result │                                                                    \n  └────────┘                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                \n │ User │         │ UI │              │ Daemon │                                \n └───┬──┘         └──┬─┘              └────┬───┘                                \n     │               │                     │                                    \n     │choose command │                     │                                    \n     ├──────────────▶│                     │                                    \n     │               │                     │                                    \n     │               │send expanded prompt │                                    \n     │               ├────────────────────▶│                                    \n     │               │                     │                                    \n     │               │    stream result    │                                    \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                    \n     │               │                     │                                    \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                \n │ User │         │ UI │              │ Daemon │                                \n └──────┘         └────┘              └────────┘                                "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                     \n   │ Save │                                                                     \n   └───┬──┘                                                                     \n       │                                                                        \n       ▼                                                                        \n ┌──────────┐                                                                   \n │ Validate │                                                                   \n └─────┬────┘                                                                   \n       │                                                                        \n       ▼                                                                        \n  ┌────────┐                                                                    \n  │ Result │                                                                    \n  └────────┘                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 80,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                     \n   pie title Pets                                                               \n     \"Cats\" : 3                                                                 \n     \"Dogs\" : 2                                                                 \n ```                                                                            "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   sequenceDiagram                                                                                                      \n       participant User                                                                                                 \n       participant UI                                                                                                   \n       participant Daemon                                                                                               \n       User->>UI: choose command                                                                                        \n       UI->>Daemon: send expanded prompt                                                                                \n       Daemon-->>UI: stream result                                                                                      \n ```                                                                                                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   flowchart TD                                                                                                         \n     A[\"Save\"] --> B[\"Validate\"]                                                                                        \n     B --> C[\"Result\"]                                                                                                  \n ```                                                                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   sequenceDiagram                                                                                                      \n       participant User                                                                                                 \n       participant UI                                                                                                   \n       participant Daemon                                                                                               \n       User->>UI: choose command                                                                                        \n       UI->>Daemon: send expanded prompt                                                                                \n       Daemon-->>UI: stream result                                                                                      \n ```                                                                                                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   flowchart TD                                                                                                         \n     A[\"Save\"] --> B[\"Validate\"]                                                                                        \n     B --> C[\"Result\"]                                                                                                  \n ```                                                                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 120,
+    "mode": "off",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └───┬──┘         └──┬─┘              └────┬───┘                                                                        \n     │               │                     │                                                                            \n     │choose command │                     │                                                                            \n     ├──────────────▶│                     │                                                                            \n     │               │                     │                                                                            \n     │               │send expanded prompt │                                                                            \n     │               ├────────────────────▶│                                                                            \n     │               │                     │                                                                            \n     │               │    stream result    │                                                                            \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                                                            \n     │               │                     │                                                                            \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └──────┘         └────┘              └────────┘                                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                                                             \n   │ Save │                                                                                                             \n   └───┬──┘                                                                                                             \n       │                                                                                                                \n       ▼                                                                                                                \n ┌──────────┐                                                                                                           \n │ Validate │                                                                                                           \n └─────┬────┘                                                                                                           \n       │                                                                                                                \n       ▼                                                                                                                \n  ┌────────┐                                                                                                            \n  │ Result │                                                                                                            \n  └────────┘                                                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   sequenceDiagram                                                                                                      \n       participant User                                                                                                 \n       participant UI                                                                                                   \n       participant Daemon                                                                                               \n       User->>UI: choose command                                                                                        \n       UI->>Daemon: send expanded prompt                                                                                \n       Daemon-->>UI: stream result                                                                                      \n ```                                                                                                                    "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   flowchart TD                                                                                                         \n     A[\"Save\"] --> B[\"Validate\"]                                                                                        \n     B --> C[\"Result\"]                                                                                                  \n ```                                                                                                                    "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 120,
+    "mode": "final",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └───┬──┘         └──┬─┘              └────┬───┘                                                                        \n     │               │                     │                                                                            \n     │choose command │                     │                                                                            \n     ├──────────────▶│                     │                                                                            \n     │               │                     │                                                                            \n     │               │send expanded prompt │                                                                            \n     │               ├────────────────────▶│                                                                            \n     │               │                     │                                                                            \n     │               │    stream result    │                                                                            \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                                                            \n     │               │                     │                                                                            \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └──────┘         └────┘              └────────┘                                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                                                             \n   │ Save │                                                                                                             \n   └───┬──┘                                                                                                             \n       │                                                                                                                \n       ▼                                                                                                                \n ┌──────────┐                                                                                                           \n │ Validate │                                                                                                           \n └─────┬────┘                                                                                                           \n       │                                                                                                                \n       ▼                                                                                                                \n  ┌────────┐                                                                                                            \n  │ Result │                                                                                                            \n  └────────┘                                                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": false,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  },
+  {
+    "id": "originalSequence",
+    "theme": "dark",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": " ┌──────┐         ┌────┐              ┌────────┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └───┬──┘         └──┬─┘              └────┬───┘                                                                        \n     │               │                     │                                                                            \n     │choose command │                     │                                                                            \n     ├──────────────▶│                     │                                                                            \n     │               │                     │                                                                            \n     │               │send expanded prompt │                                                                            \n     │               ├────────────────────▶│                                                                            \n     │               │                     │                                                                            \n     │               │    stream result    │                                                                            \n     │               │◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤                                                                            \n     │               │                     │                                                                            \n ┌───┴──┐         ┌──┴─┐              ┌────┴───┐                                                                        \n │ User │         │ UI │              │ Daemon │                                                                        \n └──────┘         └────┘              └────────┘                                                                        "
+  },
+  {
+    "id": "compactFlow",
+    "theme": "dark",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": true,
+    "snapshot": "   ┌──────┐                                                                                                             \n   │ Save │                                                                                                             \n   └───┬──┘                                                                                                             \n       │                                                                                                                \n       ▼                                                                                                                \n ┌──────────┐                                                                                                           \n │ Validate │                                                                                                           \n └─────┬────┘                                                                                                           \n       │                                                                                                                \n       ▼                                                                                                                \n  ┌────────┐                                                                                                            \n  │ Result │                                                                                                            \n  └────────┘                                                                                                            "
+  },
+  {
+    "id": "unsupported",
+    "theme": "dark",
+    "width": 120,
+    "mode": "streaming",
+    "isStreaming": true,
+    "rendered": false,
+    "snapshot": " ```mermaid                                                                                                             \n   pie title Pets                                                                                                       \n     \"Cats\" : 3                                                                                                         \n     \"Dogs\" : 2                                                                                                         \n ```                                                                                                                    "
+  }
+]

@@ -1,0 +1,1548 @@
+{
+  "target": "/Users/ventris/.pi/agent/skills/show-me/assets/visual.html",
+  "browser": "152.0.7977.76",
+  "cases": [
+    {
+      "id": "320-light-100pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-320-light-100pct.png",
+      "viewport": 320,
+      "scrollWidth": 320,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "262px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "320-light-100pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-320-light-100pct-injected.png",
+      "viewport": 320,
+      "scrollWidth": 320,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "code",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "262px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "320-light-200pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-320-light-200pct.png",
+      "viewport": 320,
+      "scrollWidth": 320,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "262px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "320-light-200pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-320-light-200pct-injected.png",
+      "viewport": 320,
+      "scrollWidth": 320,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "code",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "262px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "320-dark-100pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-320-dark-100pct.png",
+      "viewport": 320,
+      "scrollWidth": 320,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "262px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "320-dark-100pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-320-dark-100pct-injected.png",
+      "viewport": 320,
+      "scrollWidth": 320,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "code",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "262px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "320-dark-200pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-320-dark-200pct.png",
+      "viewport": 320,
+      "scrollWidth": 320,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "262px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "320-dark-200pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-320-dark-200pct-injected.png",
+      "viewport": 320,
+      "scrollWidth": 320,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "code",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "262px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "375-light-100pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-375-light-100pct.png",
+      "viewport": 375,
+      "scrollWidth": 375,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "317px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "375-light-100pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-375-light-100pct-injected.png",
+      "viewport": 375,
+      "scrollWidth": 375,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "code",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "317px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "375-light-200pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-375-light-200pct.png",
+      "viewport": 375,
+      "scrollWidth": 375,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "317px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "375-light-200pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-375-light-200pct-injected.png",
+      "viewport": 375,
+      "scrollWidth": 375,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "code",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "317px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "375-dark-100pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-375-dark-100pct.png",
+      "viewport": 375,
+      "scrollWidth": 375,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "317px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "375-dark-100pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-375-dark-100pct-injected.png",
+      "viewport": 375,
+      "scrollWidth": 375,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "code",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "317px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "375-dark-200pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-375-dark-200pct.png",
+      "viewport": 375,
+      "scrollWidth": 375,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "317px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "375-dark-200pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-375-dark-200pct-injected.png",
+      "viewport": 375,
+      "scrollWidth": 375,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "code",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "317px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "1280-light-100pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-1280-light-100pct.png",
+      "viewport": 1280,
+      "scrollWidth": 1280,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "425px 425px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "1280-light-100pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-1280-light-100pct-injected.png",
+      "viewport": 1280,
+      "scrollWidth": 1280,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "code",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "425px 425px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "1280-light-200pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-1280-light-200pct.png",
+      "viewport": 1280,
+      "scrollWidth": 1280,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "511.812px 511.812px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "1280-light-200pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-1280-light-200pct-injected.png",
+      "viewport": 1280,
+      "scrollWidth": 1280,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 14.607,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 7.008,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "code",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 15.795,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 15.795,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "511.812px 511.812px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "1280-dark-100pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-1280-dark-100pct.png",
+      "viewport": 1280,
+      "scrollWidth": 1280,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "425px 425px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "1280-dark-100pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-1280-dark-100pct-injected.png",
+      "viewport": 1280,
+      "scrollWidth": 1280,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "code",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 4.5
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 4.5
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "425px 425px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    },
+    {
+      "id": "1280-dark-200pct",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-1280-dark-200pct.png",
+      "viewport": 1280,
+      "scrollWidth": 1280,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "511.812px 511.812px",
+      "title": "Save flow",
+      "heading": "Save flow"
+    },
+    {
+      "id": "1280-dark-200pct-injected",
+      "failures": [],
+      "externalRequests": [],
+      "errors": [],
+      "screenshot": "/Users/ventris/.pi/agent/skills/show-me/tests/artifacts/html-1280-dark-200pct-injected.png",
+      "viewport": 1280,
+      "scrollWidth": 1280,
+      "overflow": [],
+      "clipping": [],
+      "contrasts": [
+        {
+          "element": "h1",
+          "ratio": 15.867,
+          "required": 3
+        },
+        {
+          "element": "p.summary",
+          "ratio": 10.396,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "code",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "h2",
+          "ratio": 13.591,
+          "required": 3
+        },
+        {
+          "element": "p",
+          "ratio": 13.591,
+          "required": 3
+        }
+      ],
+      "placeholders": [],
+      "injectedExecution": false,
+      "unsafeNodes": 0,
+      "branchColumns": "511.812px 511.812px",
+      "title": "Save flow",
+      "heading": "<img src=\"https://example.invalid/injected\" onerror=\"window.__injected=true\"><script>window.__injected=true</script>&\"'"
+    }
+  ],
+  "failures": [],
+  "notes": [
+    "Save flow is intentional sample content, not a placeholder defect.",
+    "Text enlargement uses html font-size:200% (text-only scaling, not browser zoom).",
+    "Clipping checks cover element and text-fragment bounds plus clipping ancestors; contrast covers opaque computed text/background colors."
+  ]
+}
