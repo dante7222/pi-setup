@@ -32,6 +32,7 @@
   },
   "pi": {
     "extensions": [
+      "./extensions/bash-timeout/index.ts",
       "./extensions/compaction-transcript/index.ts",
       "./extensions/herdr-subagents/index.ts",
       "./extensions/tokyo-night-footer/index.ts",

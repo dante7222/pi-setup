@@ -11,6 +11,7 @@ Personal [Pi](https://pi.dev) extensions, skills, prompt templates, and themes, 
 
 Included now:
 
+- **Bash Timeout** extension (`extensions/bash-timeout/index.ts`)
 - **Compaction Transcript** extension (`extensions/compaction-transcript/index.ts`)
 - **Tokyo Night** theme (`themes/tokyo-night.json`)
 - **Tokyo Night Status Border** extension (`extensions/tokyo-night-footer/index.ts`)
@@ -20,6 +21,16 @@ Included now:
 - **Herdr Subagents** skill and cleanup extension (`skills/herdr-subagents/`, `extensions/herdr-subagents/`)
 - **Herdr Pi Subagent State** portable bundle (`integrations/herdr-pi-subagents/`) — patched integration and manual repair skill
 - **Permissions** extension (`extensions/permissions/index.ts`) — retained but disabled
+
+## Bash timeout
+
+Agent `bash` calls that omit `timeout` receive a **120-second wall-clock timeout**, enforced by Pi's existing backend. Explicit timeouts remain unchanged, so intentional long builds can request `timeout: 600` (seconds), for example. Invalid explicit values are left for Pi to reject; zero does not mean unlimited.
+
+The extension uses Pi's supported mutable `tool_call` input, not a replacement tool or shell wrapper. It preserves shell settings, output streaming/truncation, cancellation, session environment, and rendering. It adds no tools, schema text, system-prompt instructions, messages, polling, or model calls. Only Pi's normal timeout error enters context when a command expires. The default applies in new sessions and after `/reload`, including subagents that load this package.
+
+Scope: agent `bash` calls only, not user `!`/`!!`, direct RPC shell commands, `pi.exec`, or processes hidden inside other tools. Later extensions can change the input; custom Bash backends must honor `timeout` themselves.
+
+This fixes omitted deadlines for ordinary stalled commands (`fd`, `sleep`, builds). It is **not a universal hard-deadline watchdog**: Pi 0.85.0 kills the original process group, but a daemon that escapes that group and continuously writes inherited output can still hold the backend open; uninterruptible OS I/O and a blocked Node event loop are also outside this fix. See upstream [default-timeout issue #1335](https://github.com/earendil-works/pi/issues/1335), [unmerged PR #5481](https://github.com/earendil-works/pi/pull/5481), and [detached-stdio deadline issue #6787](https://github.com/earendil-works/pi/issues/6787). No installed Pi files are patched, so package updates do not overwrite this extension.
 
 ## Compaction transcripts
 
