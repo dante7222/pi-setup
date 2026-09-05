@@ -21,6 +21,12 @@ import {
   parseSessionGroupsState,
   SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES,
   SESSION_GROUP_CHANGELOG_MAX_BYTES,
+  SESSION_GROUP_CHANGELOG_PAGE_DEFAULT_BYTES,
+  SESSION_GROUP_CHANGELOG_PAGE_DEFAULT_LINES,
+  SESSION_GROUP_CHANGELOG_PAGE_MAX_BYTES,
+  SESSION_GROUP_CHANGELOG_PAGE_MAX_LINES,
+  SESSION_GROUP_CHANGELOG_QUERY_MAX_LENGTH,
+  SESSION_GROUP_CHANGELOG_CURSOR_MAX_LENGTH,
   SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES,
   SESSION_GROUP_CONTEXT_MAX_BYTES,
   SESSION_GROUPS_DIRECTORY_NAME,
@@ -34,7 +40,6 @@ import {
 import {
   getProcessIncarnation,
   processMatchesIncarnation,
-  SessionGroupLockBusyError,
   SessionGroupLockManager,
   type SessionGroupLockHandle,
   type SessionGroupLockKind,
@@ -58,6 +63,20 @@ export interface SessionGroupChangelogTail {
   totalBytes: number;
   returnedBytes: number;
   truncated: boolean;
+}
+
+export interface SessionGroupChangelogPageOptions {
+  maxBytes?: number;
+  maxLines?: number;
+  cursor?: string;
+  query?: string;
+  signal?: AbortSignal;
+}
+
+export interface SessionGroupChangelogPage extends SessionGroupChangelogTail {
+  nextCursor?: string;
+  /** Total matching records, not just those on this page. */
+  matchedRecords?: number;
 }
 
 export interface SessionGroupChangelogAppendResult {
@@ -116,6 +135,25 @@ const CONTEXT_EDIT_TRANSACTION_FILE_NAME = ".context-edit-transaction.json";
 const ARTIFACT_STALE_MS = 5 * 60 * 1_000;
 const JSON_FILE_MAX_BYTES = 64 * 1024;
 const TRANSACTION_FILE_MAX_BYTES = 128 * 1024;
+const CATALOG_CONCURRENCY = 16;
+
+// Bounded workers also drain on error: no detached reads survive a catalog lock.
+async function mapCatalog<T, R>(items: readonly T[], visit: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = await Promise.allSettled(
+    Array.from({ length: Math.min(CATALOG_CONCURRENCY, items.length) }, async () => {
+      while (next < items.length) {
+        const index = next++;
+        results[index] = await visit(items[index]!);
+      }
+    }),
+  );
+  for (const worker of workers) {
+    if (worker.status === "rejected") throw worker.reason;
+  }
+  return results;
+}
 
 export class SessionGroupNotFoundError extends Error {
   readonly group: string;
@@ -134,6 +172,20 @@ export class SessionGroupAlreadyExistsError extends Error {
     super(`A session group named '${groupName}' already exists.`);
     this.name = "SessionGroupAlreadyExistsError";
     this.groupName = groupName;
+  }
+}
+
+export class SessionGroupDuplicateNameError extends Error {
+  constructor(name: string, ids: readonly string[]) {
+    super(`Duplicate session-group name '${name}' in catalog (${ids.join(", ")}); repair metadata before using names.`);
+    this.name = "SessionGroupDuplicateNameError";
+  }
+}
+
+export class SessionGroupChangelogCursorError extends Error {
+  constructor() {
+    super("Changelog cursor is invalid or stale. Restart without cursor (using the same query on subsequent pages).");
+    this.name = "SessionGroupChangelogCursorError";
   }
 }
 
@@ -362,6 +414,7 @@ function parseContextEditTransaction(value: unknown): SessionGroupContextEditTra
 export function applyExactSessionGroupContextEdits(
   content: string,
   edits: readonly SessionGroupContextEdit[],
+  path = "context.md",
 ): string {
   if (edits.length === 0) {
     throw new SessionGroupContextEditError("At least one context edit is required.");
@@ -405,10 +458,26 @@ export function applyExactSessionGroupContextEdits(
     }
   }
 
-  let updated = content;
-  for (let index = matches.length - 1; index >= 0; index--) {
-    const match = matches[index]!;
-    updated = `${updated.slice(0, match.index)}${match.newText}${updated.slice(match.end)}`;
+  // Check the output length before allocating it. Build once, rather than
+  // repeatedly copying a potentially large intermediate string per edit.
+  const pieces: string[] = [];
+  let offset = 0;
+  let characters = 0;
+  for (const match of matches) {
+    const unchanged = content.slice(offset, match.index);
+    pieces.push(unchanged, match.newText);
+    characters += unchanged.length + match.newText.length;
+    offset = match.end;
+  }
+  pieces.push(content.slice(offset));
+  characters += content.length - offset;
+  if (characters > SESSION_GROUP_CONTEXT_MAX_BYTES) {
+    throw new SessionGroupContextTooLargeError(path, pieces.reduce((sum, piece) => sum + Buffer.byteLength(piece), 0));
+  }
+  const updated = pieces.join("");
+  const bytes = Buffer.byteLength(updated, "utf8");
+  if (bytes > SESSION_GROUP_CONTEXT_MAX_BYTES) {
+    throw new SessionGroupContextTooLargeError(path, bytes);
   }
   if (updated === content) {
     throw new SessionGroupContextEditError(
@@ -444,9 +513,13 @@ async function readPrivateFile(
   const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
     const entry = await handle.stat();
-    if (!entry.isFile() || entry.nlink !== 1) {
+    // An atomic writer may have replaced the pathname after open(), unlinking
+    // this complete snapshot (nlink=0). Reject shared hardlinks, not that race.
+    if (!entry.isFile() || entry.nlink > 1) {
       throw new Error(`Session-groups path is not a private regular file: ${path}`);
     }
+    // Repair via the opened inode, never a pathname that an editor can replace.
+    if ((entry.mode & 0o777) !== FILE_MODE) await handle.chmod(FILE_MODE);
     if (entry.size > maxBytes) throw tooLargeError(entry.size);
     const content = await handle.readFile();
     if (content.byteLength > maxBytes) throw tooLargeError(content.byteLength);
@@ -599,7 +672,9 @@ async function readContextFile(path: string): Promise<RawContextFile> {
   );
   let content: string;
   try {
-    content = new TextDecoder("utf-8", { fatal: true }).decode(contentBytes);
+    // Keep BOM bytes in the editable snapshot so the approved patch describes
+    // exactly what will be written, including an explicitly requested removal.
+    content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(contentBytes);
   } catch {
     throw new SessionGroupContextEncodingError(path);
   }
@@ -627,7 +702,7 @@ async function readChangelogFile(path: string): Promise<RawChangelogFile> {
   );
   let content: string;
   try {
-    content = new TextDecoder("utf-8", { fatal: true }).decode(contentBytes);
+    content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(contentBytes);
   } catch {
     throw new SessionGroupChangelogEncodingError(path);
   }
@@ -730,6 +805,129 @@ async function recoverContextEditTransaction(
   );
 }
 
+interface ChangelogCursor {
+  version: 1;
+  groupId: string;
+  hash: string;
+  queryHash: string;
+  record: number;
+  offset: number;
+}
+
+function parseChangelogCursor(cursor: string): ChangelogCursor {
+  try {
+    if (cursor.length > SESSION_GROUP_CHANGELOG_CURSOR_MAX_LENGTH || !/^[A-Za-z0-9_-]+$/.test(cursor)) {
+      throw new SessionGroupChangelogCursorError();
+    }
+    const bytes = Buffer.from(cursor, "base64url");
+    if (bytes.toString("base64url") !== cursor) throw new SessionGroupChangelogCursorError();
+    const value: unknown = JSON.parse(bytes.toString("utf8"));
+    if (
+      !isRecord(value) ||
+      !hasExactKeys(value, ["version", "groupId", "hash", "queryHash", "record", "offset"]) ||
+      value.version !== 1 || !isSessionGroupId(value.groupId) ||
+      typeof value.hash !== "string" || !/^[a-f0-9]{64}$/.test(value.hash) ||
+      typeof value.queryHash !== "string" || !/^[a-f0-9]{64}$/.test(value.queryHash) ||
+      !Number.isSafeInteger(value.record) || (value.record as number) < 0 ||
+      !Number.isSafeInteger(value.offset) || (value.offset as number) < 0
+    ) throw new SessionGroupChangelogCursorError();
+    return {
+      version: 1, groupId: value.groupId, hash: value.hash, queryHash: value.queryHash,
+      record: value.record as number, offset: value.offset as number,
+    };
+  } catch {
+    throw new SessionGroupChangelogCursorError();
+  }
+}
+
+/**
+ * Timestamp headings delimit appended records, not arbitrary headings inside
+ * their Markdown bodies. For entirely manual logs, use level-two headings; a
+ * heading-free file is one record. Fenced headings never delimit records.
+ * Preamble bytes are retained as the oldest record, so pagination loses nothing.
+ */
+function changelogRecords(changelog: RawChangelogFile): Buffer[] {
+  const headings: number[] = [];
+  const timestamps: number[] = [];
+  let offset = 0;
+  let fence: { character: string; length: number } | undefined;
+  for (const line of changelog.content.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)/.exec(line);
+    if (fence) {
+      if (marker && marker[1]![0] === fence.character && marker[1]!.length >= fence.length && !marker[2]!.trim()) {
+        fence = undefined;
+      }
+    } else if (marker) {
+      fence = { character: marker[1]![0]!, length: marker[1]!.length };
+    } else if (/^##\s+\S/.test(line)) {
+      headings.push(offset);
+      if (/^## \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z — /.test(line)) timestamps.push(offset);
+    }
+    offset += Buffer.byteLength(line, "utf8");
+  }
+  if (!offset) return [];
+  const starts = timestamps.length ? timestamps : headings;
+  if (starts[0] !== 0) starts.unshift(0);
+  return starts.map((start, index) =>
+    changelog.contentBytes.subarray(start, starts[index + 1] ?? offset),
+  ).reverse();
+}
+
+// Physical lines: a terminal newline ends a line, rather than adding an empty
+// one. This permits lossless one-line pages, including runs of blank lines.
+function changelogLineCount(content: string): number {
+  return (content.match(/\n/g)?.length ?? 0) + (content && !content.endsWith("\n") ? 1 : 0);
+}
+
+function paginateChangelog(
+  records: readonly Buffer[],
+  record: number,
+  offset: number,
+  maxBytes: number,
+  maxLines: number,
+): { content: string; record: number; offset: number } {
+  let content = "";
+  while (record < records.length) {
+    const remaining = records[record]!.subarray(offset);
+    const prefix = offset ? "[Record continued] " : "";
+    const whole = prefix + remaining.toString("utf8");
+    if (Buffer.byteLength(content) + Buffer.byteLength(whole) <= maxBytes && changelogLineCount(content + whole) <= maxLines) {
+      content += whole;
+      record++;
+      offset = 0;
+      // Don't join an unterminated manual record with an older heading.
+      if (!content.endsWith("\n")) break;
+      continue;
+    }
+    // Keep records intact when they can fit on a fresh page. Oversized records
+    // get their own byte-exact fragments, always in original within-record order.
+    if (content) break;
+    const fragmentPrefix = offset ? "[Record continued] " : "[Record fragment] ";
+    let end = Math.min(remaining.length, maxBytes - Buffer.byteLength(fragmentPrefix));
+    if (end > 0) {
+      while (end < remaining.length && (remaining[end]! & 0xc0) === 0x80) end--;
+      let lines = 0;
+      for (let index = 0; index < end; index++) {
+        if (remaining[index] === 0x0a && ++lines === maxLines) {
+          end = index + 1;
+          break;
+        }
+      }
+    }
+    if (end <= 0) {
+      throw new Error("Changelog page maxBytes is too small for a continuation marker and one UTF-8 character; increase maxBytes to at least 24.");
+    }
+    content = fragmentPrefix + remaining.subarray(0, end).toString("utf8");
+    offset += end;
+    if (offset === records[record]!.length) {
+      record++;
+      offset = 0;
+    }
+    break;
+  }
+  return { content, record, offset };
+}
+
 export interface SessionGroupStoreOptions {
   rootDirectory?: string;
 }
@@ -781,8 +979,10 @@ export class SessionGroupStore {
     operation: (handle: SessionGroupLockHandle) => Promise<T>,
     options?: SessionGroupLockOptions,
   ): Promise<T> {
+    options?.signal?.throwIfAborted();
     await this.initialize();
     await this.assertBaseHierarchy();
+    options?.signal?.throwIfAborted();
     return this.lockManager.withGroupLock(
       groupId,
       kind,
@@ -790,11 +990,15 @@ export class SessionGroupStore {
         const groupDirectory = this.groupDirectory(groupId);
         try {
           await assertDirectory(groupDirectory);
+          await chmod(groupDirectory, DIRECTORY_MODE);
+          // Recovery is targeted, under this group's lock. Catalog reads never
+          // need context recovery, process-incarnation checks, or editor locks.
           await recoverArtifacts(groupDirectory, false);
           await recoverContextEditTransaction(groupDirectory, groupId);
         } catch (error) {
           if (!isNotFound(error)) throw error;
         }
+        options?.signal?.throwIfAborted();
         return operation(handle);
       },
       options,
@@ -819,43 +1023,9 @@ export class SessionGroupStore {
       await recoverArtifacts(this.rootDirectory, false);
       await recoverArtifacts(this.groupsDirectory, true);
 
-      const groupEntries = await readdir(this.groupsDirectory, { withFileTypes: true });
-      for (const entry of groupEntries) {
-        if (!isSessionGroupId(entry.name)) continue;
-        const path = join(this.groupsDirectory, entry.name);
-        if (entry.isSymbolicLink() || !entry.isDirectory()) {
-          throw new Error(`Session-group entry is not a real directory: ${path}`);
-        }
-        try {
-          await this.lockManager.withGroupLock(entry.name, "context-read", async () => {
-            await chmod(path, DIRECTORY_MODE);
-            await recoverArtifacts(path, false);
-            await recoverContextEditTransaction(path, entry.name);
-            const metadataPath = join(path, METADATA_FILE_NAME);
-            const contextPath = join(path, CONTEXT_FILE_NAME);
-            const changelogPath = join(path, CHANGELOG_FILE_NAME);
-            await assertRegularFile(metadataPath);
-            await chmod(metadataPath, FILE_MODE);
-            try {
-              await assertRegularFile(contextPath);
-              await chmod(contextPath, FILE_MODE);
-            } catch (error) {
-              if (!isNotFound(error)) throw error;
-            }
-            try {
-              await assertRegularFile(changelogPath);
-              await chmod(changelogPath, FILE_MODE);
-            } catch (error) {
-              if (!isNotFound(error)) throw error;
-            }
-          }, { waitMs: 0 });
-        } catch (error) {
-          // A long-running Zed edit in another Pi owns this group. The owning
-          // operation already validated it, and the next operation here will
-          // perform the deferred recovery while holding the same group lock.
-          if (!(error instanceof SessionGroupLockBusyError)) throw error;
-        }
-      }
+      // The private root protects all descendants immediately. File modes and
+      // interrupted context transactions are repaired lazily on target access;
+      // startup must not acquire locks for unrelated groups (including Zed).
 
       try {
         await assertRegularFile(this.statePath);
@@ -902,7 +1072,7 @@ export class SessionGroupStore {
     return this.lockManager.withCatalogLock("catalog", async () => {
     const name = normalizeGroupName(nameInput);
     const nameKey = groupNameKey(name);
-    const groups = await this.listGroups();
+    const groups = await this.readCatalogMetadata();
     if (groups.some((group) => groupNameKey(group.name) === nameKey)) {
       throw new SessionGroupAlreadyExistsError(name);
     }
@@ -953,13 +1123,20 @@ export class SessionGroupStore {
     const path = this.metadataPath(groupId);
     let value: unknown;
     try {
-      await assertDirectory(this.groupDirectory(groupId));
+      const directory = this.groupDirectory(groupId);
+      await assertDirectory(directory);
+      await chmod(directory, DIRECTORY_MODE);
       value = await readJson(path);
     } catch (error) {
       if (isNotFound(error)) throw new SessionGroupNotFoundError(groupId);
       throw error;
     }
-    const metadata = parseSessionGroupMetadata(value);
+    let metadata: SessionGroupMetadata;
+    try {
+      metadata = parseSessionGroupMetadata(value);
+    } catch (error) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)} Path: ${path}`, { cause: error });
+    }
     if (metadata.id !== groupId) {
       throw new Error(`Session-group metadata ID does not match its directory: ${path}`);
     }
@@ -980,43 +1157,75 @@ export class SessionGroupStore {
     return this.readMetadataFile(groupId);
   }
 
+  /** Caller holds the catalog lock. Names are always read fresh across processes. */
+  private async readCatalogMetadata(): Promise<SessionGroupMetadata[]> {
+    const entries = await readdir(this.groupsDirectory, { withFileTypes: true });
+    const groupIds: string[] = [];
+    for (const entry of entries) {
+      if (!isSessionGroupId(entry.name)) continue;
+      if (!entry.isDirectory() || entry.isSymbolicLink()) {
+        throw new Error(`Session-group entry is not a real directory: ${join(this.groupsDirectory, entry.name)}`);
+      }
+      groupIds.push(entry.name);
+    }
+    const groups = await mapCatalog(groupIds, (id) => this.readMetadataFile(id));
+    const names = new Map<string, string>();
+    for (const group of groups) {
+      const key = groupNameKey(group.name);
+      const duplicate = names.get(key);
+      if (duplicate) throw new SessionGroupDuplicateNameError(group.name, [duplicate, group.id]);
+      names.set(key, group.id);
+    }
+    return groups;
+  }
+
   async listGroups(): Promise<SessionGroupSummary[]> {
     await this.initialize();
     await this.assertBaseHierarchy();
     return this.lockManager.withCatalogLock("catalog", async () => {
-    const entries = await readdir(this.groupsDirectory, { withFileTypes: true });
-    const groupIds = entries
-      .filter((entry) => entry.isDirectory() && isSessionGroupId(entry.name))
-      .map((entry) => entry.name);
-    const groups = await Promise.all(
-      groupIds.map(async (groupId): Promise<SessionGroupSummary> => {
-        const metadata = await this.readMetadata(groupId);
-        const contextPath = this.contextPath(groupId);
-        await assertRegularFile(contextPath);
-        const contextStats = await lstat(contextPath);
+      const metadata = await this.readCatalogMetadata();
+      const groups = await mapCatalog(metadata, async (group): Promise<SessionGroupSummary> => {
+        let contextBytes: number | null = null;
+        let contextError: string | undefined;
+        const path = this.contextPath(group.id);
+        try {
+          // No content read, recovery, or group lock: an editor may be active.
+          const entry = await lstat(path);
+          if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1) {
+            throw new Error(`Session-groups path is not a private regular file: ${path}`);
+          }
+          contextBytes = entry.size;
+        } catch (error) {
+          contextError = isNotFound(error)
+            ? `Session-group context file is missing: ${path}`
+            : error instanceof Error ? error.message : String(error);
+        }
         return {
-          id: metadata.id,
-          name: metadata.name,
-          contextRevision: metadata.contextRevision,
-          contextBytes: contextStats.size,
-          createdAt: metadata.createdAt,
-          updatedAt: metadata.updatedAt,
+          id: group.id,
+          name: group.name,
+          contextRevision: group.contextRevision,
+          contextBytes,
+          ...(contextError === undefined ? {} : { contextError }),
+          createdAt: group.createdAt,
+          updatedAt: group.updatedAt,
         };
-      }),
-    );
-    return groups.sort((left, right) => left.name.localeCompare(right.name));
+      });
+      return groups.sort((left, right) => left.name.localeCompare(right.name));
     });
   }
 
   async resolveGroup(nameOrId: string): Promise<SessionGroupMetadata> {
     const candidate = nameOrId.trim();
-    if (isSessionGroupId(candidate)) return this.readMetadata(candidate);
-
-    const key = groupNameKey(candidate);
-    const groups = await this.listGroups();
-    const group = groups.find((item) => groupNameKey(item.name) === key);
-    if (!group) throw new SessionGroupNotFoundError(candidate);
-    return this.readMetadata(group.id);
+    await this.initialize();
+    await this.assertBaseHierarchy();
+    return this.lockManager.withCatalogLock("catalog", async () => {
+      if (isSessionGroupId(candidate)) return this.readMetadataFile(candidate);
+      const key = groupNameKey(candidate);
+      const groups = await this.readCatalogMetadata();
+      const group = groups.find((item) => groupNameKey(item.name) === key);
+      if (!group) throw new SessionGroupNotFoundError(candidate);
+      return group;
+    });
   }
 
   async readContext(groupId: string): Promise<SessionGroupContextSnapshot> {
@@ -1083,9 +1292,25 @@ export class SessionGroupStore {
     expectedRevision: number,
     expectedSha256: string,
     edits: readonly SessionGroupContextEdit[],
+    options?: SessionGroupLockOptions,
   ): Promise<SessionGroupContextEditResult> {
+    options?.signal?.throwIfAborted();
+    // A single replacement larger than the entire context can never fit.
+    // Reject before filesystem/lock work or constructing intermediate output.
+    for (const edit of edits) {
+      const bytes = Buffer.byteLength(edit.newText);
+      // A lone surrogate at either boundary can combine with retained context,
+      // reducing the encoded size by two bytes. Keep exact-edit semantics even
+      // for these unusual strings; validate the final encoding after matching.
+      const boundaryReduction = (/^[\uDC00-\uDFFF]/.test(edit.newText) ? 2 : 0) +
+        (/[\uD800-\uDBFF]$/.test(edit.newText) ? 2 : 0);
+      if (bytes - boundaryReduction > SESSION_GROUP_CONTEXT_MAX_BYTES) {
+        throw new SessionGroupContextTooLargeError(this.contextPath(groupId), bytes);
+      }
+    }
     return this.withGroupLock(groupId, "agent-edit", async () => {
     const before = await this.readContext(groupId);
+    options?.signal?.throwIfAborted();
     if (
       before.revision !== expectedRevision ||
       before.sha256 !== expectedSha256
@@ -1100,6 +1325,7 @@ export class SessionGroupStore {
     }
 
     const beforeRaw = await readContextFile(before.path);
+    options?.signal?.throwIfAborted();
     if (beforeRaw.sha256 !== before.sha256) {
       throw new SessionGroupContextConflictError(
         before.path,
@@ -1109,13 +1335,14 @@ export class SessionGroupStore {
         beforeRaw.sha256,
       );
     }
-    const updatedContent = applyExactSessionGroupContextEdits(before.content, edits);
+    const updatedContent = applyExactSessionGroupContextEdits(before.content, edits, before.path);
     const updatedBytes = Buffer.from(updatedContent, "utf8");
     if (updatedBytes.byteLength > SESSION_GROUP_CONTEXT_MAX_BYTES) {
       throw new SessionGroupContextTooLargeError(before.path, updatedBytes.byteLength);
     }
     const updatedSha256 = sha256(updatedBytes);
     const metadata = await this.readMetadata(groupId);
+    options?.signal?.throwIfAborted();
     if (
       metadata.contextRevision !== expectedRevision ||
       metadata.contextSha256 !== expectedSha256
@@ -1151,6 +1378,9 @@ export class SessionGroupStore {
       beforeMetadata: metadata,
       beforeContentBase64: beforeRaw.contentBytes.toString("base64"),
     };
+    // Last cancellation point. Once the journal starts, always finish the
+    // durable commit or rollback; cancellation must never strand a transaction.
+    options?.signal?.throwIfAborted();
     const activeTransactions = activeContextEditTransactions();
     activeTransactions.add(transaction.token);
     try {
@@ -1230,7 +1460,7 @@ export class SessionGroupStore {
       await fsyncDirectory(groupDirectory);
     } catch {
       // A committed marker contains no previous context and is safe to clean on
-      // the next store initialization. The data commit is already durable.
+      // the next targeted group access. The data commit is already durable.
     }
 
     return {
@@ -1245,7 +1475,7 @@ export class SessionGroupStore {
         sha256: updatedSha256,
       },
     };
-    });
+    }, options);
   }
 
   async prepareContextForManualEdit(groupId: string): Promise<string> {
@@ -1254,6 +1484,7 @@ export class SessionGroupStore {
     const path = this.contextPath(groupId);
     try {
       await assertRegularFile(path);
+      await chmod(path, FILE_MODE);
     } catch (error) {
       if (!isNotFound(error)) throw error;
       await atomicWritePrivateFile(path, createGroupContextTemplate(metadata.name));
@@ -1261,6 +1492,76 @@ export class SessionGroupStore {
     }
     return path;
     });
+  }
+
+  /**
+   * Newest records first, preserving their internal order. Limits include inline
+   * fragment/continuation markers. Cursors bind the file hash, group and literal
+   * case-insensitive query; repeat that query with each cursor. An unusually
+   * small byte budget may need increasing to fit a marker plus one character.
+   */
+  async readChangelogPage(
+    groupId: string,
+    options: SessionGroupChangelogPageOptions = {},
+  ): Promise<SessionGroupChangelogPage> {
+    options.signal?.throwIfAborted();
+    const maxBytes = options.maxBytes ?? SESSION_GROUP_CHANGELOG_PAGE_DEFAULT_BYTES;
+    const maxLines = options.maxLines ?? SESSION_GROUP_CHANGELOG_PAGE_DEFAULT_LINES;
+    for (const [name, value, maximum] of [
+      ["maxBytes", maxBytes, SESSION_GROUP_CHANGELOG_PAGE_MAX_BYTES],
+      ["maxLines", maxLines, SESSION_GROUP_CHANGELOG_PAGE_MAX_LINES],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+        throw new Error(`Changelog ${name} must be an integer between 1 and ${maximum}.`);
+      }
+    }
+    if (options.query !== undefined && (typeof options.query !== "string" || options.query.length > SESSION_GROUP_CHANGELOG_QUERY_MAX_LENGTH)) {
+      throw new Error(`Changelog query must be at most ${SESSION_GROUP_CHANGELOG_QUERY_MAX_LENGTH} characters.`);
+    }
+    const query = (options.query ?? "").toLowerCase();
+    const queryHash = sha256(Buffer.from(query));
+    const cursor = options.cursor === undefined ? undefined : parseChangelogCursor(options.cursor);
+    if (cursor && (cursor.groupId !== groupId || cursor.queryHash !== queryHash)) {
+      throw new SessionGroupChangelogCursorError();
+    }
+    return this.withGroupLock(groupId, "changelog-read", async () => {
+      await this.readMetadata(groupId);
+      const path = this.changelogPath(groupId);
+      let changelog: RawChangelogFile;
+      try {
+        changelog = await readChangelogFile(path);
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+        options.signal?.throwIfAborted();
+        if (cursor) throw new SessionGroupChangelogCursorError();
+        return {
+          path, exists: false, content: "", totalBytes: 0, returnedBytes: 0, truncated: false,
+          ...(options.query === undefined ? {} : { matchedRecords: 0 }),
+        };
+      }
+      options.signal?.throwIfAborted();
+      const hash = sha256(changelog.contentBytes);
+      if (cursor && cursor.hash !== hash) throw new SessionGroupChangelogCursorError();
+      const records = changelogRecords(changelog).filter((record) =>
+        !query || record.toString("utf8").toLowerCase().includes(query),
+      );
+      if (cursor && (
+        cursor.record >= records.length || cursor.offset >= records[cursor.record]!.length ||
+        (records[cursor.record]![cursor.offset]! & 0xc0) === 0x80
+      )) throw new SessionGroupChangelogCursorError();
+      const page = paginateChangelog(records, cursor?.record ?? 0, cursor?.offset ?? 0, maxBytes, maxLines);
+      const truncated = page.record < records.length;
+      const next: ChangelogCursor = {
+        version: 1, groupId, hash, queryHash, record: page.record, offset: page.offset,
+      };
+      return {
+        path, exists: true, content: page.content,
+        totalBytes: changelog.contentBytes.byteLength,
+        returnedBytes: Buffer.byteLength(page.content), truncated,
+        ...(truncated ? { nextCursor: Buffer.from(JSON.stringify(next)).toString("base64url") } : {}),
+        ...(options.query === undefined ? {} : { matchedRecords: records.length }),
+      };
+    }, { signal: options.signal });
   }
 
   async readChangelogTail(groupId: string): Promise<SessionGroupChangelogTail> {
@@ -1335,22 +1636,25 @@ export class SessionGroupStore {
     groupId: string,
     entryInput: string,
     sessionNameInput: string | undefined,
+    options?: SessionGroupLockOptions,
   ): Promise<SessionGroupChangelogAppendResult> {
+    options?.signal?.throwIfAborted();
+    const entry = entryInput.trim();
+    if (!entry) {
+      throw new SessionGroupChangelogEntryError(
+        "A non-empty changelog entry is required.",
+      );
+    }
+    const entryBytes = Buffer.byteLength(entry, "utf8");
+    if (entryBytes > SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES) {
+      throw new SessionGroupChangelogEntryError(
+        `Changelog entry is ${entryBytes} bytes; the limit is ${SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES} bytes.`,
+      );
+    }
+
     return this.withGroupLock(groupId, "changelog-append", async () => {
       await this.readMetadata(groupId);
-      const entry = entryInput.trim();
-      if (!entry) {
-        throw new SessionGroupChangelogEntryError(
-          "A non-empty changelog entry is required.",
-        );
-      }
-      const entryBytes = Buffer.from(entry, "utf8");
-      if (entryBytes.byteLength > SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES) {
-        throw new SessionGroupChangelogEntryError(
-          `Changelog entry is ${entryBytes.byteLength} bytes; the limit is ${SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES} bytes.`,
-        );
-      }
-
+      options?.signal?.throwIfAborted();
       const path = this.changelogPath(groupId);
       let existing = CHANGELOG_TEMPLATE;
       try {
@@ -1358,6 +1662,7 @@ export class SessionGroupStore {
       } catch (error) {
         if (!isNotFound(error)) throw error;
       }
+      options?.signal?.throwIfAborted();
       const timestamp = new Date().toISOString();
       const sessionName = normalizeChangelogSessionName(sessionNameInput);
       const prefix = existing.endsWith("\n") ? existing : `${existing}\n`;
@@ -1368,15 +1673,16 @@ export class SessionGroupStore {
       if (updatedBytes.byteLength > SESSION_GROUP_CHANGELOG_MAX_BYTES) {
         throw new SessionGroupChangelogTooLargeError(path, updatedBytes.byteLength);
       }
+      options?.signal?.throwIfAborted();
       await atomicWritePrivateFile(path, updatedBytes);
       return {
         path,
         timestamp,
         sessionName,
-        entryBytes: entryBytes.byteLength,
+        entryBytes,
         totalBytes: updatedBytes.byteLength,
       };
-    });
+    }, options);
   }
 
   async getActiveGroup(): Promise<SessionGroupMetadata | null> {
@@ -1413,7 +1719,7 @@ export class SessionGroupStore {
     return this.lockManager.withCatalogLock("rename", async () => {
       const name = normalizeGroupName(nameInput);
       const nameKey = groupNameKey(name);
-      const groups = await this.listGroups();
+      const groups = await this.readCatalogMetadata();
       if (
         groups.some(
           (group) => group.id !== groupId && groupNameKey(group.name) === nameKey,

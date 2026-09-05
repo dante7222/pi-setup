@@ -207,6 +207,19 @@ test("rejects editor commands outside TUI before creating a group", async () => 
   });
 });
 
+test("show and list use focused overlays so fullscreen page keys reach the viewer", async () => {
+  await withHarness(async ({ store, command, ctx }) => {
+    await store.createGroup("viewer");
+    await command.handler("join viewer", ctx);
+    const options = [];
+    ctx.ui.custom = async (_factory, opts) => { options.push(opts); };
+    await command.handler("show", ctx);
+    await command.handler("list", ctx);
+    assert.equal(options.length, 2);
+    assert.ok(options.every((opts) => opts.overlay === true && opts.overlayOptions.maxHeight === "100%"));
+  });
+});
+
 test("autocompletes subcommands and existing group names", async () => {
   await withHarness(async ({ store, command }) => {
     await store.createGroup("Table partitioning");

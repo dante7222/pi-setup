@@ -49,5 +49,8 @@
     "themes": [
       "./themes"
     ]
+  },
+  "dependencies": {
+    "diff": "8.0.4"
   }
 }

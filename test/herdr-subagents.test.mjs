@@ -4,10 +4,11 @@ import { once } from "node:events";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import extension from "../extensions/herdr-subagents/index.ts";
-import { atomic, cleanup, closeJob, collect, jobs, launcher, locked, PAGE_BYTES, piArgs, reportPage, save, scopeFor, spawnTasks, splitTarget, status, systemPrompt, validateTasks } from "../extensions/herdr-subagents/core.ts";
+import { agentDirectory, atomic, cleanup, closeJob, closeJobs, collect, jobs, launcher, locked, PAGE_BYTES, piArgs, reportPage, save, scopeFor, spawnTasks, splitTarget, status, systemPrompt, validateTasks } from "../extensions/herdr-subagents/core.ts";
 import { finalReport } from "../extensions/herdr-subagents/worker.ts";
 
 async function fixture(t) {
@@ -24,6 +25,7 @@ const args=process.argv.slice(2);
 state.calls.push(args);
 let result={};
 if(args[1]==='list') result={panes:state.panes};
+if(args[1]==='current') result={pane:state.panes[0]};
 if(args[1]==='layout') result={layout:{panes:state.panes.map(p=>({...p,rect:{width:100,height:40}}))}};
 if(args[1]==='split') {
  const id=state.next++;
@@ -44,6 +46,21 @@ if(!['run','report-agent'].includes(args[1])) console.log(JSON.stringify({result
 
 function task(name, extra = {}) { return validateTasks([{ name, prompt: "test task", ...extra }], {}, process.cwd())[0]; }
 
+async function cli(scope, args, input = "") {
+  const child = spawn(process.execPath, [launcher, ...args], {
+    env: { ...scope.env, PI_SESSION_ID: "test-session" }, stdio: "pipe",
+  });
+  const closed = once(child, "close");
+  let stdout = "", stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(input);
+  const [code] = await closed;
+  assert.equal(code, 0, stderr);
+  assert.equal(stdout.trim().split("\n").length, 1);
+  return JSON.parse(stdout);
+}
+
 async function completed(scope, job, text, state = "done") {
   await writeFile(join(scope.root, job.id, "result.md"), text);
   await atomic(join(scope.root, job.id, "done.json"), { state, report: text }, true);
@@ -54,10 +71,15 @@ test("input validation, independent model/thinking and literal task delivery", (
   const [inherited] = validateTasks([{ name: "review", prompt: "@secret $(touch pwned)", role: "reviewer" }], env);
   assert.equal(inherited.model, "provider/model");
   assert.equal(inherited.thinking, "high");
+  const [explicit] = validateTasks([{ name: "review", prompt: inherited.prompt, role: "reviewer", cwd: process.cwd(), model: "provider/model", thinking: "high" }], env);
+  assert.deepEqual(inherited, explicit, "Omitting matching defaults must preserve the entire resolved task");
   const [custom] = validateTasks([{ name: "custom", prompt: "x", model: "other/model:low" }], env);
   assert.equal(custom.thinking, undefined);
-  const args = piArgs(inherited, "/tmp/job");
-  assert.deepEqual(args, ["--mode", "json", "-p", "--no-session", "--name", "review", "--model", "provider/model", "--thinking", "high", "--append-system-prompt", "/tmp/job/system.md"]);
+  const args = piArgs(inherited);
+  assert.deepEqual(args.slice(0, 10), ["--mode", "json", "-p", "--no-session", "--name", "review", "--model", "provider/model", "--thinking", "high"]);
+  assert.equal(args[10], "-e");
+  assert.match(args[11], /herdr-subagents\/prompt\.ts$/);
+  assert.ok(!args.includes("--append-system-prompt"));
   assert.ok(!args.includes(inherited.prompt));
   assert.match(systemPrompt(inherited), /Do not spawn agents/);
   for (const input of [[], Array(17).fill({ name: "a", prompt: "x" }), [{ name: "../bad", prompt: "x" }], [{ name: "a", prompt: "" }], [{ name: "a", prompt: "x", role: "__proto__" }], [{ name: "a", prompt: "x", model: 3 }], [{ name: "a", prompt: "x", timeout: 0 }], [{ name: "a", prompt: "x", tools: "bash" }], [{ name: "a", prompt: "x" }, { name: "a", prompt: "x" }]]) {
@@ -67,7 +89,7 @@ test("input validation, independent model/thinking and literal task delivery", (
 
 test("all roles retain normal Pi resource and tool discovery; extra extensions are additive", () => {
   for (const role of ["reviewer", "explorer", "tester", "worker"]) {
-    const args = piArgs(task("configured", { role, extensions: ["/tmp/extra-extension.ts"] }), "/tmp/job");
+    const args = piArgs(task("configured", { role, extensions: ["/tmp/extra-extension.ts"] }));
     for (const flag of ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--tools", "--exclude-tools", "--no-tools", "--no-builtin-tools"]) {
       assert.ok(!args.includes(flag), `${role} unexpectedly restricts ${flag}`);
     }
@@ -93,19 +115,50 @@ test("layout leaves main alone after first split, chooses largest owned area", (
   assert.deepEqual(splitTarget(layout, ["a", "b"], "main"), { pane: "a", direction: "down" });
 });
 
-test("16 panes launch, names/focus/cwd are explicit; 17th and duplicate rejected", async (t) => {
+test("16-job CLI workflow keeps bounded metadata, explicit names/focus/cwd and unread-pane safety", async (t) => {
   const { scope, statePath } = await fixture(t);
-  const launched = await spawnTasks(scope, Array.from({ length: 16 }, (_, i) => task(`job-${i}`)));
+  // Maximum-length names exercise real serialized output, not an estimated schema.
+  const tasks = Array.from({ length: 16 }, (_, i) => ({ name: `job-${String(i).padStart(2, "0")}-${"x".repeat(25)}`, prompt: "test task" }));
+  const started = await cli(scope, ["spawn"], JSON.stringify(tasks));
+  const launched = await jobs(scope);
   assert.equal(launched.length, 16);
+  assert.deepEqual(started, { jobs: launched.map((job) => ({ id: job.id, name: job.task.name })) });
+  assert.ok(Buffer.byteLength(JSON.stringify(started)) <= 1100);
   await assert.rejects(spawnTasks(scope, [task("overflow")]), /At most 16/);
   const state = JSON.parse(await readFile(statePath, "utf8"));
   assert.equal(state.panes.length, 17);
   for (const call of state.calls.filter((call) => call[1] === "split")) assert.ok(call.includes("--no-focus") && call.includes("--cwd"));
   assert.equal(state.calls.filter((call) => call[1] === "rename").length, 16);
+  for (const job of launched) assert.ok(job.pane && job.terminal, "Pane identity must remain available in job.json");
+  const progress = await cli(scope, ["status"]);
+  assert.deepEqual(progress, { root: scope.root, jobs: launched.map((job) => ({ id: job.id, name: job.task.name, state: "running" })) });
+  // Normalize only the machine-specific artifact directory for a portable budget.
+  assert.ok(Buffer.byteLength(JSON.stringify({ ...progress, root: "/artifacts" })) <= 1400);
+  const waiting = await cli(scope, ["collect"]);
+  assert.deepEqual(waiting, { reports: [], pending: 16 });
+  assert.ok(Buffer.byteLength(JSON.stringify(waiting)) <= 30);
+  assert.deepEqual(await cli(scope, ["close"]), { closed: [] });
   for (const job of launched) await completed(scope, job, "finished");
-  await cleanup(scope, true);
+  const collected = await cli(scope, ["collect"]);
+  assert.deepEqual(collected, { reports: launched.map((job) => ({ id: job.id, name: job.task.name, state: "done", complete: true, text: "finished" })), pending: 0 });
+  for (const report of collected.reports) assert.ok(Buffer.byteLength(JSON.stringify({ ...report, text: "" })) <= 110);
+  assert.deepEqual(await cli(scope, ["close"]), { closed: launched.map((job) => job.task.name) });
   assert.equal(JSON.parse(await readFile(statePath, "utf8")).panes.length, 1);
   assert.equal((await stat(scope.root)).mode & 0o777, 0o700);
+});
+
+test("compact status preserves positive collected/closed flags and failure states", async (t) => {
+  const { scope } = await fixture(t);
+  const [running, consumed, cancelled] = await spawnTasks(scope, [task("running"), task("consumed"), task("cancelled")]);
+  await completed(scope, consumed, "checked");
+  await collect(scope, 0, async () => {});
+  await completed(scope, cancelled, "partial evidence", "cancelled");
+  await closeJob(scope, cancelled, true);
+  assert.deepEqual((await status(scope)).jobs, [
+    { id: running.id, name: "running", state: "running" },
+    { id: consumed.id, name: "consumed", state: "done", collected: true },
+    { id: cancelled.id, name: "cancelled", state: "cancelled", closed: true },
+  ]);
 });
 
 test("concurrent spawn is serialized and partial launch rolls back only created panes", async (t) => {
@@ -130,7 +183,7 @@ test("status cannot classify an in-progress launch as a disappeared worker", asy
     assert.equal(settled, false);
     await save(scope, job);
   });
-  assert.equal((await inspection)[0].state, "running");
+  assert.equal((await inspection).jobs[0].state, "running");
   assert.equal(await stat(join(scope.root, job.id, "done.json")).catch(() => undefined), undefined);
 });
 
@@ -156,6 +209,7 @@ for(let i=0;i<3;i++) await locked({root:${JSON.stringify(scope.root)}},async()=>
 test("cancellation waits for the supervisor's final report rather than consuming a placeholder", async (t) => {
   const { scope } = await fixture(t);
   const [job] = await spawnTasks(scope, [task("cancelled")]);
+  await atomic(join(scope.root, job.id, "worker.json"), { pid: process.pid }, true);
   let closed = false;
   const closing = closeJob(scope, job, true).then(() => { closed = true; });
   await delay(100);
@@ -200,7 +254,12 @@ test("collection is bounded, lossless Unicode pagination; no transcript enters r
     await collect(scope, 0, async (output) => {
       assert.ok(Buffer.byteLength(JSON.stringify(output)) < PAGE_BYTES);
       assert.equal(JSON.stringify(output).split("\n").length, 1);
-      for (const report of output.reports) chunks.push(report.text);
+      for (const report of output.reports) {
+        assert.equal(report.offset ?? 0, chunks.join("").length);
+        assert.equal(Object.hasOwn(report, "offset"), chunks.length > 0);
+        assert.equal(typeof report.complete, "boolean");
+        chunks.push(report.text);
+      }
       assert.ok(output.pending >= 1);
       pages++;
     });
@@ -230,11 +289,11 @@ test("disappeared/replaced panes never count as success and identity prevents un
   state.panes[1].terminal_id = "replaced";
   await writeFile(statePath, JSON.stringify(state));
   await assert.rejects(closeJob(scope, job, true), /identity changed/);
-  assert.equal((await status(scope))[0].state, "ending");
+  assert.equal((await status(scope)).jobs[0].state, "ending");
   const ending = (await jobs(scope))[0];
   ending.endedAt = Date.now() - 5001;
   await save(scope, ending);
-  assert.equal((await status(scope))[0].state, "failed");
+  assert.equal((await status(scope)).jobs[0].state, "failed");
   state.panes = state.panes.slice(0, 1);
   await writeFile(statePath, JSON.stringify(state));
   await collect(scope, 0, async (output) => assert.equal(output.reports[0].state, "failed"));
@@ -261,7 +320,13 @@ test("all 16 reports fit bounded pages without loss", async (t) => {
     await collect(scope, 0, async (output) => {
       assert.ok(Buffer.byteLength(JSON.stringify(output)) < PAGE_BYTES);
       pending = output.pending;
-      for (const report of output.reports) received.set(report.id, (received.get(report.id) || "") + report.text);
+      for (const report of output.reports) {
+        const previous = received.get(report.id) || "";
+        assert.equal(report.offset ?? 0, previous.length);
+        assert.equal(Object.hasOwn(report, "offset"), previous.length > 0);
+        assert.equal(report.complete, previous.length + report.text.length === 1500);
+        received.set(report.id, previous + report.text);
+      }
     });
   }
   assert.equal(received.size, 16);
@@ -273,7 +338,7 @@ test("final report rejects incomplete/error/aborted/length turns but accepts ret
   assert.deepEqual(finalReport(last, 0, true), { text: "final", error: undefined });
   assert.ok(finalReport(last, 1, true).error);
   assert.ok(finalReport(last, 0, false).error);
-  for (const stopReason of ["error", "aborted", "length"]) assert.ok(finalReport({ ...last, stopReason }, 0, true).error);
+  for (const stopReason of ["error", "aborted", "length", "pending", "deferred", "toolUse"]) assert.ok(finalReport({ ...last, stopReason }, 0, true).error);
   assert.ok(finalReport({ ...last, content: [...last.content, { type: "toolCall", name: "bash" }] }, 0, true).error);
   assert.ok(finalReport(undefined, 0, true).error);
   assert.equal(reportPage("😀END", 0, 3), "");
@@ -321,12 +386,16 @@ for (const trigger of ["timeout", "cancel"]) test(`worker ${trigger} kills its p
   const calls = JSON.parse(await readFile(statePath, "utf8")).calls;
   const jobdir = join(scope.root, job.id);
   const fakePi = join(directory, "slow.mjs");
-  await writeFile(fakePi, `process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);`);
+  await writeFile(fakePi, `import {writeFileSync} from 'node:fs'; process.on('SIGTERM',()=>{}); writeFileSync(${JSON.stringify(join(directory, "started"))},String(process.pid)); setInterval(()=>{},1000);`);
   await atomic(join(jobdir, "launch.json"), { pi: process.execPath, args: [fakePi] });
   const child = spawn(process.execPath, [launcher, "worker", jobdir], { env: { ...env, HERDR_PANE_ID: job.pane }, stdio: "ignore" });
   t.after(() => child.kill("SIGKILL"));
   const closed = once(child, "close");
-  if (trigger === "cancel") await atomic(join(jobdir, "cancel.json"), {});
+  if (trigger === "cancel") {
+    for (let i = 0; i < 200 && !await stat(join(directory, "started")).catch(() => undefined); i++) await delay(25);
+    assert.ok(await stat(join(directory, "started")));
+    await atomic(join(jobdir, "cancel.json"), {});
+  }
   await closed;
   const done = JSON.parse(await readFile(join(jobdir, "done.json"), "utf8"));
   assert.equal(done.state, "cancelled");
@@ -355,4 +424,143 @@ test("extension adds zero tools/prompt messages; settle closes only consumed pan
   await handlers.get("session_shutdown")({ reason: "quit" }, ctx);
   assert.equal((await jobs(scope)).find((j) => j.id === unread.id).closed, true);
   assert.ok(commands.has("subagents"));
+});
+
+test("tilde config paths match Pi and extension anchors relative paths", async (t) => {
+  const { env } = await fixture(t);
+  assert.equal(agentDirectory({ PI_CODING_AGENT_DIR: "~/.pi/agent" }), agentDirectory({}));
+  const path = join(env.PI_CODING_AGENT_DIR, "config with spaces");
+  assert.equal(agentDirectory({ PI_CODING_AGENT_DIR: pathToFileURL(path).href }), path);
+  const old = { ...process.env };
+  Object.assign(process.env, env, { PI_CODING_AGENT_DIR: ".test-agent-dir" });
+  t.after(() => { for (const key of Object.keys(process.env)) if (!(key in old)) delete process.env[key]; Object.assign(process.env, old); });
+  extension({ on() {}, registerCommand() {} });
+  assert.equal(process.env.PI_CODING_AGENT_DIR, join(process.cwd(), ".test-agent-dir"));
+});
+
+test("moved workers resolve by terminal across workspaces; moved callers use current identity", async (t) => {
+  const { scope, statePath } = await fixture(t);
+  const [job] = await spawnTasks(scope, [task("moved")]);
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.panes[0].pane_id = "w2:p-parent";
+  state.panes[1].pane_id = "w2:p-worker";
+  await writeFile(statePath, JSON.stringify(state));
+  assert.equal((await status(scope)).jobs[0].state, "running");
+  await completed(scope, job, "moved result");
+  await collect(scope, 0, async (output) => assert.equal(output.reports[0].text, "moved result"));
+  await cleanup(scope);
+  let updated = JSON.parse(await readFile(statePath, "utf8"));
+  assert.equal(updated.panes.length, 1);
+  assert.ok(updated.calls.some((args) => args[1] === "close" && args[2] === "w2:p-worker"));
+  await spawnTasks(scope, [task("after-move")]);
+  updated = JSON.parse(await readFile(statePath, "utf8"));
+  const split = updated.calls.filter((args) => args[1] === "split").at(-1);
+  assert.equal(split[split.indexOf("--pane") + 1], "w2:p-parent");
+});
+
+test("identity is revalidated after cancellation acknowledgement", async (t) => {
+  const { scope, statePath } = await fixture(t);
+  const [job] = await spawnTasks(scope, [task("replaced-during-wait")]);
+  const jobdir = join(scope.root, job.id);
+  await atomic(join(jobdir, "worker.json"), { pid: process.pid }, true);
+  const closing = assert.rejects(closeJob(scope, job, true), /identity changed/);
+  for (let i = 0; i < 100 && !await stat(join(jobdir, "cancel.json")).catch(() => undefined); i++) await delay(10);
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.panes[1].terminal_id = "replacement";
+  await writeFile(statePath, JSON.stringify(state));
+  await completed(scope, job, "partial", "cancelled");
+  await closing;
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).panes.length, 2);
+  assert.ok(!(await jobs(scope))[0].closed);
+});
+
+test("rejected launch is fenced and rolled back without waiting for a nonexistent worker", async (t) => {
+  const { scope, statePath } = await fixture(t);
+  await assert.rejects(spawnTasks({ ...scope, env: { ...scope.env, FAKE_FAIL: "run" } }, [task("rejected")]), /rolled back/);
+  const [job] = await jobs(scope);
+  assert.equal(job.closed, true);
+  assert.equal(JSON.parse(await readFile(join(scope.root, job.id, "worker.json"), "utf8")).cancelled, true);
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).panes.length, 1);
+});
+
+test("lost split response is reported as unresolved rather than falsely claiming rollback", async (t) => {
+  const { scope, statePath } = await fixture(t);
+  await assert.rejects(spawnTasks({ ...scope, env: { ...scope.env, FAKE_FAIL: "split" } }, [task("lost-response")]), /rollback incomplete.*ownership is unresolved/);
+  const [job] = await jobs(scope);
+  assert.equal(job.creating, true);
+  assert.ok(!job.closed);
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).panes.length, 2);
+});
+
+test("batch cancellation shares one grace period and attempts jobs after failures", async (t) => {
+  const { scope, statePath } = await fixture(t);
+  const launched = await spawnTasks(scope, [task("stalled-a"), task("stalled-b"), task("complete")]);
+  for (const job of launched.slice(0, 2)) await atomic(join(scope.root, job.id, "worker.json"), { pid: process.pid }, true);
+  await completed(scope, launched[2], "ok");
+  const start = Date.now();
+  await assert.rejects(closeJobs(scope, launched, true, 500), /stalled-a.*stalled-b/);
+  assert.ok(Date.now() - start < 1300, "Cancellation must not spend a fresh grace period per job");
+  assert.equal((await jobs(scope)).find((j) => j.id === launched[2].id).closed, true);
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).panes.length, 3);
+});
+
+test("saved reports remain collectible during Herdr outage; unfinished jobs expose a bounded warning", async (t) => {
+  const { scope } = await fixture(t);
+  const [job] = await spawnTasks(scope, [task("offline")]);
+  await completed(scope, job, "offline report");
+  const offline = { ...scope, env: { ...scope.env, FAKE_FAIL: "list" } };
+  await collect(offline, 0, async (output) => assert.equal(output.reports[0].text, "offline report"));
+  await spawnTasks(scope, [task("unfinished")]);
+  await collect(offline, 0, async (output) => {
+    assert.equal(output.pending, 1);
+    assert.match(output.warning, /Herdr pane list/);
+    assert.ok(Buffer.byteLength(JSON.stringify(output)) < PAGE_BYTES);
+  });
+});
+
+test("status paginates large closed/unread backlogs", async (t) => {
+  const { scope } = await fixture(t);
+  for (let i = 0; i < 70; i++) {
+    const job = { id: i.toString(16).padStart(12, "0"), task: task(`history-${i}`), closed: true, created: i, cursor: 0 };
+    await mkdir(join(scope.root, job.id), { recursive: true });
+    await save(scope, job);
+    await completed(scope, job, "unread");
+  }
+  let offset = 0;
+  const ids = [];
+  do {
+    const page = await status(scope, offset);
+    assert.ok(page.jobs.length <= 16);
+    assert.ok(Buffer.byteLength(JSON.stringify(page)) < PAGE_BYTES);
+    ids.push(...page.jobs.map((j) => j.id));
+    offset = page.next;
+  } while (offset !== undefined);
+  assert.equal(new Set(ids).size, 70);
+});
+
+test("cancellation recovers a parent crash after fencing but before completion publication", async (t) => {
+  const { scope } = await fixture(t);
+  const [job] = await spawnTasks(scope, [task("cancel-crash")]);
+  await atomic(join(scope.root, job.id, "worker.json"), { cancelled: true }, true);
+  await closeJob(scope, job, true, Date.now() + 500);
+  assert.equal(job.closed, true);
+  const done = JSON.parse(await readFile(join(scope.root, job.id, "done.json"), "utf8"));
+  assert.equal(done.state, "cancelled");
+});
+
+test("a cancellation broadcast write failure does not prevent later jobs closing", async (t) => {
+  const { scope } = await fixture(t);
+  const launched = await spawnTasks(scope, [task("bad-broadcast"), task("later-job")]);
+  await mkdir(join(scope.root, launched[0].id, "cancel.json"));
+  await completed(scope, launched[1], "ready");
+  await assert.rejects(closeJobs(scope, launched, true), /EISDIR|directory/);
+  assert.equal((await jobs(scope)).find((job) => job.id === launched[1].id).closed, true);
+});
+
+test("failed process cleanup prevents automatic pane closure", async (t) => {
+  const { scope } = await fixture(t);
+  const [job] = await spawnTasks(scope, [task("unsafe-close")]);
+  await atomic(join(scope.root, job.id, "done.json"), { state: "failed", report: "", cleanupError: "ps unavailable" }, true);
+  await collect(scope, 0, async () => {});
+  await assert.rejects(cleanup(scope), /ps unavailable.*pane retained/);
 });

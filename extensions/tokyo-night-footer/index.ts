@@ -36,8 +36,15 @@ import {
   estimateLoadedContextTokens,
   estimateRequestContextTokens,
   estimateStreamingContextTokens,
+  isCompletedResponse,
+  usageInputTokens,
   usageTokenTotal,
 } from "./context-usage.ts";
+import {
+  formatFirstTokenLatency,
+  responseTimeToFirstToken,
+  responseTokensPerSecond,
+} from "./throughput.ts";
 
 // Visual layout adapted from oh-my-pi's MIT-licensed editor status line.
 const LEGACY_SESSION_NAME_STATUS_KEY = "ventris-session-name";
@@ -47,6 +54,8 @@ const PRIME_AGENT_WIDGET_KEY = "tokyo-night-footer";
 const TITLE_GENERATION_TIMEOUT_MS = 20_000;
 const TPS_ICON_NERD = "󰓅";
 const TPS_ICON_FALLBACK = "⚡";
+const TTFT_ICON_NERD = "";
+const TTFT_ICON_FALLBACK = "◷";
 const CONTEXT_ICON_NERD = "";
 const CONTEXT_ICON_FALLBACK = "◫";
 const GIT_BRANCH_ICON_NERD = "";
@@ -117,6 +126,7 @@ interface StatusLineState {
   sessionId: string | undefined;
   sessionGroupName: string | undefined;
   latestTps: number | undefined;
+  latestTtftMs: number | undefined;
   contextEstimate: ContextTokenEstimate | undefined;
   requestContextEstimate: ContextTokenEstimate | undefined;
   loadedContextTokens: number | undefined;
@@ -124,6 +134,8 @@ interface StatusLineState {
   streamingContextChars: number;
   streamingContentChars: Map<number, number>;
   contextUsageInvalidated: boolean;
+  contextUsageSnapshot: number | null | undefined;
+  checkContextEntries: (() => void) | undefined;
   footerData: ReadonlyFooterDataProvider | undefined;
   gitStatus: GitStatusTracker;
   runtimeContext: ExtensionContext | undefined;
@@ -261,7 +273,7 @@ function statusSegmentPriority(id: string): number {
   if (id.startsWith("status:")) return 85;
   if (id === "context") return 80;
   if (id === "path") return 75;
-  if (id === "tps") return 65;
+  if (id === "tps" || id === "ttft") return 65;
   if (id === "thinking") return 55;
   if (id === "git") return 45;
   if (id === "pi") return 20;
@@ -326,11 +338,13 @@ function contextSegment(
   contextEstimate: ContextTokenEstimate | undefined,
   loadedContextTokens: number | undefined,
   contextUsageInvalidated: boolean,
+  contextUsageSnapshot: number | null | undefined,
   nerdIcons: boolean,
 ): string {
-  const usage = ctx.getContextUsage();
-  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-  const reportedContextTokens = contextUsageInvalidated ? undefined : usage?.tokens;
+  // Rendering must never walk the session tree. Pi's getContextUsage() does;
+  // snapshot it only at session/branch boundaries and use event-driven updates.
+  const contextWindow = ctx.model?.contextWindow ?? 0;
+  const reportedContextTokens = contextUsageInvalidated ? undefined : contextUsageSnapshot;
   const isLoadedContextEstimate =
     contextEstimate === undefined &&
     reportedContextTokens === 0 &&
@@ -338,7 +352,9 @@ function contextSegment(
   const contextTokens =
     contextEstimate?.tokens ??
     (isLoadedContextEstimate ? loadedContextTokens : reportedContextTokens);
-  const isEstimate = contextEstimate?.estimated ?? isLoadedContextEstimate;
+  // Pi's fallback may include estimated trailing messages or use another model's
+  // tokenizer. Only a completed current-model response is labeled reported.
+  const isEstimate = contextEstimate?.estimated ?? true;
   const percent =
     contextTokens !== null && contextTokens !== undefined && contextWindow > 0
       ? (contextTokens / contextWindow) * 100
@@ -371,6 +387,7 @@ function buildLeftSegments(
   availableWidth: number,
   scrollIndicator: string | undefined,
 ): StatusSegment[] {
+  state.checkContextEntries?.();
   const statusSegments = Array.from(state.footerData?.getExtensionStatuses().entries() ?? [])
     .filter(
       ([key]) => key !== LEGACY_SESSION_NAME_STATUS_KEY && key !== LEGACY_TPS_STATUS_KEY,
@@ -450,6 +467,7 @@ function buildLeftSegments(
       state.contextEstimate,
       state.loadedContextTokens,
       state.contextUsageInvalidated,
+      state.contextUsageSnapshot,
       nerdIcons,
     ),
   });
@@ -458,7 +476,16 @@ function buildLeftSegments(
     const icon = nerdIcons ? TPS_ICON_NERD : TPS_ICON_FALLBACK;
     segments.push({
       id: "tps",
-      content: tone(theme, "tps", withIcon(icon, `${state.latestTps.toFixed(1)} tok/s`)),
+      content: tone(theme, "tps", withIcon(icon, `${state.latestTps.toFixed(1)} tps`)),
+    });
+  }
+  if (state.latestTtftMs !== undefined) {
+    segments.push({
+      id: "ttft",
+      content: tone(theme, "tps", withIcon(
+        nerdIcons ? TTFT_ICON_NERD : TTFT_ICON_FALLBACK,
+        formatFirstTokenLatency(state.latestTtftMs),
+      )),
     });
   }
 
@@ -577,15 +604,24 @@ function renderTopBorder(
   let left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
   const right = renderStatusGroup(rightSegments, "right", theme, nerdIcons);
 
-  // Keep the right-aligned agent title visible while progressively removing
-  // lower-priority status details.
-  while (visibleWidth(left) + visibleWidth(right) > availableWidth && leftSegments.length > 1) {
-    leftSegments.splice(leastImportantSegmentIndex(leftSegments), 1);
+  // Keep the title visible while dropping lower-priority details. Subtract the
+  // removed segment/separator widths instead of rebuilding and measuring the
+  // entire styled line after every removal (especially costly in narrow panes).
+  let leftWidth = visibleWidth(left);
+  const rightWidth = visibleWidth(right);
+  const initialSegmentCount = leftSegments.length;
+  while (leftWidth + rightWidth > availableWidth && leftSegments.length > 1) {
+    const index = leastImportantSegmentIndex(leftSegments);
+    // Both powerline and fallback separators occupy one column plus two spaces.
+    leftWidth -= visibleWidth(leftSegments[index]!.content) + 3;
+    leftSegments.splice(index, 1);
+  }
+  if (leftSegments.length !== initialSegmentCount) {
     left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
   }
-  if (visibleWidth(left) + visibleWidth(right) > availableWidth && leftSegments.length === 1) {
+  if (leftWidth + rightWidth > availableWidth && leftSegments.length === 1) {
     const groupChromeWidth = 2;
-    const leftBudget = Math.max(0, availableWidth - visibleWidth(right));
+    const leftBudget = Math.max(0, availableWidth - rightWidth);
     if (leftBudget > groupChromeWidth) {
       leftSegments[0] = {
         ...leftSegments[0]!,
@@ -596,13 +632,18 @@ function renderTopBorder(
         ),
       };
       left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
+      leftWidth = visibleWidth(left);
     } else {
       left = "";
+      leftWidth = 0;
     }
   }
-  if (visibleWidth(left) + visibleWidth(right) > availableWidth) left = "";
+  if (leftWidth + rightWidth > availableWidth) {
+    left = "";
+    leftWidth = 0;
+  }
 
-  const gapWidth = Math.max(0, availableWidth - visibleWidth(left) - visibleWidth(right));
+  const gapWidth = Math.max(0, availableWidth - leftWidth - rightWidth);
   return `${border("╭──")}${left}${border("─".repeat(gapWidth))}${right}${border("──╮")}`;
 }
 
@@ -735,6 +776,7 @@ export default function (pi: ExtensionAPI): void {
     sessionId: undefined,
     sessionGroupName: undefined,
     latestTps: undefined,
+    latestTtftMs: undefined,
     contextEstimate: undefined,
     requestContextEstimate: undefined,
     loadedContextTokens: undefined,
@@ -742,6 +784,8 @@ export default function (pi: ExtensionAPI): void {
     streamingContextChars: 0,
     streamingContentChars: new Map(),
     contextUsageInvalidated: false,
+    contextUsageSnapshot: undefined,
+    checkContextEntries: undefined,
     footerData: undefined,
     gitStatus: createGitStatusTracker(process.cwd()),
     runtimeContext: undefined,
@@ -753,7 +797,48 @@ export default function (pi: ExtensionAPI): void {
     titleGenerationInFlight: false,
   };
   let requestRender: (() => void) | undefined;
-  let turnStartedAt: number | undefined;
+  let requestStartedAt: number | undefined;
+  let requestFirstTokenAt: number | undefined;
+  let requestHeadersObserved = false;
+  let requestClockLocked = false;
+  let requestLoadedContextTokens: number | undefined;
+  let contextLeafId: string | null | undefined;
+  let contextRefreshQueued = false;
+
+  const snapshotContextUsage = (ctx: ExtensionContext): void => {
+    const tokens = ctx.getContextUsage()?.tokens;
+    state.contextUsageSnapshot = tokens;
+    if (tokens === null || tokens === undefined || tokens === 0) return;
+    // Pi's own usage fallback does not validate the active model identity.
+    const manager = ctx.sessionManager;
+    // Current Pi can walk just the trailing entries through O(1) lookups. Avoid
+    // a second full getBranch() allocation; retain the older runtime fallback.
+    const getLeafEntry = (manager as {
+      getLeafEntry?: ExtensionContext["sessionManager"]["getLeafEntry"];
+    }).getLeafEntry;
+    const branch = getLeafEntry ? undefined : manager.getBranch();
+    let index = (branch?.length ?? 0) - 1;
+    let entry = branch ? branch[index] : getLeafEntry?.call(manager);
+    let excludedTokens = 0;
+    while (entry) {
+      // Pi's fallback estimator includes trailing persisted !! results even
+      // though convertToLlm excludes them. Correct that on resume/tree/reload.
+      if (entry.type === "message" && entry.message.role === "bashExecution" && entry.message.excludeFromContext) {
+        excludedTokens += Math.ceil((entry.message.command.length + entry.message.output.length) / 4);
+      }
+      if (entry.type === "message" && entry.message.role === "assistant" &&
+          isCompletedResponse(entry.message.stopReason) && usageInputTokens(entry.message.usage) > 0) {
+        if (!assistantMatchesModel(entry.message, { provider: ctx.model?.provider, id: ctx.model?.id })) {
+          state.contextUsageSnapshot = undefined;
+        }
+        break;
+      }
+      entry = branch ? branch[--index] : entry.parentId === null ? undefined : manager.getEntry(entry.parentId);
+    }
+    if (state.contextUsageSnapshot !== undefined) {
+      state.contextUsageSnapshot = Math.max(0, tokens - excludedTokens);
+    }
+  };
 
   const contextRenderKey = (estimate: ContextTokenEstimate | undefined): string => {
     if (!estimate) return "unknown";
@@ -767,6 +852,42 @@ export default function (pi: ExtensionAPI): void {
     const previousKey = contextRenderKey(state.contextEstimate);
     state.contextEstimate = estimate;
     if (contextRenderKey(estimate) !== previousKey) requestRender?.();
+  };
+
+  const checkContextEntries = (): void => {
+    const ctx = state.runtimeContext;
+    // Prime Agent may not expose leaf lookup. In Pi these are O(1) map accesses.
+    if (!ctx?.sessionManager.getLeafId || contextRefreshQueued || !state.runtimeActive) return;
+    if (ctx.sessionManager.getLeafId() === contextLeafId) return;
+    contextRefreshQueued = true;
+    const generation = state.runtimeGeneration;
+    queueMicrotask(() => {
+      contextRefreshQueued = false;
+      if (!state.runtimeActive || generation !== state.runtimeGeneration) return;
+      const leafId = ctx.sessionManager.getLeafId();
+      let entry = leafId === null ? undefined : ctx.sessionManager.getEntry(leafId);
+      let estimate = state.contextEstimate;
+      if (!estimate && !state.contextUsageInvalidated && state.contextUsageSnapshot !== null) {
+        const tokens = state.contextUsageSnapshot === 0
+          ? state.loadedContextTokens
+          : state.contextUsageSnapshot;
+        if (tokens !== undefined) estimate = { tokens, estimated: true };
+      }
+      let changed = false;
+      // recordBashResult() persists idle ! output without message_end. Only
+      // inspect newly appended entries, outside render; normal messages were
+      // already counted by their events. !! results add nothing.
+      while (entry && entry.id !== contextLeafId) {
+        if (estimate && entry.type === "message" && entry.message.role === "bashExecution") {
+          const next = estimateContextWithMessage(estimate, entry.message);
+          changed ||= next !== estimate;
+          estimate = next;
+        }
+        entry = entry.parentId === null ? undefined : ctx.sessionManager.getEntry(entry.parentId);
+      }
+      contextLeafId = leafId;
+      if (changed) setContextEstimate(estimate);
+    });
   };
 
   const updateLoadedContext = (loadedContextTokens: number | undefined): void => {
@@ -864,12 +985,16 @@ export default function (pi: ExtensionAPI): void {
     state.sessionId = ctx.sessionManager.getSessionId();
     state.sessionGroupName = undefined;
     state.latestTps = undefined;
+    state.latestTtftMs = undefined;
     state.contextEstimate = undefined;
     state.requestContextEstimate = undefined;
     state.authoritativeLoadedContextTokens = undefined;
     state.streamingContextChars = 0;
     state.streamingContentChars.clear();
     state.contextUsageInvalidated = false;
+    snapshotContextUsage(ctx);
+    contextLeafId = ctx.sessionManager.getLeafId?.();
+    state.checkContextEntries = checkContextEntries;
     // Session Groups loads after the footer and applies membership-specific tool
     // gating later in session_start. Wait for its presentation event instead of
     // measuring the transient registration-time tool set.
@@ -885,7 +1010,7 @@ export default function (pi: ExtensionAPI): void {
     state.titleGenerationAbortController = new AbortController();
     state.titleGenerationInFlight = false;
     requestRender = undefined;
-    turnStartedAt = undefined;
+    requestStartedAt = undefined;
     ctx.ui.setStatus(LEGACY_SESSION_NAME_STATUS_KEY, undefined);
     ctx.ui.setStatus(LEGACY_TPS_STATUS_KEY, undefined);
 
@@ -932,6 +1057,13 @@ export default function (pi: ExtensionAPI): void {
     maybeGenerateAgentTitle(ctx);
   });
 
+  pi.on("resources_discover", (_event, ctx) => {
+    if (!state.runtimeActive) return;
+    // Also initialize when the footer is loaded without Session Groups.
+    updateLoadedContext(estimateLoadedContext(pi, ctx));
+    requestRender?.();
+  });
+
   pi.on("before_agent_start", (event, ctx) => {
     maybeGenerateAgentTitle(ctx, event.prompt);
   });
@@ -946,10 +1078,19 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("context", (event, ctx) => {
     if (!state.runtimeActive) return;
-    const loadedContextTokens =
-      state.loadedContextTokens ?? estimateLoadedContext(pi, ctx);
+    // This request already contains every persisted shell result before it.
+    contextLeafId = ctx.sessionManager.getLeafId?.();
+    // Old runtimes without request/header hooks retain the context fallback.
+    requestStartedAt = performance.now();
+    requestFirstTokenAt = undefined;
+    requestHeadersObserved = false;
+    requestClockLocked = false;
+    requestLoadedContextTokens = undefined;
+    // Tools can be activated by a tool result between calls in the same run.
+    const loadedContextTokens = estimateLoadedContext(pi, ctx);
     if (loadedContextTokens === undefined) return;
-    if (state.loadedContextTokens === undefined) updateLoadedContext(loadedContextTokens);
+    updateLoadedContext(loadedContextTokens);
+    requestLoadedContextTokens = loadedContextTokens;
 
     const estimate = estimateRequestContextTokens(
       event.messages,
@@ -961,26 +1102,53 @@ export default function (pi: ExtensionAPI): void {
     setContextEstimate(estimate);
   });
 
-  pi.on("turn_start", () => {
-    turnStartedAt = performance.now();
+  pi.on("before_provider_headers", () => {
+    // ModelRuntime emits this after resolving auth, even for custom streamSimple
+    // providers that omit onPayload. Prefer the later payload hook if available.
+    if (state.runtimeActive && requestStartedAt !== undefined && !requestClockLocked && !requestHeadersObserved) {
+      requestStartedAt = performance.now();
+      requestHeadersObserved = true;
+    }
+  });
+
+  pi.on("before_provider_request", () => {
+    // Do not time unrelated calls (e.g. compaction/title generation). A context
+    // event opens a main-agent request; message_end closes it.
+    if (state.runtimeActive && requestStartedAt !== undefined && !requestClockLocked) {
+      requestStartedAt = performance.now();
+      // Repeated payload hooks (transport fallback/retry) belong to the same
+      // logical response. Restarting here would hide latency and inflate TPS.
+      requestClockLocked = true;
+    }
   });
 
   pi.on("message_start", (event) => {
-    if (event.message.role !== "assistant") return;
+    if (!state.runtimeActive || event.message.role !== "assistant") return;
+    // A late custom-provider hook must not move the start past response headers.
+    requestClockLocked = true;
     state.streamingContextChars = 0;
     state.streamingContentChars.clear();
-    if (state.requestContextEstimate) setContextEstimate(state.requestContextEstimate);
-    if (turnStartedAt === undefined) turnStartedAt = performance.now();
+    if (state.requestContextEstimate) {
+      setContextEstimate(estimateStreamingContextTokens(state.requestContextEstimate, 0, event.message.usage));
+    }
   });
 
-  pi.on("message_update", (event, ctx) => {
-    if (event.message.role !== "assistant") return;
+  pi.on("message_update", (event) => {
+    if (!state.runtimeActive || event.message.role !== "assistant") return;
     const streamEvent = event.assistantMessageEvent;
     if (
       streamEvent.type === "text_delta" ||
       streamEvent.type === "thinking_delta" ||
       streamEvent.type === "toolcall_delta"
     ) {
+      if (requestFirstTokenAt === undefined && requestStartedAt !== undefined && streamEvent.delta.length > 0) {
+        // Only immutable delta payloads carry event-time output evidence. Pi's
+        // partial.content/usage are shared mutable objects: even a start event
+        // can already contain future output when a buffered stream is consumed.
+        // One clock read per response, never one per token/chunk or render.
+        requestFirstTokenAt = performance.now();
+        requestClockLocked = true;
+      }
       const previous = state.streamingContentChars.get(streamEvent.contentIndex) ?? 0;
       const current = previous + streamEvent.delta.length;
       state.streamingContentChars.set(streamEvent.contentIndex, current);
@@ -1010,29 +1178,19 @@ export default function (pi: ExtensionAPI): void {
       );
     }
 
-    const contextTokens = usageTokenTotal(event.message.usage);
-    if (
-      contextTokens > 0 &&
-      assistantMatchesModel(event.message, {
-        provider: ctx.model?.provider,
-        id: ctx.model?.id,
-      })
-    ) {
-      state.contextUsageInvalidated = false;
-      setContextEstimate({ tokens: contextTokens, estimated: false });
-      return;
-    }
     if (state.requestContextEstimate) {
       setContextEstimate(
         estimateStreamingContextTokens(
           state.requestContextEstimate,
           state.streamingContextChars,
+          event.message.usage,
         ),
       );
     }
   });
 
   pi.on("message_end", (event, ctx) => {
+    if (!state.runtimeActive) return;
     if (event.message.role !== "assistant") {
       if (state.contextEstimate) {
         setContextEstimate(estimateContextWithMessage(state.contextEstimate, event.message));
@@ -1040,35 +1198,44 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    const elapsedMs = turnStartedAt === undefined ? 0 : performance.now() - turnStartedAt;
-    const outputTokens = event.message.usage.output;
+    const completedAt = performance.now();
     const contextTokens = usageTokenTotal(event.message.usage);
-    const completed =
-      event.message.stopReason !== "error" && event.message.stopReason !== "aborted";
-    const hasCurrentModelUsage =
-      completed &&
-      contextTokens > 0 &&
-      assistantMatchesModel(event.message, {
-        provider: ctx.model?.provider,
-        id: ctx.model?.id,
-      });
+    const completed = isCompletedResponse(event.message.stopReason);
+    const matchesModel = assistantMatchesModel(event.message, {
+      provider: ctx.model?.provider,
+      id: ctx.model?.id,
+    });
+    const hasCurrentModelUsage = completed && matchesModel && usageInputTokens(event.message.usage) > 0;
 
-    if (completed && outputTokens > 0 && elapsedMs >= 100) {
-      state.latestTps = outputTokens / (elapsedMs / 1_000);
+    const previousTps = state.latestTps;
+    const previousTtftMs = state.latestTtftMs;
+    if (completed && matchesModel) {
+      state.latestTps = responseTokensPerSecond(event.message, requestStartedAt, completedAt);
+      // Publish the pair on completion, retaining the last successful response
+      // during streaming/failure. TTFT does not depend on token-usage support.
+      state.latestTtftMs = responseTimeToFirstToken(requestStartedAt, requestFirstTokenAt, completedAt);
     }
     if (hasCurrentModelUsage) {
       state.contextUsageInvalidated = false;
-      state.authoritativeLoadedContextTokens = state.loadedContextTokens;
+      // A group/tool change while streaming applies to the NEXT request, not
+      // the one whose usage just arrived.
+      state.authoritativeLoadedContextTokens = requestLoadedContextTokens;
       setContextEstimate({ tokens: contextTokens, estimated: false });
     } else if (state.requestContextEstimate) {
-      setContextEstimate(
-        estimateContextWithMessage(state.requestContextEstimate, event.message),
-      );
+      const fallback = estimateContextWithMessage(state.requestContextEstimate, event.message);
+      setContextEstimate(estimateStreamingContextTokens(
+        state.requestContextEstimate,
+        (fallback.tokens - state.requestContextEstimate.tokens) * 4,
+        completed && matchesModel ? event.message.usage : undefined,
+      ));
     }
     state.requestContextEstimate = undefined;
     state.streamingContextChars = 0;
     state.streamingContentChars.clear();
-    turnStartedAt = undefined;
+    requestStartedAt = undefined;
+    requestFirstTokenAt = undefined;
+    // Context/TPS can round to the same display value even when TTFT changes.
+    if (state.latestTps !== previousTps || state.latestTtftMs !== previousTtftMs) requestRender?.();
   });
 
   pi.on("tool_result", (event) => {
@@ -1087,12 +1254,15 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("turn_end", () => {
-    turnStartedAt = undefined;
+    requestStartedAt = undefined;
     refreshGitStatus(true);
   });
   pi.on("agent_settled", (_event, ctx) => maybeGenerateAgentTitle(ctx));
   pi.on("session_info_changed", () => requestRender?.());
   pi.on("model_select", () => {
+    state.latestTps = undefined;
+    state.latestTtftMs = undefined;
+    requestStartedAt = undefined;
     state.contextEstimate = undefined;
     state.requestContextEstimate = undefined;
     state.authoritativeLoadedContextTokens = undefined;
@@ -1102,7 +1272,13 @@ export default function (pi: ExtensionAPI): void {
     requestRender?.();
   });
   pi.on("thinking_level_select", () => requestRender?.());
-  pi.on("session_compact", () => {
+  pi.on("session_compact", (_event, ctx) => {
+    if (!state.runtimeActive) return;
+    state.latestTps = undefined;
+    state.latestTtftMs = undefined;
+    requestStartedAt = undefined;
+    snapshotContextUsage(ctx);
+    contextLeafId = ctx.sessionManager.getLeafId?.();
     state.contextEstimate = undefined;
     state.requestContextEstimate = undefined;
     state.authoritativeLoadedContextTokens = undefined;
@@ -1112,6 +1288,12 @@ export default function (pi: ExtensionAPI): void {
     requestRender?.();
   });
   pi.on("session_tree", (_event, ctx) => {
+    if (!state.runtimeActive) return;
+    state.latestTps = undefined;
+    state.latestTtftMs = undefined;
+    requestStartedAt = undefined;
+    snapshotContextUsage(ctx);
+    contextLeafId = ctx.sessionManager.getLeafId?.();
     state.contextEstimate = undefined;
     state.requestContextEstimate = undefined;
     state.authoritativeLoadedContextTokens = undefined;
@@ -1124,6 +1306,9 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     state.runtimeActive = false;
     state.runtimeGeneration++;
+    state.latestTps = undefined;
+    state.latestTtftMs = undefined;
+    requestFirstTokenAt = undefined;
     state.sessionId = undefined;
     state.sessionGroupName = undefined;
     state.titleGenerationAbortController.abort();
@@ -1142,9 +1327,12 @@ export default function (pi: ExtensionAPI): void {
     state.streamingContextChars = 0;
     state.streamingContentChars.clear();
     state.contextUsageInvalidated = false;
+    state.contextUsageSnapshot = undefined;
+    state.checkContextEntries = undefined;
+    contextLeafId = undefined;
     state.runtimeContext = undefined;
     state.primeAgentContext = undefined;
     state.primeAgentWidgetText = undefined;
-    turnStartedAt = undefined;
+    requestStartedAt = undefined;
   });
 }

@@ -1,8 +1,9 @@
-import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  InputEvent,
   SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -18,6 +19,7 @@ import {
 import {
   appendSessionGroupContext,
   appendUnavailableSessionGroupContext,
+  estimateSessionGroupContextTokens,
 } from "./context.ts";
 import { publishSessionGroupPresentation } from "./events.ts";
 import {
@@ -47,6 +49,16 @@ import {
   registerSessionGroupTool,
   type SessionGroupUserAuthorization,
 } from "./tool.ts";
+
+interface PendingSessionGroupInput {
+  authorization: SessionGroupUserAuthorization;
+  streaming: boolean;
+  imageHash: string;
+}
+
+function fingerprintImages(images: InputEvent["images"]): string {
+  return createHash("sha256").update(JSON.stringify(images ?? [])).digest("hex");
+}
 
 interface UnavailableContextSnapshot {
   groupId: string;
@@ -132,8 +144,26 @@ export default function sessionGroups(pi: ExtensionAPI): void {
   let currentContextSnapshot: SessionGroupContextSnapshot | undefined;
   let unavailableContextSnapshot: UnavailableContextSnapshot | undefined;
   let currentUserAuthorization: SessionGroupUserAuthorization | undefined;
-  let pendingStreamingAuthorizations: SessionGroupUserAuthorization[] = [];
-  const authorizationStorage = new AsyncLocalStorage<SessionGroupUserAuthorization>();
+  let pendingInputs: PendingSessionGroupInput[] = [];
+  let pendingDelivery: PendingSessionGroupInput | undefined;
+  let inputOverflow = false;
+  const warnedContextKeys = new Set<string>();
+
+  const warnContextOverhead = (snapshot: SessionGroupContextSnapshot, ctx: ExtensionContext): void => {
+    const model = ctx.model;
+    if (!model || !Number.isFinite(model.contextWindow) || model.contextWindow <= 0) return;
+    const tokens = estimateSessionGroupContextTokens(snapshot);
+    if (tokens <= model.contextWindow * 0.1) return;
+    const hash = createHash("sha256").update(appendSessionGroupContext("", snapshot)).digest("hex");
+    const key = JSON.stringify([model.provider, model.id, model.contextWindow, hash]);
+    if (warnedContextKeys.has(key)) return;
+    warnedContextKeys.add(key);
+    notify(
+      ctx,
+      `Shared session-group context uses approximately ${tokens} tokens (${Math.round(tokens / model.contextWindow * 100)}% of ${model.provider}/${model.id}'s ${model.contextWindow}-token window). Consider shortening it with /group edit; it has not been truncated or summarized.`,
+      "warning",
+    );
+  };
 
   const sessionGroupToolNames = [
     EDIT_GROUP_CONTEXT_TOOL_NAME,
@@ -242,14 +272,24 @@ export default function sessionGroups(pi: ExtensionAPI): void {
   registerSessionGroupChangelogTool(pi, store, toolController);
 
   pi.on("input", (event) => {
-    const authorization = { text: event.text, source: event.source };
-    if (event.streamingBehavior) {
-      pendingStreamingAuthorizations.push(authorization);
-      if (pendingStreamingAuthorizations.length > 100) {
-        pendingStreamingAuthorizations = pendingStreamingAuthorizations.slice(-100);
-      }
-    } else {
-      authorizationStorage.enterWith(authorization);
+    // ExtensionRunner awaits *every* preceding handler, even synchronous ones.
+    // ALS.enterWith here cannot authorize the caller's later continuation.
+    // Correlate observed input -> final prompt -> delivered user message instead.
+    // Pi 0.85.0 exposes neither an input ID nor original text/transform history:
+    // earlier transforms are indistinguishable from direct input. Execution-time
+    // confirmation remains mandatory; later transforms/expansion fail matching.
+    if (pendingInputs.length >= 100) {
+      inputOverflow = true;
+      pendingInputs = [];
+      pendingDelivery = undefined;
+      currentUserAuthorization = undefined;
+    }
+    if (!inputOverflow) {
+      pendingInputs.push({
+        authorization: { text: event.text, source: event.source },
+        streaming: event.streamingBehavior !== undefined,
+        imageHash: fingerprintImages(event.images),
+      });
     }
     return { action: "continue" };
   });
@@ -262,7 +302,9 @@ export default function sessionGroups(pi: ExtensionAPI): void {
     currentContextSnapshot = undefined;
     unavailableContextSnapshot = undefined;
     currentUserAuthorization = undefined;
-    pendingStreamingAuthorizations = [];
+    pendingInputs = [];
+    pendingDelivery = undefined;
+    inputOverflow = false;
     const entries = ctx.sessionManager.getEntries();
     let destinationMembership: SessionGroupMembership | undefined;
     try {
@@ -310,9 +352,11 @@ export default function sessionGroups(pi: ExtensionAPI): void {
     let sourceMembership = consumeSessionGroupTransition(
       event,
       ctx.sessionManager.getSessionFile(),
+      ctx.sessionManager,
     );
     if (
       sourceMembership === undefined &&
+      !(event.reason === "startup" && effectiveDestinationMembership !== undefined) &&
       (event.reason === "new" ||
         event.reason === "fork" ||
         (event.reason === "startup" && ctx.sessionManager.getHeader()?.parentSession))
@@ -320,7 +364,7 @@ export default function sessionGroups(pi: ExtensionAPI): void {
       const path = sourceSessionFile(event, ctx);
       if (path) {
         try {
-          sourceMembership = readSessionGroupMembershipFromFile(path);
+          sourceMembership = await readSessionGroupMembershipFromFile(path);
         } catch (error) {
           notify(
             ctx,
@@ -423,7 +467,19 @@ export default function sessionGroups(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    currentUserAuthorization = authorizationStorage.getStore();
+    currentUserAuthorization = undefined;
+    pendingDelivery = undefined;
+    const idleInputs = pendingInputs.filter(({ streaming }) => !streaming);
+    // More than one outstanding input is ambiguous even with different text:
+    // a later transform could reproduce an earlier handled request verbatim.
+    if (
+      !inputOverflow && idleInputs.length === 1 &&
+      idleInputs[0]!.authorization.text === event.prompt &&
+      idleInputs[0]!.imageHash === fingerprintImages(event.images)
+    ) pendingDelivery = idleInputs[0];
+    // Keep streaming observations until actual delivery; idle observations are
+    // consumed together so handled/stale inputs cannot authorize a later run.
+    pendingInputs = pendingInputs.filter(({ streaming }) => streaming);
     if (currentGroupId === null) {
       // Other extensions and /tools can change the active set after startup.
       // Enforce zero Session Groups schema overhead at the provider boundary.
@@ -431,6 +487,7 @@ export default function sessionGroups(pi: ExtensionAPI): void {
       return;
     }
     if (currentContextSnapshot?.id === currentGroupId) {
+      warnContextOverhead(currentContextSnapshot, ctx);
       return {
         systemPrompt: appendSessionGroupContext(
           event.systemPrompt,
@@ -485,6 +542,7 @@ export default function sessionGroups(pi: ExtensionAPI): void {
       const snapshot = await store.reconcileContext(metadata.id);
       currentContextSnapshot = snapshot;
       present(ctx, metadata);
+      warnContextOverhead(snapshot, ctx);
       return {
         systemPrompt: appendSessionGroupContext(event.systemPrompt, snapshot),
       };
@@ -528,9 +586,8 @@ export default function sessionGroups(pi: ExtensionAPI): void {
   });
 
   pi.on("message_start", (event) => {
-    if (event.message.role !== "user" || pendingStreamingAuthorizations.length === 0) {
-      return;
-    }
+    if (event.message.role !== "user") return;
+    currentUserAuthorization = undefined;
     const messageText =
       typeof event.message.content === "string"
         ? event.message.content
@@ -538,30 +595,38 @@ export default function sessionGroups(pi: ExtensionAPI): void {
             .filter((block): block is { type: "text"; text: string } => block.type === "text")
             .map((block) => block.text)
             .join("\n");
-    const matchingIndexes = pendingStreamingAuthorizations.flatMap(
-      (authorization, index) => (authorization.text === messageText ? [index] : []),
-    );
-    if (matchingIndexes.length !== 1) {
-      currentUserAuthorization = undefined;
-      if (matchingIndexes.length === 0) {
-        pendingStreamingAuthorizations = [];
-      } else {
-        pendingStreamingAuthorizations = pendingStreamingAuthorizations.slice(
-          matchingIndexes[matchingIndexes.length - 1]! + 1,
-        );
-      }
-      return;
+    const candidates = [
+      ...(pendingDelivery ? [pendingDelivery] : []),
+      ...pendingInputs.filter(({ streaming }) => streaming),
+    ];
+    const images = typeof event.message.content === "string"
+      ? undefined
+      : event.message.content.filter((block) => block.type === "image");
+    if (
+      !inputOverflow && candidates.length === 1 &&
+      candidates[0]!.authorization.text === messageText &&
+      candidates[0]!.authorization.source !== "extension" &&
+      candidates[0]!.imageHash === fingerprintImages(images)
+    ) {
+      currentUserAuthorization = candidates[0]!.authorization;
     }
-    const matchIndex = matchingIndexes[0]!;
-    currentUserAuthorization = pendingStreamingAuthorizations[matchIndex];
-    pendingStreamingAuthorizations = pendingStreamingAuthorizations.slice(matchIndex + 1);
+    pendingDelivery = undefined;
+    // Without delivery IDs, multiple queued/handled/transformed observations
+    // cannot be safely disambiguated; consume them together and require fresh input.
+    pendingInputs = [];
+  });
+
+  pi.on("model_select", (_event, ctx) => {
+    if (currentContextSnapshot) warnContextOverhead(currentContextSnapshot, ctx);
   });
 
   pi.on("agent_settled", () => {
     currentContextSnapshot = undefined;
     unavailableContextSnapshot = undefined;
     currentUserAuthorization = undefined;
-    pendingStreamingAuthorizations = [];
+    pendingInputs = [];
+    pendingDelivery = undefined;
+    inputOverflow = false;
   });
 
   pi.on("session_shutdown", (event, ctx) => {
@@ -579,11 +644,17 @@ export default function sessionGroups(pi: ExtensionAPI): void {
     currentContextSnapshot = undefined;
     unavailableContextSnapshot = undefined;
     currentUserAuthorization = undefined;
-    pendingStreamingAuthorizations = [];
+    pendingInputs = [];
+    pendingDelivery = undefined;
+    inputOverflow = false;
+    if (event.reason === "new" && !event.targetSessionFile && currentGroupId !== null) {
+      notify(ctx, "Pi cannot safely correlate group inheritance across in-memory /new. Use /group join in the new session if no global active group is selected.", "warning");
+    }
     recordSessionGroupTransition(
       event,
       ctx.sessionManager.getSessionFile(),
       currentGroupId,
+      ctx.sessionManager,
     );
   });
 }

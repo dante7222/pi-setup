@@ -11,6 +11,12 @@ export const SESSION_GROUP_CONTEXT_MAX_BYTES = 64 * 1024;
 export const SESSION_GROUP_CHANGELOG_MAX_BYTES = 256 * 1024;
 export const SESSION_GROUP_CHANGELOG_TAIL_MAX_BYTES = 16 * 1024;
 export const SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES = 8 * 1024;
+export const SESSION_GROUP_CHANGELOG_PAGE_DEFAULT_BYTES = 4096;
+export const SESSION_GROUP_CHANGELOG_PAGE_DEFAULT_LINES = 1000;
+export const SESSION_GROUP_CHANGELOG_PAGE_MAX_BYTES = 16_384;
+export const SESSION_GROUP_CHANGELOG_PAGE_MAX_LINES = 2000;
+export const SESSION_GROUP_CHANGELOG_QUERY_MAX_LENGTH = 256;
+export const SESSION_GROUP_CHANGELOG_CURSOR_MAX_LENGTH = 2048;
 export const SESSION_GROUP_NAME_MAX_LENGTH = 80;
 
 const UUID_PATTERN =
@@ -53,7 +59,9 @@ export interface SessionGroupReference {
 
 export interface SessionGroupSummary extends SessionGroupReference {
   contextRevision: number;
-  contextBytes: number;
+  // A catalog observation, not a locked/validated context snapshot.
+  contextBytes: number | null;
+  contextError?: string;
   createdAt: string;
   updatedAt: string;
 }

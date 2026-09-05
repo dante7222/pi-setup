@@ -7,6 +7,15 @@ import sessionGroups from "../extensions/session-groups/index.ts";
 import { readSessionGroupMembership } from "../extensions/session-groups/membership.ts";
 import { SessionGroupStore } from "../extensions/session-groups/store.ts";
 
+async function startUserPrompt(handlers, ctx, prompt) {
+  const result = await handlers.get("before_agent_start")(
+    { prompt, systemPrompt: "base", systemPromptOptions: {} },
+    ctx,
+  );
+  await handlers.get("message_start")({ message: { role: "user", content: prompt, timestamp: Date.now() } }, ctx);
+  return result;
+}
+
 async function withExtension(run) {
   const directory = await mkdtemp(join(tmpdir(), "pi-session-groups-extension-"));
   const agentDirectory = join(directory, "agent");
@@ -151,7 +160,9 @@ test("exposes the context-edit tool only while the session is grouped", async ()
         parameters,
       })),
     );
-    assert.ok(Math.ceil(serializedGroupTools.length / 4) <= 210);
+    // Includes bounded changelog pagination; ungrouped sessions remove both schemas.
+    const estimatedSchemaTokens = Math.ceil(serializedGroupTools.length / 4);
+    assert.ok(estimatedSchemaTokens <= 320, `Grouped tool schemas use ~${estimatedSchemaTokens} tokens`);
     await handlers.get("session_start")({ reason: "startup" }, ctx);
     assert.deepEqual(activeTools, ["read", "bash"]);
 
@@ -288,6 +299,56 @@ test("refreshes and injects group context on every prompt without session copies
   });
 });
 
+test("warns once per model and shared content without truncation or snapshot refresh", async () => {
+  await withExtension(async ({ store, handlers, command, notifications, ctx }) => {
+    const group = await store.createGroup("partitioning");
+    await store.setActiveGroup(group.id);
+    await handlers.get("session_start")({ reason: "startup" }, ctx);
+    ctx.model = { provider: "test", id: "small", contextWindow: 8192 };
+    const content = "# partitioning\n" + "x".repeat(6000) + "\nEND MARKER\n";
+    await writeFile(store.contextPath(group.id), content);
+    const warnings = () => notifications.filter(({ type, message }) => type === "warning" && message.includes("tokens"));
+    const first = await startUserPrompt(handlers, ctx, "continue");
+    assert.match(first.systemPrompt, /END MARKER/);
+    assert.equal(warnings().length, 1);
+    assert.match(warnings()[0].message, /test\/small/);
+    await startUserPrompt(handlers, ctx, "retry");
+    await handlers.get("agent_settled")({}, ctx);
+    await startUserPrompt(handlers, ctx, "again");
+    assert.equal(warnings().length, 1);
+
+    ctx.model = { provider: "test", id: "large", contextWindow: 131072 };
+    await handlers.get("model_select")({ model: ctx.model }, ctx);
+    assert.equal(warnings().length, 1);
+    ctx.model = { provider: "test", id: "other-small", contextWindow: 8192 };
+    await handlers.get("model_select")({ model: ctx.model }, ctx);
+    assert.equal(warnings().length, 2);
+    await writeFile(store.contextPath(group.id), content + "new decision\n");
+    const stable = await startUserPrompt(handlers, ctx, "retry");
+    assert.doesNotMatch(stable.systemPrompt, /new decision/);
+    assert.equal(warnings().length, 2);
+    await handlers.get("agent_settled")({}, ctx);
+    const refreshed = await startUserPrompt(handlers, ctx, "next");
+    assert.match(refreshed.systemPrompt, /new decision/);
+    assert.equal(warnings().length, 3);
+    await command.handler("leave", ctx);
+    await startUserPrompt(handlers, ctx, "ungrouped");
+    assert.equal(warnings().length, 3);
+  });
+});
+
+test("stored destination membership avoids inspecting its source transcript", async () => {
+  await withExtension(async ({ store, entries, handlers, notifications, ctx }) => {
+    const group = await store.createGroup("destination");
+    entries.push({ type: "custom", customType: "ventris-session-group-membership", data: { version: 1, groupId: group.id } });
+    // An attempted source read would warn, making the regression observable.
+    ctx.sessionManager.getHeader = () => ({ parentSession: "/nonexistent/session-groups-parent.jsonl" });
+    await handlers.get("session_start")({ reason: "startup" }, ctx);
+    assert.equal(readSessionGroupMembership(entries).groupId, group.id);
+    assert.equal(notifications.some(({ message }) => message.includes("source-session")), false);
+  });
+});
+
 test("reads and appends the optional changelog only on demand", async () => {
   await withExtension(async ({
     store,
@@ -312,10 +373,7 @@ test("reads and appends the optional changelog only on demand", async () => {
 
     const request = "Add our completed backfill work to the group changelog.";
     await handlers.get("input")({ text: request, source: "interactive" }, ctx);
-    const before = await handlers.get("before_agent_start")(
-      { prompt: request, systemPrompt: "base", systemPromptOptions: {} },
-      ctx,
-    );
+    const before = await startUserPrompt(handlers, ctx, request);
     assert.doesNotMatch(before.systemPrompt, /Completed historical backfill/);
 
     confirmationAnswers.push(true);
@@ -456,10 +514,7 @@ test("agent tool requires current direct authorization and returns a visible dif
       },
       ctx,
     );
-    await handlers.get("before_agent_start")(
-      { prompt: "continue", systemPrompt: "base", systemPromptOptions: {} },
-      ctx,
-    );
+    await startUserPrompt(handlers, ctx, "Add the monthly partition decision to our shared group context.");
     confirmationAnswers.push(true);
     const result = await tool.execute(
       "tool-call",
@@ -513,17 +568,14 @@ test("agent tool rejects mismatched and extension-originated authorization", asy
       { text: "Continue implementation without changing shared context.", source: "interactive" },
       ctx,
     );
-    await handlers.get("before_agent_start")(
-      { prompt: "continue", systemPrompt: "base", systemPromptOptions: {} },
-      ctx,
-    );
+    await startUserPrompt(handlers, ctx, "Continue implementation without changing shared context.");
     const args = {
       userRequestQuote: "update shared context",
       edits: [{ oldText: "# partitioning\n", newText: "# partitioning\n\nMore\n" }],
     };
     await assert.rejects(
       tool.execute("tool-call", args, undefined, undefined, ctx),
-      /exact substring/,
+      /direct interactive or RPC user authorization/,
     );
 
     await handlers.get("agent_settled")({}, ctx);
@@ -531,10 +583,7 @@ test("agent tool rejects mismatched and extension-originated authorization", asy
       { text: "update shared context", source: "extension" },
       ctx,
     );
-    await handlers.get("before_agent_start")(
-      { prompt: "continue", systemPrompt: "base", systemPromptOptions: {} },
-      ctx,
-    );
+    await startUserPrompt(handlers, ctx, "update shared context");
     await assert.rejects(
       tool.execute("extension-tool-call", args, undefined, undefined, ctx),
       /direct interactive or RPC user authorization/,
@@ -552,10 +601,7 @@ test("requires confirmation when message wording contains negative intent", asyn
       { text: userMessage, source: "interactive" },
       ctx,
     );
-    await handlers.get("before_agent_start")(
-      { prompt: userMessage, systemPrompt: "base", systemPromptOptions: {} },
-      ctx,
-    );
+    await startUserPrompt(handlers, ctx, userMessage);
     const snapshot = await store.readContext(group.id);
 
     await assert.rejects(
@@ -594,10 +640,7 @@ test("associates streaming authorization only when its user message is delivered
       { text: "Continue normally.", source: "interactive" },
       ctx,
     );
-    await handlers.get("before_agent_start")(
-      { prompt: "continue", systemPrompt: "base", systemPromptOptions: {} },
-      ctx,
-    );
+    await startUserPrompt(handlers, ctx, "Continue normally.");
     await handlers.get("input")(
       {
         text: "Add a steering note to shared context.",
@@ -640,10 +683,7 @@ test("fails closed on ambiguous streaming authorization sources", async () => {
       { text: "Continue normally.", source: "interactive" },
       ctx,
     );
-    await handlers.get("before_agent_start")(
-      { prompt: "continue", systemPrompt: "base", systemPromptOptions: {} },
-      ctx,
-    );
+    await startUserPrompt(handlers, ctx, "Continue normally.");
     const text = "Add the same note to shared context.";
     await handlers.get("input")(
       { text, source: "interactive", streamingBehavior: "steer" },

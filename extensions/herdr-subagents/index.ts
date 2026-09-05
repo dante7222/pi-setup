@@ -1,9 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { cleanup, scopeFor, status } from "./core.ts";
+import { agentDirectory, cleanup, scopeFor, status } from "./core.ts";
 
 // No tools, prompt injections, polling, model calls, or automatic follow-up turns.
 export default function herdrSubagents(pi: ExtensionAPI): void {
   if (process.env.HERDR_ENV !== "1" || process.env.PI_HERDR_WORKER === "1") return;
+  // Anchor relative paths before a session switch changes cwd; shell tools inherit it.
+  process.env.PI_CODING_AGENT_DIR = agentDirectory();
   const finish = async (ctx: ExtensionContext, cancel = false) => {
     try {
       const closed = await cleanup(scopeFor(ctx.sessionManager.getSessionId()), cancel);

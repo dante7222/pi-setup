@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import childProcess, { spawn } from "node:child_process";
+import { once } from "node:events";
+import { syncBuiltinESMExports } from "node:module";
 import {
   chmod,
   mkdir,
@@ -21,6 +23,8 @@ import {
   SessionGroupLockManager,
   SessionGroupLockOrderError,
 } from "../extensions/session-groups/lock.ts";
+// A second module instance models reload without invoking Pi or user state.
+import { SessionGroupLockManager as ReloadedLockManager } from "../extensions/session-groups/lock.ts?lock-reload-test";
 import {
   SessionGroupAlreadyExistsError,
   SessionGroupContextConflictError,
@@ -457,6 +461,328 @@ test("serializes lock acquisition across real child processes", async () => {
     await chmod(directory, 0o700).catch(() => undefined);
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+async function withFailedRelease(manager, run) {
+  await manager.withCatalogLock("catalog", async () => undefined);
+  const writer = new DatabaseSync(manager.databasePath);
+  let staleHandle;
+  let startedAt;
+  try {
+    await assert.rejects(manager.withGroupLock(GROUP_ID, "agent-edit", async (handle) => {
+      staleHandle = handle;
+      startedAt = Date.now();
+      writer.exec("BEGIN IMMEDIATE");
+    }), /database is locked|SQLITE_BUSY/i);
+    assert.ok(Date.now() - startedAt >= 2_000, "writer outlasted the release deadline");
+    await run(writer, staleHandle);
+  } finally {
+    // Also rolls back if an assertion failed while the writer was held.
+    writer.close();
+  }
+}
+
+test("lock release recovers after writer contention exceeds two seconds without restarting Pi", async () => {
+  await withLocks(async ({ first, locksDirectory }) => {
+    const second = new ReloadedLockManager(locksDirectory);
+    await withFailedRelease(first, async (writer, staleHandle) => {
+      const row = writer.prepare("SELECT * FROM locks WHERE lock_key = ?")
+        .get(first.groupLockPath(GROUP_ID));
+      assert.equal(row.process_pid, process.pid);
+      assert.equal(row.process_incarnation, getProcessIncarnation(process.pid));
+      await assert.rejects(staleHandle.setEditorPid(process.pid), /no longer active/);
+
+      // Cancellation of a subsequent cleanup wait must not forget ownership.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20);
+      try {
+        await assert.rejects(first.withGroupLock(GROUP_ID, "context-read", async () => {
+          assert.fail("cancelled cleanup must not enter the operation");
+        }, { signal: controller.signal, waitMs: 10_000 }), { name: "AbortError" });
+      } finally {
+        clearTimeout(timer);
+      }
+      writer.exec("ROLLBACK");
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(writer.prepare("SELECT token FROM locks WHERE lock_key = ?")
+        .get(first.groupLockPath(GROUP_ID)).token, row.token,
+      "no autonomous background cleanup");
+
+      await withLocks(async ({ first: unrelated }) => {
+        await insertLockRow(unrelated, {
+          lockKey: row.lock_key, token: row.token,
+          processPid: row.process_pid, processIncarnation: row.process_incarnation,
+          editorPid: null, kind: row.kind, createdAt: row.created_at,
+        });
+        await assert.rejects(unrelated.withGroupLock(GROUP_ID, "agent-edit", async () => {},
+          { waitMs: 0 }), SessionGroupLockBusyError,
+        "retained cleanup authority is bound to its original database identity");
+      });
+
+      // Even a separately loaded module in this process retains cleanup authority.
+      await second.withGroupLock(GROUP_ID, "agent-edit", async () => {
+        await assert.rejects(first.withGroupLock(GROUP_ID, "agent-edit", async () => {},
+          { waitMs: 0 }), SessionGroupLockBusyError);
+        await assert.rejects(staleHandle.setEditorPid(null), /no longer active/);
+      }, { waitMs: 0 });
+      await first.withGroupLock(GROUP_ID, "context-read", async () => {}, { waitMs: 0 });
+      assert.equal(writer.prepare("SELECT COUNT(*) AS count FROM locks").get().count, 0);
+    });
+  });
+});
+
+for (const [field, replacement] of [
+  ["token", randomUUID()],
+  ["process_pid", 2_147_483_647],
+  ["process_incarnation", "different-incarnation"],
+]) {
+  test(`lock deferred cleanup cannot release a replacement ${field}`, async () => {
+    await withLocks(async ({ first, second }) => {
+      await withFailedRelease(first, async (writer) => {
+        writer.exec("ROLLBACK");
+        writer.prepare(`UPDATE locks SET ${field} = ? WHERE lock_key = ?`)
+          .run(replacement, first.groupLockPath(GROUP_ID));
+        // An unrelated operation retries cleanup, but has no stale-recovery
+        // authority over this group. All three ownership predicates must match.
+        await second.withCatalogLock("catalog", async () => {});
+        assert.equal(writer.prepare(`SELECT ${field} FROM locks WHERE lock_key = ?`)
+          .get(first.groupLockPath(GROUP_ID))[field], replacement);
+        await first.withCatalogLock("catalog", async () => {}, { waitMs: 0 });
+      });
+    });
+  });
+}
+
+test("lock cancellation prevents pre-aborted and waiting operations", async () => {
+  await withLocks(async ({ first, second }) => {
+    const preAborted = new AbortController();
+    preAborted.abort();
+    await assert.rejects(first.withCatalogLock("catalog", async () => {
+      assert.fail("pre-aborted operation ran");
+    }, { signal: preAborted.signal }), { name: "AbortError" });
+    await assert.rejects(readFile(first.databasePath), { code: "ENOENT" });
+
+    await first.withGroupLock(GROUP_ID, "agent-edit", async () => {
+      const controller = new AbortController();
+      const startedAt = Date.now();
+      const timer = setTimeout(() => controller.abort(), 20);
+      try {
+        await assert.rejects(second.withGroupLock(GROUP_ID, "agent-edit", async () => {
+          assert.fail("waiting operation ran after abort");
+        }, { signal: controller.signal, waitMs: 10_000 }), { name: "AbortError" });
+        assert.ok(Date.now() - startedAt < 1_000);
+      } finally {
+        clearTimeout(timer);
+      }
+      await assert.rejects(first.withGroupLock(GROUP_ID, "context-read", async () => {
+        assert.fail("pre-aborted reentrant operation ran");
+      }, { signal: preAborted.signal }), { name: "AbortError" });
+    });
+    await second.withGroupLock(GROUP_ID, "context-read", async () => {}, { waitMs: 0 });
+  });
+});
+
+test("lock bootstrap writer waits are cancellable and do not poison later initialization", async () => {
+  await withLocks(async ({ first, second }) => {
+    const writer = new DatabaseSync(first.databasePath);
+    writer.exec("BEGIN IMMEDIATE");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20);
+    const startedAt = Date.now();
+    try {
+      await assert.rejects(first.withCatalogLock("catalog", async () => {
+        assert.fail("bootstrap entered operation after abort");
+      }, { signal: controller.signal, waitMs: 10_000 }), { name: "AbortError" });
+      assert.ok(Date.now() - startedAt < 1_000);
+    } finally {
+      clearTimeout(timer);
+      writer.close();
+    }
+    await Promise.all([
+      first.withCatalogLock("catalog", async () => {}),
+      second.withCatalogLock("catalog", async () => {}),
+    ]);
+  });
+});
+
+test("lock cancellation at acquisition boundary releases without entering operation", async (t) => {
+  await withLocks(async ({ first, second }) => {
+    const controller = new AbortController();
+    const acquire = first.database.tryAcquire;
+    // Inject abort exactly after the SQLite acquisition commit, before withLock
+    // resumes. No timing-dependent race is needed to cover this boundary.
+    t.mock.method(first.database, "tryAcquire", async function (...args) {
+      const result = await acquire.apply(this, args);
+      if (result.acquired) controller.abort();
+      return result;
+    });
+    await assert.rejects(first.withGroupLock(GROUP_ID, "agent-edit", async () => {
+      assert.fail("operation entered after acquisition-boundary abort");
+    }, { signal: controller.signal }), { name: "AbortError" });
+    await second.withGroupLock(GROUP_ID, "context-read", async () => {}, { waitMs: 0 });
+  });
+});
+
+test("lock abort does not interrupt started operations, reentrant work, or contended release", async () => {
+  await withLocks(async ({ first, second }) => {
+    const controller = new AbortController();
+    let detached;
+    let writer;
+    let releaseTimer;
+    let childFinished = false;
+    try {
+      const result = await first.withGroupLock(GROUP_ID, "agent-edit", async () => {
+        detached = first.withGroupLock(GROUP_ID, "context-read", async () => {
+          controller.abort();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          await assert.rejects(second.withGroupLock(GROUP_ID, "agent-edit", async () => {},
+            { waitMs: 0 }), SessionGroupLockBusyError);
+          childFinished = true;
+        });
+        writer = new DatabaseSync(first.databasePath);
+        writer.exec("BEGIN IMMEDIATE");
+        releaseTimer = setTimeout(() => writer.exec("ROLLBACK"), 200);
+        return "committed";
+      }, { signal: controller.signal });
+      await detached;
+      assert.equal(result, "committed");
+      assert.equal(childFinished, true);
+      await second.withGroupLock(GROUP_ID, "context-read", async () => {}, { waitMs: 0 });
+    } finally {
+      clearTimeout(releaseTimer);
+      writer?.close();
+    }
+  });
+});
+
+test("lock acquisition caches its own incarnation instead of repeatedly invoking ps", async () => {
+  await withLocks(async ({ locksDirectory }) => {
+    const script = `
+      import childProcess from "node:child_process";
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      import { SessionGroupLockManager, getProcessIncarnation } from ${JSON.stringify(new URL(
+        "../extensions/session-groups/lock.ts", import.meta.url,
+      ).href)};
+      let probes = 0;
+      const originalPs = childProcess.execFileSync;
+      childProcess.execFileSync = (...args) => {
+        if (args[0] === "/bin/ps") probes++;
+        return originalPs(...args);
+      };
+      const originalRead = fs.readFileSync;
+      fs.readFileSync = (...args) => {
+        if (args[0] === "/proc/" + process.pid + "/stat") probes++;
+        return originalRead(...args);
+      };
+      syncBuiltinESMExports();
+      const identity = getProcessIncarnation(process.pid);
+      const manager = new SessionGroupLockManager(process.env.LOCKS);
+      for (let i = 0; i < 30; i++) {
+        await manager.withCatalogLock("catalog", async () => {});
+        if (getProcessIncarnation(process.pid) !== identity) throw new Error("identity changed");
+      }
+      console.log(JSON.stringify({ probes }));
+    `;
+    const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning",
+      "--experimental-strip-types", "--input-type=module", "-e", script], {
+      env: { ...process.env, LOCKS: locksDirectory }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const [code] = await once(child, "close");
+    assert.equal(code, 0, stderr);
+    assert.equal(JSON.parse(stdout).probes, 1);
+  });
+});
+
+test("lock protects an external live Zed after Pi exits and reclaims only after Zed exits", async () => {
+  await withLocks(async ({ first }) => {
+    const child = spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000)"], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const exited = once(child, "close");
+    const previousTimezone = process.env.TZ;
+    try {
+      await once(child.stdout, "data");
+      process.env.TZ = "UTC";
+      const incarnation = getProcessIncarnation(child.pid);
+      process.env.TZ = "America/New_York";
+      assert.equal(getProcessIncarnation(child.pid), incarnation,
+        "uncached external process identity is timezone independent too");
+      assert.equal(typeof incarnation, "string");
+      await insertLockRow(first, {
+        lockKey: first.groupLockPath(GROUP_ID), token: randomUUID(),
+        processPid: 2_147_483_647, editorPid: child.pid,
+        editorIncarnation: incarnation, kind: "zed-edit", createdAt: new Date().toISOString(),
+      });
+      await assert.rejects(first.withGroupLock(GROUP_ID, "context-read", async () => {},
+        { waitMs: 0 }), /editor/);
+      child.kill();
+      await exited;
+      await first.withGroupLock(GROUP_ID, "context-read", async () => {}, { waitMs: 0 });
+    } finally {
+      if (previousTimezone === undefined) delete process.env.TZ;
+      else process.env.TZ = previousTimezone;
+      child.kill();
+      await exited;
+    }
+  });
+});
+
+test("lock external identity probes run outside writer transactions and revalidate Zed changes", {
+  skip: process.platform !== "darwin",
+}, async (t) => {
+  await withLocks(async ({ first, second }) => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    let continueProbe;
+    const probeStarted = Promise.withResolvers();
+    const mock = t.mock.method(childProcess, "execFile", (_file, args, _options, callback) => {
+      assert.equal(args.at(-1), String(child.pid));
+      continueProbe = () => callback(null, "new-incarnation", "");
+      probeStarted.resolve();
+    });
+    syncBuiltinESMExports();
+    let acquiring;
+    try {
+      await insertLockRow(first, {
+        lockKey: first.groupLockPath(GROUP_ID), token: randomUUID(),
+        processPid: child.pid, processIncarnation: "old-incarnation",
+        editorPid: null, kind: "zed-edit", createdAt: new Date().toISOString(),
+      });
+      acquiring = second.withGroupLock(GROUP_ID, "context-read", async () => {
+        assert.fail("stale snapshot stole a newly Zed-protected lock");
+      }, { waitMs: 0 });
+      const rejected = assert.rejects(acquiring, SessionGroupLockBusyError);
+      await probeStarted.promise;
+      const writer = new DatabaseSync(first.databasePath);
+      try {
+        // This must succeed while the external probe is still pending.
+        writer.exec("BEGIN IMMEDIATE");
+        writer.prepare("UPDATE locks SET editor_pid = ?, editor_incarnation = ? WHERE lock_key = ?")
+          .run(process.pid, getProcessIncarnation(process.pid), first.groupLockPath(GROUP_ID));
+        writer.exec("COMMIT");
+      } finally {
+        writer.close();
+      }
+      continueProbe();
+      await rejected;
+      await assert.rejects(first.withGroupLock(GROUP_ID, "agent-edit", async () => {},
+        { signal: AbortSignal.abort(), waitMs: 0 }), { name: "AbortError" });
+    } finally {
+      continueProbe?.();
+      await acquiring?.catch(() => {});
+      mock.mock.restore();
+      syncBuiltinESMExports();
+      const exited = once(child, "close");
+      child.kill();
+      await exited;
+    }
+  });
 });
 
 test("initializes and resolves active membership while Zed owns the group lock", async () => {

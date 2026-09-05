@@ -2,12 +2,9 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import {
-  DynamicBorder,
-  getMarkdownTheme,
-} from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Text } from "@earendil-works/pi-tui";
 import type { SessionGroupMetadata } from "./contracts.ts";
+import { estimateSessionGroupContextTokens } from "./context.ts";
+import { createSessionGroupMarkdownViewer } from "./viewer.ts";
 import {
   editSessionGroupContextInZed,
   type SessionGroupEditorPidHandler,
@@ -105,28 +102,13 @@ async function showMarkdown(
     return;
   }
 
-  await ctx.ui.custom((_tui, theme, keybindings, done) => {
-    const container = new Container();
-    container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-    container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
-    container.addChild(new Markdown(markdown, 1, 1, getMarkdownTheme()));
-    container.addChild(
-      new Text(theme.fg("dim", "Use the configured confirm or cancel key to close"), 1, 0),
-    );
-    container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-    return {
-      render: (width: number) => container.render(width),
-      invalidate: () => container.invalidate(),
-      handleInput: (data: string) => {
-        if (
-          keybindings.matches(data, "tui.select.confirm") ||
-          keybindings.matches(data, "tui.select.cancel")
-        ) {
-          done(undefined);
-        }
-      },
-    };
-  });
+  // A focused overlay owns page keys in fullscreen mode; an editor replacement
+  // loses them to the transcript's viewport handler before handleInput runs.
+  await ctx.ui.custom(
+    (tui, theme, keybindings, done) =>
+      createSessionGroupMarkdownViewer(tui, theme, keybindings, () => done(undefined), title, markdown),
+    { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%" } },
+  );
 }
 
 async function currentGroup(
@@ -291,7 +273,7 @@ async function showGroup(
   const snapshot = await store.readContext(group.id);
   await showMarkdown(
     ctx,
-    `${group.name} — revision ${snapshot.revision}, ${snapshot.bytes} bytes`,
+    `${group.name} — revision ${snapshot.revision}, ${snapshot.bytes} bytes, ~${estimateSessionGroupContextTokens(snapshot)} prompt tokens`,
     snapshot.content,
   );
 }
@@ -314,7 +296,8 @@ async function listGroups(
       group.id === active?.id ? "active" : undefined,
     ].filter((marker): marker is string => marker !== undefined);
     const suffix = markers.length > 0 ? ` — ${markers.join(", ")}` : "";
-    return `- **${group.name}**${suffix}\n  - ID: \`${group.id}\`\n  - Context: revision ${group.contextRevision}, ${group.contextBytes} bytes`;
+    const contextSize = group.contextBytes === null ? "unavailable" : `${group.contextBytes} bytes`;
+    return `- **${group.name}**${suffix}\n  - ID: \`${group.id}\`\n  - Context: revision ${group.contextRevision}, ${contextSize}`;
   });
   await showMarkdown(ctx, "Session groups", lines.join("\n"));
 }
@@ -564,6 +547,7 @@ export function registerSessionGroupCommands(
 ): void {
   const editContextInZed =
     dependencies.editContextInZed ?? editSessionGroupContextInZed;
+  let completionScan: ReturnType<SessionGroupStore["listGroups"]> | undefined;
   pi.registerCommand("group", {
     description: "Create, join, edit, and manage shared session groups and changelogs",
     getArgumentCompletions: async (prefix) => {
@@ -584,7 +568,10 @@ export function registerSessionGroupCommands(
         return null;
       }
       try {
-        const groups = await store.listGroups();
+        // Coalesce overlapping keystrokes, but do not retain a stale name cache
+        // after the scan: another Pi process may rename a group at any time.
+        completionScan ??= store.listGroups().finally(() => { completionScan = undefined; });
+        const groups = await completionScan;
         const values = [
           ...(operation === "active" ? ["status", "off"] : []),
           ...groups.map((group) => group.name),

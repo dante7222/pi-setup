@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, readFileSync, lstatSync } from "node:fs";
 import {
@@ -7,12 +7,14 @@ import {
   lstat,
   mkdir,
   open,
+  readFile,
   rename,
   rm,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { platform } from "node:os";
 import { DatabaseSync } from "node:sqlite";
+import { setTimeout as delay } from "node:timers/promises";
 
 const LOCK_DIRECTORY_MODE = 0o700;
 const DEFAULT_WAIT_MS = 2_000;
@@ -97,18 +99,50 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+interface LockProcessState {
+  pid: number;
+  incarnation?: string;
+  pendingReleases: Map<string, Map<string, LockOwner>>;
+}
+
+// Passive process-scoped data must survive extension reloads: losing a failed
+// release token while Pi is still alive would strand the row again. Do not keep
+// timers, handles, connections, or external-PID identity caches in this registry.
+const processStateKey = Symbol.for("pi.session-groups.lock-process-state.v1");
+const processScope = globalThis as typeof globalThis & {
+  [processStateKey]?: LockProcessState;
+};
+const previousProcessState = processScope[processStateKey];
+const lockProcessState: LockProcessState = previousProcessState?.pid === process.pid
+  ? previousProcessState
+  : { pid: process.pid, pendingReleases: new Map() };
+processScope[processStateKey] = lockProcessState;
+
+function linuxIncarnation(stat: string, bootId: string): string | undefined {
+  const commandEnd = stat.lastIndexOf(")");
+  if (commandEnd === -1) return undefined;
+  const startTicks = stat.slice(commandEnd + 2).trim().split(/\s+/)[19];
+  return startTicks ? `linux:${bootId.trim()}:${startTicks}` : undefined;
+}
+
 export function getProcessIncarnation(pid: number): string | undefined {
+  if (pid === process.pid && lockProcessState.incarnation !== undefined) {
+    return lockProcessState.incarnation;
+  }
+  const incarnation = probeProcessIncarnation(pid);
+  if (pid === process.pid && incarnation !== undefined) {
+    lockProcessState.incarnation = incarnation;
+  }
+  return incarnation;
+}
+
+function probeProcessIncarnation(pid: number): string | undefined {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
   try {
     if (platform() === "linux") {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const commandEnd = stat.lastIndexOf(")");
-      if (commandEnd === -1) return undefined;
-      const fieldsAfterCommand = stat.slice(commandEnd + 2).trim().split(/\s+/);
-      const startTicks = fieldsAfterCommand[19];
-      if (!startTicks) return undefined;
-      const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-      return `linux:${bootId}:${startTicks}`;
+      const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8");
+      return linuxIncarnation(stat, bootId);
     }
     if (platform() === "darwin") {
       const startedAt = execFileSync(
@@ -137,6 +171,68 @@ export function processMatchesIncarnation(
   if (expectedIncarnation === null) return true;
   const actualIncarnation = getProcessIncarnation(pid);
   return actualIncarnation === undefined || actualIncarnation === expectedIncarnation;
+}
+
+async function getProcessIncarnationAsync(
+  pid: number,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  signal?.throwIfAborted();
+  if (pid === process.pid) return getProcessIncarnation(pid);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  try {
+    if (platform() === "linux") {
+      const stat = await readFile(`/proc/${pid}/stat`, { encoding: "utf8", signal });
+      const bootId = await readFile("/proc/sys/kernel/random/boot_id", {
+        encoding: "utf8", signal,
+      });
+      return linuxIncarnation(stat, bootId);
+    }
+    if (platform() === "darwin") {
+      const startedAt = await new Promise<string>((resolve, reject) => {
+        execFile("/bin/ps", ["-o", "lstart=", "-p", String(pid)], {
+          encoding: "utf8",
+          env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+          timeout: 1_000,
+          signal,
+        }, (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
+      });
+      return startedAt ? `darwin:${startedAt}` : undefined;
+    }
+  } catch {
+    signal?.throwIfAborted();
+  }
+  return undefined;
+}
+
+async function processMatchesIncarnationAsync(
+  pid: number,
+  expectedIncarnation: string | null,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  signal?.throwIfAborted();
+  if (!processIsAlive(pid)) return false;
+  if (expectedIncarnation === null) return true;
+  const actual = await getProcessIncarnationAsync(pid, signal);
+  // An inaccessible or timed-out probe must never authorize stealing a live lock.
+  return actual === undefined || actual === expectedIncarnation;
+}
+
+async function waitForInitialization(
+  initialization: Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!signal) return initialization;
+  signal.throwIfAborted();
+  // Bootstrap publication is atomic and shared by concurrent callers. Cancel the
+  // caller's wait, not another caller's initialization or a publication in progress.
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    initialization.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -220,6 +316,11 @@ async function fsyncDirectory(path: string): Promise<void> {
   }
 }
 
+// Failed releases are explicit cleanup authority, not evidence that arbitrary
+// locks owned by this PID are stale. Share only these records across managers,
+// bound to the original inode AND namespace; keep no timers or connections here.
+const pendingReleases = lockProcessState.pendingReleases;
+
 class LockDatabase {
   readonly path: string;
   readonly identityPath: string;
@@ -232,15 +333,27 @@ class LockDatabase {
     this.identityPath = `${path}.identity.json`;
   }
 
-  async initialize(_timeout: number): Promise<void> {
-    if (!this.initialization) {
-      this.initialization = this.initializeOnce().catch((error: unknown) => {
-        this.initialization = undefined;
-        throw error;
-      });
+  async initialize(timeout: number, signal?: AbortSignal): Promise<void> {
+    const deadline = Date.now() + Math.max(0, timeout);
+    while (true) {
+      signal?.throwIfAborted();
+      if (!this.initialization) {
+        this.initialization = this.initializeOnce().catch((error: unknown) => {
+          this.initialization = undefined;
+          throw error;
+        });
+      }
+      try {
+        await waitForInitialization(this.initialization, signal);
+        signal?.throwIfAborted();
+        this.assertBoundDatabase();
+        return;
+      } catch (error) {
+        signal?.throwIfAborted();
+        if (!isSqliteBusy(error) || Date.now() >= deadline) throw error;
+        await delay(RETRY_MS, undefined, { signal });
+      }
     }
-    await this.initialization;
-    this.assertBoundDatabase();
   }
 
   private async initializeOnce(): Promise<void> {
@@ -342,89 +455,86 @@ class LockDatabase {
   }
 
   private async recoverBootstrapIdentity(): Promise<LockDatabaseIdentity> {
-    const deadline = Date.now() + DEFAULT_WAIT_MS;
-    while (true) {
-      let database: DatabaseSync | undefined;
+    // One attempt only: initialize() owns bounded, cancellable contention waits.
+    let database: DatabaseSync | undefined;
+    try {
+      await this.assertPrivateDatabaseFile();
+      database = new DatabaseSync(this.path, { timeout: SQLITE_TIMEOUT_MS });
+      database.exec("PRAGMA synchronous = FULL;");
+      database.exec("BEGIN IMMEDIATE");
+      let namespace: string;
       try {
-        await this.assertPrivateDatabaseFile();
-        database = new DatabaseSync(this.path, { timeout: SQLITE_TIMEOUT_MS });
-        database.exec("PRAGMA synchronous = FULL;");
-        database.exec("BEGIN IMMEDIATE");
-        let namespace: string;
-        try {
-          database.exec(`
-            CREATE TABLE IF NOT EXISTS lock_metadata (
-              key TEXT PRIMARY KEY,
-              value TEXT NOT NULL
-            ) STRICT;
-            CREATE TABLE IF NOT EXISTS locks (
-              lock_key TEXT PRIMARY KEY,
-              token TEXT NOT NULL,
-              process_pid INTEGER NOT NULL,
-              process_incarnation TEXT NOT NULL,
-              editor_pid INTEGER,
-              editor_incarnation TEXT,
-              kind TEXT NOT NULL,
-              created_at TEXT NOT NULL
-            ) STRICT;
-          `);
-          database
-            .prepare(
-              "INSERT OR IGNORE INTO lock_metadata(key, value) VALUES ('namespace', ?)",
-            )
-            .run(randomUUID());
-          database
-            .prepare(
-              "INSERT OR IGNORE INTO lock_metadata(key, value) VALUES ('bootstrap_complete', '0')",
-            )
-            .run();
-          const rows = database
-            .prepare(
-              "SELECT key, value FROM lock_metadata WHERE key IN ('namespace', 'bootstrap_complete')",
-            )
-            .all();
-          const metadata = new Map<string, string>();
-          for (const row of rows) {
-            if (isRecord(row) && typeof row.key === "string" && typeof row.value === "string") {
-              metadata.set(row.key, row.value);
-            }
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS lock_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+          ) STRICT;
+          CREATE TABLE IF NOT EXISTS locks (
+            lock_key TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            process_pid INTEGER NOT NULL,
+            process_incarnation TEXT NOT NULL,
+            editor_pid INTEGER,
+            editor_incarnation TEXT,
+            kind TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          ) STRICT;
+        `);
+        database
+          .prepare(
+            "INSERT OR IGNORE INTO lock_metadata(key, value) VALUES ('namespace', ?)",
+          )
+          .run(randomUUID());
+        database
+          .prepare(
+            "INSERT OR IGNORE INTO lock_metadata(key, value) VALUES ('bootstrap_complete', '0')",
+          )
+          .run();
+        const rows = database
+          .prepare(
+            "SELECT key, value FROM lock_metadata WHERE key IN ('namespace', 'bootstrap_complete')",
+          )
+          .all();
+        const metadata = new Map<string, string>();
+        for (const row of rows) {
+          if (isRecord(row) && typeof row.key === "string" && typeof row.value === "string") {
+            metadata.set(row.key, row.value);
           }
-          const storedNamespace = metadata.get("namespace");
-          if (!storedNamespace || !GROUP_ID_PATTERN.test(storedNamespace)) {
-            throw new Error(`Session-group lock database namespace is invalid: ${this.path}`);
-          }
-          if (metadata.get("bootstrap_complete") !== "0") {
-            throw new Error(
-              `Session-group lock identity is missing after completed bootstrap: ${this.identityPath}`,
-            );
-          }
-          namespace = storedNamespace;
-          database.exec("COMMIT");
-        } catch (error) {
-          database.exec("ROLLBACK");
-          throw error;
         }
-        database.close();
-        database = undefined;
-
-        const identity: LockDatabaseIdentity = {
-          ...databaseIdentityFromStat(this.path),
-          namespace,
-        };
-        await this.publishIdentity(identity);
-        return identity;
+        const storedNamespace = metadata.get("namespace");
+        if (!storedNamespace || !GROUP_ID_PATTERN.test(storedNamespace)) {
+          throw new Error(`Session-group lock database namespace is invalid: ${this.path}`);
+        }
+        if (metadata.get("bootstrap_complete") !== "0") {
+          throw new Error(
+            `Session-group lock identity is missing after completed bootstrap: ${this.identityPath}`,
+          );
+        }
+        namespace = storedNamespace;
+        database.exec("COMMIT");
       } catch (error) {
-        database?.close();
-        try {
-          return await this.readIdentity();
-        } catch (identityError) {
-          if (!isNodeError(identityError) || identityError.code !== "ENOENT") {
-            throw identityError;
-          }
-        }
-        if (!isSqliteBusy(error) || Date.now() >= deadline) throw error;
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, RETRY_MS));
+        database.exec("ROLLBACK");
+        throw error;
       }
+      database.close();
+      database = undefined;
+
+      const identity: LockDatabaseIdentity = {
+        ...databaseIdentityFromStat(this.path),
+        namespace,
+      };
+      await this.publishIdentity(identity);
+      return identity;
+    } catch (error) {
+      database?.close();
+      try {
+        return await this.readIdentity();
+      } catch (identityError) {
+        if (!isNodeError(identityError) || identityError.code !== "ENOENT") {
+          throw identityError;
+        }
+      }
+      throw error;
     }
   }
 
@@ -473,28 +583,45 @@ class LockDatabase {
     this.assertBoundDatabase();
   }
 
-  tryAcquire(owner: LockOwner): { acquired: boolean; owner: LockOwner | undefined } {
+  private readOwner(lockKey: string): LockOwner | undefined {
+    const database = this.assertBoundDatabase();
+    try {
+      return lockOwnerFromRow(database.prepare(
+        `SELECT lock_key, token, process_pid, process_incarnation,
+                editor_pid, editor_incarnation, kind, created_at
+           FROM locks WHERE lock_key = ?`,
+      ).get(lockKey));
+    } finally {
+      this.finishDatabaseOperation();
+    }
+  }
+
+  async tryAcquire(
+    owner: LockOwner,
+    signal?: AbortSignal,
+  ): Promise<{ acquired: boolean; owner: LockOwner | undefined }> {
+    const observed = this.readOwner(owner.lockKey);
+    // Probe outside the writer transaction. A dead incarnation cannot revive,
+    // but the row (including its Zed identity) can change while we await ps.
+    if (observed && (
+      await processMatchesIncarnationAsync(
+        observed.processPid, observed.processIncarnation, signal,
+      ) || (observed.editorPid !== null && await processMatchesIncarnationAsync(
+        observed.editorPid, observed.editorIncarnation, signal,
+      ))
+    )) {
+      return { acquired: false, owner: observed };
+    }
+    signal?.throwIfAborted();
     const database = this.assertBoundDatabase();
     try {
       database.exec("BEGIN IMMEDIATE");
       try {
-        const current = lockOwnerFromRow(
-          database
-            .prepare(
-              `SELECT lock_key, token, process_pid, process_incarnation,
-                      editor_pid, editor_incarnation, kind, created_at
-                 FROM locks WHERE lock_key = ?`,
-            )
-            .get(owner.lockKey),
-        );
-        const processOwnsLock =
-          current !== undefined &&
-          processMatchesIncarnation(current.processPid, current.processIncarnation);
-        const editorOwnsLock =
-          current?.editorPid !== null &&
-          current?.editorPid !== undefined &&
-          processMatchesIncarnation(current.editorPid, current.editorIncarnation);
-        if (current && (processOwnsLock || editorOwnsLock)) {
+        const current = this.readOwner(owner.lockKey);
+        // Compare the entire snapshot under SQLite's writer exclusion before
+        // relying on the liveness result. In particular, token alone is not
+        // enough: setEditorPid changes protection without changing the token.
+        if (JSON.stringify(current) !== JSON.stringify(observed)) {
           database.exec("COMMIT");
           return { acquired: false, owner: current };
         }
@@ -541,9 +668,11 @@ class LockDatabase {
       const result = database
         .prepare(
           `UPDATE locks SET editor_pid = ?, editor_incarnation = ?
-            WHERE lock_key = ? AND token = ?`,
+            WHERE lock_key = ? AND token = ?
+              AND process_pid = ? AND process_incarnation = ?`,
         )
-        .run(editorPid, editorIncarnation, owner.lockKey, owner.token);
+        .run(editorPid, editorIncarnation, owner.lockKey, owner.token,
+          owner.processPid, owner.processIncarnation);
       if (Number(result.changes) !== 1) {
         throw new Error(`Session-group lock ownership changed: ${owner.lockKey}`);
       }
@@ -552,13 +681,41 @@ class LockDatabase {
     }
   }
 
-  release(owner: LockOwner): void {
+  retainRelease(owner: LockOwner): void {
+    const key = JSON.stringify(this.identity);
+    let owners = pendingReleases.get(key);
+    if (!owners) {
+      owners = new Map();
+      pendingReleases.set(key, owners);
+    }
+    owners.set(owner.token, { ...owner });
+  }
+
+  retryPendingReleases(): void {
+    this.assertBoundDatabase();
+    const key = JSON.stringify(this.identity);
+    const owners = pendingReleases.get(key);
+    if (!owners) return;
+    for (const [token, owner] of owners) {
+      if (owner.processPid === process.pid &&
+          owner.processIncarnation === getProcessIncarnation(process.pid)) {
+        // Missing or replaced rows already relinquished our ownership. Never
+        // delete a different token/process, and never poison future acquisitions.
+        this.release(owner, true);
+      }
+      owners.delete(token);
+    }
+    if (owners.size === 0) pendingReleases.delete(key);
+  }
+
+  release(owner: LockOwner, allowMissing = false): void {
     const database = this.assertBoundDatabase();
     try {
       const result = database
-        .prepare("DELETE FROM locks WHERE lock_key = ? AND token = ?")
-        .run(owner.lockKey, owner.token);
-      if (Number(result.changes) !== 1) {
+        .prepare(`DELETE FROM locks WHERE lock_key = ? AND token = ?
+                    AND process_pid = ? AND process_incarnation = ?`)
+        .run(owner.lockKey, owner.token, owner.processPid, owner.processIncarnation);
+      if (Number(result.changes) !== 1 && !allowMissing) {
         throw new Error(`Session-group lock ownership changed before release: ${owner.lockKey}`);
       }
     } finally {
@@ -610,7 +767,7 @@ class LockHandle implements SessionGroupLockHandle {
     if (!this.active) throw new Error(`Session-group lock is no longer active: ${this.path}`);
     let editorIncarnation: string | null = null;
     if (pid !== null) {
-      const detectedIncarnation = getProcessIncarnation(pid);
+      const detectedIncarnation = await getProcessIncarnationAsync(pid);
       if (detectedIncarnation === undefined) {
         throw new Error(`Could not identify the Zed process incarnation: ${pid}`);
       }
@@ -618,6 +775,7 @@ class LockHandle implements SessionGroupLockHandle {
     }
     const deadline = Date.now() + DEFAULT_WAIT_MS;
     while (true) {
+      if (!this.active) throw new Error(`Session-group lock is no longer active: ${this.path}`);
       try {
         this.database.updateEditorPid(this.owner, pid, editorIncarnation);
         this.owner.editorPid = pid;
@@ -638,6 +796,8 @@ interface HeldLock {
 
 export interface SessionGroupLockOptions {
   waitMs?: number;
+  /** Cancels acquisition/waits, not an operation that has already started. */
+  signal?: AbortSignal;
 }
 
 export class SessionGroupLockManager {
@@ -709,8 +869,11 @@ export class SessionGroupLockManager {
     operation: (handle: SessionGroupLockHandle) => Promise<T>,
     options?: SessionGroupLockOptions,
   ): Promise<T> {
+    const signal = options?.signal;
+    signal?.throwIfAborted();
     await mkdir(this.locksDirectory, { recursive: true, mode: LOCK_DIRECTORY_MODE });
-    await this.database.initialize(options?.waitMs ?? DEFAULT_WAIT_MS);
+    await this.database.initialize(options?.waitMs ?? DEFAULT_WAIT_MS, signal);
+    signal?.throwIfAborted();
     const inherited = this.heldLocks.getStore();
     const existing = inherited?.get(path);
     if (existing?.handle.active) {
@@ -740,15 +903,26 @@ export class SessionGroupLockManager {
       kind,
       rootFrame,
       options?.waitMs ?? DEFAULT_WAIT_MS,
+      signal,
     );
     const held = new Map(inherited);
     held.set(path, { handle, frame: rootFrame });
     try {
+      // Acquisition may have completed just as cancellation arrived. Release
+      // even in that case, but never start the store's atomic operation.
+      signal?.throwIfAborted();
       return await this.heldLocks.run(held, () => operation(handle));
     } finally {
       await handle.waitForReentrantOperations();
       handle.active = false;
-      await this.release(handle.owner);
+      try {
+        // Deliberately not cancellable: started operations and their cleanup
+        // must finish even when the turn is aborted.
+        await this.release(handle.owner);
+      } catch (error) {
+        this.database.retainRelease(handle.owner);
+        throw error;
+      }
     }
   }
 
@@ -757,6 +931,7 @@ export class SessionGroupLockManager {
     kind: SessionGroupLockKind,
     rootFrame: symbol,
     waitMs: number,
+    signal?: AbortSignal,
   ): Promise<LockHandle> {
     const deadline = Date.now() + Math.max(0, waitMs);
     let lastOwner: LockOwner | undefined;
@@ -765,6 +940,7 @@ export class SessionGroupLockManager {
       throw new Error(`Could not identify the current process incarnation: ${process.pid}`);
     }
     while (true) {
+      signal?.throwIfAborted();
       const owner: LockOwner = {
         lockKey: path,
         token: randomUUID(),
@@ -777,7 +953,8 @@ export class SessionGroupLockManager {
       };
       let result: { acquired: boolean; owner: LockOwner | undefined };
       try {
-        result = this.database.tryAcquire(owner);
+        this.database.retryPendingReleases();
+        result = await this.database.tryAcquire(owner, signal);
       } catch (error) {
         if (!isSqliteBusy(error)) throw error;
         result = { acquired: false, owner: lastOwner };
@@ -785,9 +962,10 @@ export class SessionGroupLockManager {
       if (result.acquired) {
         return new LockHandle(path, owner, this.database, rootFrame);
       }
+      signal?.throwIfAborted();
       lastOwner = result.owner;
       if (Date.now() >= deadline) throw new SessionGroupLockBusyError(path, lastOwner);
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, RETRY_MS));
+      await delay(RETRY_MS, undefined, { signal });
     }
   }
 

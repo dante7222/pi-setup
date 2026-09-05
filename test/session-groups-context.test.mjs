@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   appendSessionGroupContext,
   appendUnavailableSessionGroupContext,
+  estimateSessionGroupContextTokens,
 } from "../extensions/session-groups/context.ts";
 
 const snapshot = {
@@ -33,7 +34,7 @@ test("appends complete scoped context and explicit-update policy", () => {
 });
 
 test("keeps compact context boundaries collision-safe", () => {
-  const boundary = "PI_SG_AAAAAAAAAAAA";
+  const boundary = "PI_SG_CONTEXT";
   const prompt = appendSessionGroupContext("base prompt", {
     ...snapshot,
     content: `A context value mentions ${boundary}.\n`,
@@ -42,6 +43,16 @@ test("keeps compact context boundaries collision-safe", () => {
   assert.match(prompt, new RegExp(`-----BEGIN ${boundary}_1-----`));
   assert.match(prompt, new RegExp(`-----END ${boundary}_1-----`));
   assert.match(prompt, new RegExp(`mentions ${boundary}`));
+});
+
+test("trailing edits preserve the full unchanged prompt prefix", () => {
+  const before = { ...snapshot, content: `${"shared guidance\n".repeat(4000)}before\n` };
+  const after = { ...before, content: before.content.replace(/before\n$/, "after\n"), sha256: "b".repeat(64) };
+  const first = appendSessionGroupContext("base", before);
+  const second = appendSessionGroupContext("base", after);
+  const unchanged = first.indexOf("before\n");
+  assert.equal(first.slice(0, unchanged), second.slice(0, unchanged));
+  assert.equal(estimateSessionGroupContextTokens(before), Math.ceil(appendSessionGroupContext("", before).length / 4));
 });
 
 test("appends only a short warning when shared context is unavailable", () => {

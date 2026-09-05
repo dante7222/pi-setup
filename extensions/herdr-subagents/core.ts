@@ -33,6 +33,7 @@ export interface Job {
   pane?: string;
   terminal?: string;
   launched?: boolean;
+  creating?: boolean;
   closed?: boolean;
   endedAt?: number;
   cursor: number;
@@ -44,6 +45,7 @@ export interface Completion {
   report: string;
   error?: string;
   exitCode?: number | null;
+  cleanupError?: string;
 }
 interface Pane { pane_id: string; terminal_id: string }
 interface Rect { width: number; height: number }
@@ -55,6 +57,12 @@ export interface Scope {
   env: NodeJS.ProcessEnv;
 }
 
+export function agentDirectory(env = process.env): string {
+  const path = env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  if (path.startsWith("file://")) return fileURLToPath(path);
+  return resolve(path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path);
+}
+
 export function scopeFor(session = process.env.PI_SESSION_ID, env = process.env): Scope {
   if (env.PI_HERDR_WORKER === "1") throw new Error("Subagents cannot spawn or control subagents.");
   if (env.HERDR_ENV !== "1" || !env.HERDR_SOCKET_PATH || !env.HERDR_PANE_ID || !env.HERDR_WORKSPACE_ID || !session) {
@@ -62,19 +70,21 @@ export function scopeFor(session = process.env.PI_SESSION_ID, env = process.env)
   }
   const key = createHash("sha256").update(JSON.stringify([env.HERDR_SOCKET_PATH, env.HERDR_PANE_ID, session])).digest("hex").slice(0, 24);
   return {
-    root: join(resolve(env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent")), "herdr-subagents", key),
+    root: join(agentDirectory(env), "herdr-subagents", key),
     pane: env.HERDR_PANE_ID, workspace: env.HERDR_WORKSPACE_ID, env,
   };
 }
 
-export async function atomic(path: string, value: unknown, firstWriter = false): Promise<void> {
+export async function atomic(path: string, value: unknown, firstWriter = false): Promise<boolean> {
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
     if (firstWriter) {
       // Atomic publish-if-absent: readers never see partial JSON or a replaced final.
-      await link(temporary, path).catch((error: NodeJS.ErrnoException) => { if (error.code !== "EEXIST") throw error; });
+      try { await link(temporary, path); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return false; throw error; }
     } else await rename(temporary, path);
+    return true;
   } finally {
     await rm(temporary, { force: true });
   }
@@ -194,13 +204,15 @@ export function validateTasks(input: unknown, env = process.env, cwd = process.c
   });
 }
 
-export function piArgs(task: Task, directory: string): string[] {
+export function piArgs(task: Task): string[] {
   // Use normal Pi resource discovery and tool configuration for every role.
   const args = ["--mode", "json", "-p", "--no-session", "--name", task.name];
   for (const path of task.extensions) args.push("-e", path);
   if (task.model) args.push("--model", task.model);
   if (task.thinking) args.push("--thinking", task.thinking);
-  args.push("--append-system-prompt", join(directory, "system.md"));
+  // An append CLI flag suppresses Pi's normal APPEND_SYSTEM.md discovery.
+  // This last, additive extension appends the role instructions after discovery.
+  args.push("-e", fileURLToPath(new URL("./prompt.ts", import.meta.url)));
   // Stdin carries the prompt literally: no shell expansion, @file expansion or argv limit.
   return args;
 }
@@ -237,6 +249,9 @@ export async function spawnTasks(scope: Scope, tasks: Task[]): Promise<Job[]> {
       }
     }
     if (!pi) throw new Error("pi executable not found on PATH.");
+    const { pane: parent } = await herdr<{ pane: Pane }>(scope, ["pane", "current", "--current"]);
+    const { panes } = await herdr<{ panes: Pane[] }>(scope, ["pane", "list"]);
+    const owned = panes.filter((pane) => existing.some((job) => job.terminal === pane.terminal_id)).map((pane) => pane.pane_id);
     const created: Job[] = [];
     try {
       for (const task of tasks) {
@@ -246,12 +261,22 @@ export async function spawnTasks(scope: Scope, tasks: Task[]): Promise<Job[]> {
         await save(scope, job);
         created.push(job);
         await writeFile(join(directory, "system.md"), systemPrompt(task), { mode: 0o600 });
-        await atomic(join(directory, "launch.json"), { pi, args: piArgs(task, directory) });
-        const { layout } = await herdr<{ layout: Layout }>(scope, ["pane", "layout", "--pane", scope.pane]);
-        const target = splitTarget(layout, [...existing, ...created].flatMap((j) => j.pane ? [j.pane] : []), scope.pane);
-        const { pane } = await herdr<{ pane: Pane }>(scope, ["pane", "split", "--pane", target.pane, "--direction", target.direction, "--cwd", task.cwd, "--no-focus", "--env", `PI_CODING_AGENT_DIR=${resolve(scope.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"))}`]);
-        job.pane = pane.pane_id;
-        job.terminal = pane.terminal_id;
+        await atomic(join(directory, "launch.json"), { pi, args: piArgs(task) });
+        const { layout } = await herdr<{ layout: Layout }>(scope, ["pane", "layout", "--pane", parent.pane_id]);
+        const target = splitTarget(layout, [...owned, ...created.flatMap((j) => j.pane ? [j.pane] : [])], parent.pane_id);
+        job.creating = true;
+        await save(scope, job);
+        try {
+          const { pane } = await herdr<{ pane: Pane }>(scope, ["pane", "split", "--pane", target.pane, "--direction", target.direction, "--cwd", task.cwd, "--no-focus", "--env", `PI_CODING_AGENT_DIR=${agentDirectory(scope.env)}`]);
+          job.pane = pane.pane_id;
+          job.terminal = pane.terminal_id;
+          job.creating = false;
+        } catch (error) {
+          // A server rejection is definite; a lost response may hide a created pane.
+          if ((error as { herdrCode?: string }).herdrCode) job.creating = false;
+          await save(scope, job);
+          throw error;
+        }
         await save(scope, job);
         await herdr(scope, ["pane", "rename", job.pane, `${task.role}: ${task.name}`]);
         job.launched = true;
@@ -260,12 +285,9 @@ export async function spawnTasks(scope: Scope, tasks: Task[]): Promise<Job[]> {
       }
       return created;
     } catch (error) {
-      const failures: string[] = [];
-      for (const job of created) {
-        try { await closeJob(scope, job, true); }
-        catch (e) { failures.push(String(e)); }
-      }
-      throw new Error(`${String(error)}${failures.length ? `; rollback incomplete: ${failures.join("; ")}` : "; new panes rolled back"}`);
+      try { await closeJobs(scope, created, true); }
+      catch (rollback) { throw new Error(`${String(error)}; rollback incomplete: ${String(rollback)}`); }
+      throw new Error(`${String(error)}; new panes rolled back`);
     }
   });
 }
@@ -288,19 +310,31 @@ export async function completion(scope: Scope, job: Job): Promise<Completion | u
   return json<Completion>(join(directory, "done.json"));
 }
 
-export async function status(scope: Scope): Promise<unknown[]> {
+export interface WorkerClaim { pid?: number; cancelled?: boolean }
+
+export async function status(scope: Scope, offset = 0): Promise<{ jobs: unknown[]; next?: number }> {
   return locked(scope, async () => {
     const all = (await jobs(scope)).filter((job) => !job.closed || !job.collected);
-    if (!all.length) return [];
-    const { panes } = await herdr<{ panes: Pane[] }>(scope, ["pane", "list", "--workspace", scope.workspace]);
-    return Promise.all(all.map(async (job) => {
+    if (!all.length) return { jobs: [] };
+    const { panes } = await herdr<{ panes: Pane[] }>(scope, ["pane", "list"]);
+    const entries = await Promise.all(all.map(async (job) => {
       const done = await completion(scope, job);
-      if (!done && job.endedAt === undefined && !panes.some((pane) => pane.pane_id === job.pane && pane.terminal_id === job.terminal)) {
+      const claim = await json<WorkerClaim>(join(scope.root, job.id, "worker.json"));
+      let dead = false;
+      if (claim?.pid) {
+        try { process.kill(claim.pid, 0); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") dead = true; else throw error; }
+      }
+      if (!done && job.endedAt === undefined && (dead || !panes.some((pane) => pane.terminal_id === job.terminal))) {
         job.endedAt = Date.now();
         await save(scope, job);
       }
-      return { id: job.id, name: job.task.name, state: done?.state || (job.endedAt === undefined ? "running" : "ending"), collected: job.collected || false, closed: job.closed || false };
+      return {
+        id: job.id, name: job.task.name, state: done?.state || (job.endedAt === undefined ? "running" : "ending"),
+        ...(job.collected ? { collected: true } : {}), ...(job.closed ? { closed: true } : {}),
+      };
     }));
+    return { jobs: entries.slice(offset, offset + LIMIT), ...(offset + LIMIT < entries.length ? { next: offset + LIMIT } : {}) };
   });
 }
 
@@ -321,11 +355,18 @@ export function reportPage(text: string, cursor: number, budget: number): string
 export async function collect(scope: Scope, wait: number, emit: (value: unknown) => Promise<void>): Promise<void> {
   const deadline = Date.now() + wait * 1000;
   let nextReconcile = 0;
+  let warning: string | undefined;
   while (true) {
-    if (Date.now() >= nextReconcile) { await status(scope); nextReconcile = Date.now() + 5000; }
     const all = (await jobs(scope)).filter((job) => !job.collected);
     const ready = await Promise.all(all.map((job) => completion(scope, job)));
-    if (ready.some(Boolean) || !all.length || Date.now() >= deadline) break;
+    // Saved reports never depend on a live Herdr connection.
+    if (ready.some(Boolean) || !all.length) break;
+    if (Date.now() >= nextReconcile) {
+      try { await status(scope); warning = undefined; }
+      catch (error) { warning = reportPage(String(error), 0, 1500); }
+      nextReconcile = Date.now() + 5000;
+    }
+    if (Date.now() >= deadline) break;
     await delay(500);
   }
   await locked(scope, async () => {
@@ -343,37 +384,51 @@ export async function collect(scope: Scope, wait: number, emit: (value: unknown)
       job.cursor += part.length;
       job.collected = job.cursor >= text.length;
       if (!job.collected) pending++;
-      const entry = { id: job.id, name: job.task.name, state: done.state, offset: start, complete: job.collected, text: part };
+      const entry = { id: job.id, name: job.task.name, state: done.state, ...(start ? { offset: start } : {}), complete: job.collected, text: part };
       remaining -= Buffer.byteLength(JSON.stringify(entry));
       reports.push(entry);
       updates.push(job);
     }
-    await emit({ reports, pending, ...(pending ? { next: "collect again for remaining reports/pages" } : {}) });
+    await emit({ reports, pending, ...(warning ? { warning } : {}) });
     for (const job of updates) await save(scope, job);
   });
 }
 
-export async function closeJob(scope: Scope, job: Job, cancel = false): Promise<void> {
+async function ownedPane(scope: Scope, job: Job): Promise<Pane | undefined> {
+  const { panes } = await herdr<{ panes: Pane[] }>(scope, ["pane", "list"]);
+  // Cross-workspace moves change pane IDs, but terminal identity survives.
+  const pane = panes.find((p) => p.terminal_id === job.terminal);
+  if (!pane && panes.some((p) => p.pane_id === job.pane)) throw new Error(`${job.task.name}: terminal identity changed; refusing to close.`);
+  if (job.pane === scope.pane || pane?.pane_id === scope.pane) throw new Error("Refusing to close the main pane.");
+  return pane;
+}
+
+export async function closeJob(scope: Scope, job: Job, cancel = false, deadline = Date.now() + 10_000): Promise<void> {
   if (job.closed) return;
+  if (job.creating) throw new Error(`${job.task.name}: pane creation response was lost; ownership is unresolved. Inspect Herdr before retrying; no unknown pane was closed.`);
   if (!cancel && !job.collected) throw new Error(`${job.task.name}: collect the entire report before closing (or explicitly cancel).`);
   if (job.pane) {
-    const { panes } = await herdr<{ panes: Pane[] }>(scope, ["pane", "list", "--workspace", scope.workspace]);
-    const pane = panes.find((p) => p.pane_id === job.pane);
-    if (pane && pane.terminal_id !== job.terminal) throw new Error(`${job.task.name}: terminal identity changed; refusing to close.`);
-    if (job.pane === scope.pane) throw new Error("Refusing to close the main pane.");
-    if (pane && cancel && job.launched) {
+    await ownedPane(scope, job);
+    if (cancel && job.launched) {
       const directory = join(scope.root, job.id);
       await atomic(join(directory, "cancel.json"), {});
-      const deadline = Date.now() + 10_000;
-      // Herdr may SIGKILL the pane supervisor before its group-kill grace period.
-      // Cancel out-of-band and require acknowledgement BEFORE closing the PTY.
+      // Race the worker's atomic startup claim. Winning fences all delayed launches;
+      // losing requires the running supervisor's acknowledgement before closing PTY.
+      const fenced = await atomic(join(directory, "worker.json"), { cancelled: true }, true);
+      // Recover a parent crash between fencing startup and publishing completion.
+      if (fenced || (await json<WorkerClaim>(join(directory, "worker.json")))?.cancelled) {
+        await atomic(join(directory, "done.json"), { state: "cancelled", report: "", error: "Cancelled before worker startup." }, true);
+      }
       while (!(await json<Completion>(join(directory, "done.json")))) {
         if (Date.now() >= deadline) throw new Error(`${job.task.name}: cancellation not acknowledged; pane retained. Inspect it before forcing closure.`);
         await delay(100);
       }
     }
-    if (pane) await herdr(scope, ["pane", "close", job.pane]).catch((error: Error & { herdrCode?: string }) => {
-      // Herdr can auto-remove a pane when the cancelled supervisor exits.
+    const done = await json<Completion>(join(scope.root, job.id, "done.json"));
+    if (done?.cleanupError) throw new Error(`${job.task.name}: ${done.cleanupError}; pane retained for inspection.`);
+    // Never rely on the identity observed before a potentially long cancellation wait.
+    const pane = await ownedPane(scope, job);
+    if (pane) await herdr(scope, ["pane", "close", pane.pane_id]).catch((error: Error & { herdrCode?: string }) => {
       if (error.herdrCode !== "pane_not_found") throw error;
     });
   }
@@ -382,23 +437,25 @@ export async function closeJob(scope: Scope, job: Job, cancel = false): Promise<
   await save(scope, job);
 }
 
+export async function closeJobs(scope: Scope, all: Job[], cancel = false, grace = 10_000): Promise<string[]> {
+  const closed: string[] = [];
+  const failures: string[] = [];
+  if (cancel) for (const job of all) {
+    if (!job.launched || job.closed) continue;
+    try { await atomic(join(scope.root, job.id, "cancel.json"), {}); }
+    catch (error) { failures.push(`${job.task.name}: ${String(error)}`); }
+  }
+  const deadline = Date.now() + grace;
+  for (const job of all) {
+    if (job.closed || (!cancel && !job.collected)) continue;
+    try { await closeJob(scope, job, cancel, deadline); closed.push(job.task.name); }
+    catch (error) { failures.push(String(error)); }
+  }
+  if (failures.length) throw new Error(failures.join("; "));
+  return closed;
+}
+
 export async function cleanup(scope: Scope, cancel = false): Promise<string[]> {
-  // Idle sessions without jobs do no I/O beyond this existence check, and no Herdr calls.
   if (!(await stat(scope.root).catch(() => undefined))) return [];
-  return locked(scope, async () => {
-    const closed: string[] = [];
-    const failures: string[] = [];
-    const all = await jobs(scope);
-    // Broadcast first so cancellation of 16 workers costs one grace period.
-    if (cancel) for (const job of all) {
-      if (job.launched && !job.closed) await atomic(join(scope.root, job.id, "cancel.json"), {});
-    }
-    for (const job of all) {
-      if (job.closed || (!cancel && !job.collected)) continue;
-      try { await closeJob(scope, job, cancel); closed.push(job.task.name); }
-      catch (error) { failures.push(String(error)); }
-    }
-    if (failures.length) throw new Error(failures.join("; "));
-    return closed;
-  });
+  return locked(scope, async () => closeJobs(scope, await jobs(scope), cancel));
 }

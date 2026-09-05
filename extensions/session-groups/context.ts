@@ -1,7 +1,9 @@
 import type { SessionGroupContextSnapshot } from "./contracts.ts";
 
 function contextBoundary(snapshot: SessionGroupContextSnapshot): string {
-  const base = `PI_SG_${snapshot.sha256.slice(0, 12).toUpperCase()}`;
+  // Content hashes change the opening marker even for a trailing edit, needlessly
+  // invalidating a reusable prompt prefix. Only collisions require a new marker.
+  const base = "PI_SG_CONTEXT";
   let boundary = base;
   let suffix = 1;
   while (snapshot.content.includes(boundary)) {
@@ -27,6 +29,11 @@ export function appendSessionGroupContext(
     snapshot.content,
     `-----END ${boundary}-----`,
   ].join("\n")}`;
+}
+
+/** Approximate occupancy, not a tokenizer measurement or an upper bound. */
+export function estimateSessionGroupContextTokens(snapshot: SessionGroupContextSnapshot): number {
+  return Math.ceil(appendSessionGroupContext("", snapshot).length / 4);
 }
 
 export function appendUnavailableSessionGroupContext(

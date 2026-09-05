@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -15,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   SESSION_GROUP_CHANGELOG_ENTRY_MAX_BYTES,
   SESSION_GROUP_CHANGELOG_MAX_BYTES,
@@ -24,6 +27,7 @@ import {
 } from "../extensions/session-groups/contracts.ts";
 import {
   applyExactSessionGroupContextEdits,
+  atomicWritePrivateFile,
   SessionGroupAlreadyExistsError,
   SessionGroupChangelogEntryError,
   SessionGroupChangelogEncodingError,
@@ -33,6 +37,7 @@ import {
   SessionGroupContextEncodingError,
   SessionGroupContextRevisionError,
   SessionGroupContextTooLargeError,
+  SessionGroupDuplicateNameError,
   SessionGroupNotFoundError,
   SessionGroupStore,
 } from "../extensions/session-groups/store.ts";
@@ -316,7 +321,7 @@ test("rejects symlinks instead of following storage paths outside the root", asy
   });
 });
 
-test("rejects malformed UTF-8 JSON and restores private modes on restart", async () => {
+test("rejects malformed UTF-8 JSON and restores private modes on target access", async () => {
   await withStore(async (store, rootDirectory) => {
     const group = await store.createGroup("partitioning");
     await writeFile(store.metadataPath(group.id), Buffer.from([0xc3, 0x28]));
@@ -329,6 +334,9 @@ test("rejects malformed UTF-8 JSON and restores private modes on restart", async
       await chmod(store.contextPath(group.id), 0o644);
       const restarted = new SessionGroupStore({ rootDirectory });
       await restarted.initialize();
+      assert.equal((await stat(rootDirectory)).mode & 0o777, 0o700);
+      // Root privacy is immediate; descendant repair is lazy, without global locks.
+      await restarted.readContext(group.id);
       assert.equal((await stat(store.groupDirectory(group.id))).mode & 0o777, 0o700);
       assert.equal((await stat(store.metadataPath(group.id))).mode & 0o777, 0o600);
       assert.equal((await stat(store.contextPath(group.id))).mode & 0o777, 0o600);
@@ -358,6 +366,8 @@ test("recovers abandoned create, delete, and atomic-write artifacts", async () =
 
     const restarted = new SessionGroupStore({ rootDirectory });
     await restarted.initialize();
+    assert.equal((await readdir(store.groupDirectory(group.id))).includes(groupTemp), true);
+    await restarted.readMetadata(group.id);
     const groupEntries = await readdir(store.groupsDirectory);
     const rootEntries = await readdir(rootDirectory);
     const activeGroupEntries = await readdir(store.groupDirectory(group.id));
@@ -582,6 +592,196 @@ test("rolls back interrupted edits with the original UTF-8 BOM bytes", async () 
       (await restarted.readMetadata(group.id)).contextSha256,
       digest(originalWithBom),
     );
+  });
+});
+
+test("catalog operations ignore missing or locked unrelated contexts, even on cold start", async () => {
+  await withStore(async (store, rootDirectory) => {
+    const missing = await store.createGroup("Missing context");
+    const locked = await store.createGroup("Editor active");
+    const target = await store.createGroup("Target");
+    await rm(store.contextPath(missing.id));
+    const ready = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    const held = store.withGroupLock(locked.id, "zed-edit", async () => {
+      ready.resolve();
+      await release.promise;
+    });
+    await ready.promise;
+    try {
+      const cold = new SessionGroupStore({ rootDirectory });
+      cold.withGroupLock = async () => { throw new Error("Catalog acquired a group lock"); };
+      const groups = await cold.listGroups();
+      const summary = groups.find((group) => group.id === missing.id);
+      assert.equal(summary.contextBytes, null);
+      assert.match(summary.contextError, /missing/);
+      assert.equal((await cold.resolveGroup("TARGET")).id, target.id);
+      assert.equal((await cold.resolveGroup("Editor active")).id, locked.id);
+      assert.equal((await cold.createGroup("Independent")).name, "Independent");
+      await assert.rejects(cold.createGroup("missing context"), SessionGroupAlreadyExistsError);
+    } finally {
+      release.resolve();
+      await held;
+    }
+  });
+});
+
+test("catalog metadata is atomic, fresh after other-store renames, and fail-closed", async () => {
+  await withStore(async (store, rootDirectory) => {
+    const first = await store.createGroup("First");
+    const second = await store.createGroup("Second");
+    const other = new SessionGroupStore({ rootDirectory });
+    await other.renameGroup(first.id, "Renamed elsewhere");
+    await assert.rejects(store.resolveGroup("First"), SessionGroupNotFoundError);
+    assert.equal((await store.resolveGroup("Renamed elsewhere")).id, first.id);
+
+    // Only targeted context access recovers or rejects a context journal.
+    const journal = join(store.groupDirectory(first.id), ".context-edit-transaction.json");
+    await writeFile(journal, "corrupt context journal", { mode: 0o600 });
+    assert.equal((await store.listGroups()).length, 2);
+    await assert.rejects(store.readContext(first.id), /Invalid JSON/);
+    await rm(journal);
+
+    const updateMetadata = async () => {
+      for (let index = 0; index < 20; index++) {
+        await atomicWritePrivateFile(store.metadataPath(second.id), JSON.stringify({ ...second, contextRevision: index }));
+      }
+    };
+    await Promise.all([updateMetadata(), (async () => {
+      for (let index = 0; index < 20; index++) assert.equal((await store.listGroups()).length, 2);
+    })()]);
+
+    await atomicWritePrivateFile(store.metadataPath(second.id), JSON.stringify({ ...second, name: "RENAMED ELSEWHERE" }));
+    await assert.rejects(store.listGroups(), SessionGroupDuplicateNameError);
+    await assert.rejects(store.resolveGroup("Renamed elsewhere"), SessionGroupDuplicateNameError);
+    await assert.rejects(store.createGroup("Third"), SessionGroupDuplicateNameError);
+    await writeFile(store.metadataPath(second.id), "{broken");
+    await assert.rejects(store.createGroup("Third"), /Invalid JSON/);
+    await assert.rejects(store.resolveGroup("Renamed elsewhere"), /Invalid JSON/);
+  });
+});
+
+test("catalog handles 500 groups under a 128-descriptor limit without per-group locks", { skip: process.platform === "win32" }, async () => {
+  await withStore(async (store, rootDirectory) => {
+    const seed = await store.createGroup("Seed");
+    for (let batch = 0; batch < 500; batch += 16) {
+      await Promise.all(Array.from({ length: Math.min(16, 500 - batch) }, async (_, index) => {
+        const id = randomUUID();
+        await mkdir(store.groupDirectory(id), { mode: 0o700 });
+        await writeFile(store.metadataPath(id), JSON.stringify({ ...seed, id, name: `Group ${batch + index}` }), { mode: 0o600 });
+      }));
+    }
+    const script = `
+      import assert from 'node:assert/strict';
+      import { SessionGroupStore } from ${JSON.stringify(new URL("../extensions/session-groups/store.ts", import.meta.url).href)};
+      const store = new SessionGroupStore({ rootDirectory: process.argv[1] });
+      store.withGroupLock = async () => { throw new Error('unexpected per-group lock'); };
+      assert.equal((await store.listGroups()).length, 501);
+      assert.equal((await store.resolveGroup('Group 499')).name, 'Group 499');
+      await store.createGroup('Scale addition');
+      assert.equal((await store.listGroups()).length, 502);
+      console.log('500-group low-FD catalog passed');
+    `;
+    const result = await promisify(execFile)("/bin/sh", [
+      "-c", 'ulimit -n 128; exec "$@"', "catalog-scale", process.execPath,
+      "--disable-warning=MODULE_TYPELESS_PACKAGE_JSON", "--experimental-strip-types", "--input-type=module", "-e", script, rootDirectory,
+    ], { timeout: 30_000 });
+    assert.match(result.stdout, /500-group low-FD catalog passed/);
+  });
+});
+
+test("rejects oversized edit output before acquiring a lock or allocating combined output", async () => {
+  await withStore(async (store) => {
+    store.withGroupLock = async () => { throw new Error("Unexpected lock"); };
+    await assert.rejects(store.editContext(randomUUID(), 0, "a".repeat(64), [
+      { oldText: "a", newText: "x".repeat(SESSION_GROUP_CONTEXT_MAX_BYTES + 1) },
+    ]), SessionGroupContextTooLargeError);
+    await assert.rejects(store.editContext(randomUUID(), 0, "a".repeat(64), [
+      { oldText: "a", newText: "é".repeat(40_000) },
+    ]), SessionGroupContextTooLargeError);
+    assert.throws(() => applyExactSessionGroupContextEdits("abc", [
+      { oldText: "a", newText: "x".repeat(40_000) },
+      { oldText: "b", newText: "y".repeat(40_000) },
+    ]), SessionGroupContextTooLargeError);
+  });
+});
+
+test("cancellation after awaited validation does not mutate context or changelog", async () => {
+  await withStore(async (store) => {
+    const group = await store.createGroup("Cancel validation");
+    const before = await store.readContext(group.id);
+    const originalReadMetadata = store.readMetadata.bind(store);
+    let controller = new AbortController();
+    store.readMetadata = async (...args) => {
+      const metadata = await originalReadMetadata(...args);
+      controller.abort(new Error("validation cancelled"));
+      return metadata;
+    };
+    await assert.rejects(store.editContext(group.id, before.revision, before.sha256, [
+      { oldText: before.content, newText: "changed" },
+    ], { signal: controller.signal }), /validation cancelled/);
+    assert.equal(await readFile(before.path, "utf8"), before.content);
+    controller = new AbortController();
+    await assert.rejects(store.appendChangelog(group.id, "cancelled append", "session", { signal: controller.signal }), /validation cancelled/);
+    await assert.rejects(readFile(store.changelogPath(group.id)), /ENOENT/);
+    assert.equal((await readdir(store.groupDirectory(group.id))).some((name) => name.includes("transaction")), false);
+  });
+});
+
+test("waiting mutations forward cancellation without entering their transaction", async () => {
+  await withStore(async (store) => {
+    const group = await store.createGroup("Cancel waiting");
+    const before = await store.readContext(group.id);
+    const ready = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    const held = store.withGroupLock(group.id, "zed-edit", async () => {
+      ready.resolve();
+      await release.promise;
+    });
+    await ready.promise;
+    try {
+      for (const mutate of [
+        (signal) => store.editContext(group.id, before.revision, before.sha256, [{ oldText: before.content, newText: "cancelled" }], { signal, waitMs: 5000 }),
+        (signal) => store.appendChangelog(group.id, "cancelled append", "session", { signal, waitMs: 5000 }),
+      ]) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(new Error("wait cancelled")), 30);
+        try {
+          await assert.rejects(mutate(controller.signal), (error) =>
+            error.name === "AbortError" || error.message === "wait cancelled",
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      assert.equal(await readFile(before.path, "utf8"), before.content);
+      await assert.rejects(readFile(store.changelogPath(group.id)), /ENOENT/);
+    } finally {
+      release.resolve();
+      await held;
+    }
+  });
+});
+
+test("cancellation after journal publication finishes the durable context commit", async () => {
+  await withStore(async (store) => {
+    const group = await store.createGroup("Commit despite cancellation");
+    const before = await store.readContext(group.id);
+    const controller = new AbortController();
+    const journal = join(store.groupDirectory(group.id), ".context-edit-transaction.json");
+    const metadataPath = store.metadataPath.bind(store);
+    store.metadataPath = (id) => {
+      // This path lookup occurs between context and metadata publication.
+      if (existsSync(journal)) controller.abort(new Error("cancel after journal"));
+      return metadataPath(id);
+    };
+    const result = await store.editContext(group.id, before.revision, before.sha256, [
+      { oldText: before.content, newText: "committed safely\n" },
+    ], { signal: controller.signal });
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(result.after.content, "committed safely\n");
+    assert.equal((await store.readContext(group.id)).sha256, result.after.sha256);
+    assert.equal(existsSync(journal), false);
   });
 });
 

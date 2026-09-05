@@ -1,7 +1,5 @@
 import type { InputSource } from "@earendil-works/pi-coding-agent";
 import {
-  generateDiffString,
-  generateUnifiedPatch,
   renderDiff,
   withFileMutationQueue,
   type ExtensionAPI,
@@ -17,6 +15,8 @@ import {
   applyExactSessionGroupContextEdits,
   type SessionGroupStore,
 } from "./store.ts";
+import { createSessionGroupContextDiff } from "./diff.ts";
+import { escapeSessionGroupDisplay, previewSessionGroupDiff } from "./display.ts";
 
 export const EDIT_GROUP_CONTEXT_TOOL_NAME = "edit_group_context";
 export const GROUP_CHANGELOG_TOOL_NAME = "group_changelog";
@@ -38,6 +38,9 @@ const editGroupContextSchema = Type.Object({
 const groupChangelogSchema = Type.Object({
   action: StringEnum(["read", "append"] as const),
   entry: Type.Optional(Type.String()),
+  limit: Type.Optional(Type.Integer({ minimum: 1024, maximum: 16384 })),
+  cursor: Type.Optional(Type.String({ maxLength: 1024 })),
+  query: Type.Optional(Type.String({ maxLength: 256 })),
 });
 
 export type EditGroupContextInput = Static<typeof editGroupContextSchema>;
@@ -56,6 +59,7 @@ export interface EditGroupContextDetails {
   newRevision: number;
   oldSha256: string;
   newSha256: string;
+  coarseDiff?: boolean;
 }
 
 export interface GroupChangelogDetails {
@@ -66,6 +70,8 @@ export interface GroupChangelogDetails {
   truncated?: boolean;
   timestamp?: string;
   sessionName?: string;
+  nextCursor?: string;
+  matchedRecords?: number;
 }
 
 export interface SessionGroupToolController {
@@ -83,9 +89,10 @@ export function registerSessionGroupTool(
     name: EDIT_GROUP_CONTEXT_TOOL_NAME,
     label: "Edit Group Context",
     description:
-      "Apply exact replacements to this group's shared context only after an explicit user request and confirmation; stale writes fail.",
+      "Edit shared group context only on explicit user request and confirmation. Batch minimal unique, non-overlapping replacements against the original; one successful batch per run. Updates appear next user turn; stale writes fail.",
     parameters: editGroupContextSchema,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      signal?.throwIfAborted();
       const groupId = controller.getCurrentGroupId();
       const snapshot = controller.getCurrentContextSnapshot();
       const authorization = controller.getCurrentUserAuthorization();
@@ -113,18 +120,14 @@ export function registerSessionGroupTool(
         );
       }
 
-      const proposedContent = applyExactSessionGroupContextEdits(
-        snapshot.content,
-        params.edits,
-      );
-      const { diff: proposedDiff } = generateDiffString(
-        snapshot.content,
-        proposedContent,
-      );
-      const diffPreview =
-        proposedDiff.length <= 4_000
-          ? proposedDiff
-          : `${proposedDiff.slice(0, 4_000)}\n… diff preview truncated`;
+      // The shared exact-edit validator checks the final byte budget before
+      // allocating a large replacement or starting diff computation.
+      const proposedContent = applyExactSessionGroupContextEdits(snapshot.content, params.edits, snapshot.path);
+      if (Buffer.from(proposedContent, "utf8").toString("utf8") !== proposedContent) {
+        throw new Error("Shared-context replacements must contain valid Unicode text.");
+      }
+      const preview = await createSessionGroupContextDiff(snapshot.path, snapshot.content, proposedContent, signal);
+      const diffPreview = previewSessionGroupDiff(preview.diff, 4_000, 100);
       const approved = await ctx.ui.confirm(
         "Update shared session-group context?",
         [
@@ -132,36 +135,29 @@ export function registerSessionGroupTool(
           `Revision: ${snapshot.revision}`,
           `User request: ${JSON.stringify(params.userRequestQuote)}`,
           `Exact replacements: ${params.edits.length}`,
+          ...(preview.coarse ? ["Large change: showing a whole-file replacement diff."] : []),
           "",
           diffPreview,
         ].join("\n"),
+        { signal },
       );
+      signal?.throwIfAborted();
       if (!approved) {
         throw new Error("The user did not approve the shared-context update.");
       }
 
       const contextPath = store.contextPath(groupId);
-      const result = await withFileMutationQueue(contextPath, () =>
-        store.editContext(
-          groupId,
-          snapshot.revision,
-          snapshot.sha256,
-          params.edits,
-        ),
-      );
-      const { diff } = generateDiffString(
-        result.before.content,
-        result.after.content,
-      );
-      const patch = generateUnifiedPatch(
-        result.after.path,
-        result.before.content,
-        result.after.content,
-      );
+      const result = await withFileMutationQueue(contextPath, () => {
+        signal?.throwIfAborted();
+        return store.editContext(groupId, snapshot.revision, snapshot.sha256, params.edits, { signal });
+      });
+      // The store's revision/hash check guarantees this is the approved diff.
+      // Do not interrupt a committed write or recompute a quadratic diff here.
       const details: EditGroupContextDetails = {
         path: result.after.path,
-        diff,
-        patch,
+        diff: preview.diff,
+        patch: preview.patch,
+        coarseDiff: preview.coarse,
         oldRevision: result.before.revision,
         newRevision: result.after.revision,
         oldSha256: result.before.sha256,
@@ -179,13 +175,14 @@ export function registerSessionGroupTool(
       };
     },
     renderCall(args, theme) {
+      const count = Array.isArray(args.edits) ? args.edits.length : 0;
       return new Text(
-        `${theme.fg("toolTitle", theme.bold("edit_group_context"))} ${theme.fg("muted", `${args.edits.length} replacement${args.edits.length === 1 ? "" : "s"}`)}`,
+        `${theme.fg("toolTitle", theme.bold("edit_group_context"))} ${theme.fg("muted", `${count} replacement${count === 1 ? "" : "s"}`)}`,
         0,
         0,
       );
     },
-    renderResult(result, { isPartial }, theme) {
+    renderResult(result, { isPartial, expanded }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Updating group context…"), 0, 0);
       const details = result.details;
       if (!details) {
@@ -193,13 +190,18 @@ export function registerSessionGroupTool(
           .filter((block): block is { type: "text"; text: string } => block.type === "text")
           .map((block) => block.text)
           .join("\n");
-        return new Text(text, 0, 0);
+        return new Text(escapeSessionGroupDisplay(text), 0, 0);
       }
-      return new Text(
-        `${theme.fg("success", `Updated group context to revision ${details.newRevision}`)}\n${renderDiff(details.diff, { filePath: details.path })}`,
-        0,
-        0,
-      );
+      const summary = theme.fg("success", `Updated group context to revision ${details.newRevision}`);
+      if (!expanded) return new Text(summary, 0, 0);
+      const visible = previewSessionGroupDiff(details.diff, 32_768, 2_000);
+      // Pi's intra-line word diff is unbounded too. Keep it for small edits;
+      // color large lines without another expensive similarity search.
+      const lines = visible.split("\n");
+      const rendered = lines.every((line) => line.length <= 500)
+        ? renderDiff(visible, { filePath: details.path })
+        : lines.map((line) => theme.fg(line.startsWith("+") ? "toolDiffAdded" : line.startsWith("-") ? "toolDiffRemoved" : "toolDiffContext", line)).join("\n");
+      return new Text(`${summary}\n${rendered}`, 0, 0);
     },
   });
 }
@@ -213,9 +215,10 @@ export function registerSessionGroupChangelogTool(
     name: GROUP_CHANGELOG_TOOL_NAME,
     label: "Group Changelog",
     description:
-      "Read recent group history or append completed work when the user asks.",
+      "Read newest group history first (4 KiB default, limit up to 16 KiB/2000 lines); continue with cursor, optionally filter records by literal query. Append completed work only when the user asks and confirms.",
     parameters: groupChangelogSchema,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      signal?.throwIfAborted();
       const groupId = controller.getCurrentGroupId();
       if (groupId === null) {
         throw new Error("This session does not belong to a group.");
@@ -225,27 +228,46 @@ export function registerSessionGroupChangelogTool(
         if (params.entry !== undefined) {
           throw new Error("group_changelog read does not accept an entry.");
         }
-        const tail = await store.readChangelogTail(groupId);
+        const limit = params.limit ?? 4096;
+        if (!Number.isInteger(limit) || limit < 1024 || limit > 16384) {
+          throw new Error("group_changelog limit must be 1024–16384 bytes.");
+        }
+        // Reserve space for the cursor/footer so the complete model-visible
+        // result, not merely the stored text, stays within the advertised cap.
+        const page = await store.readChangelogPage(groupId, {
+          maxBytes: limit - 768,
+          maxLines: 1_988,
+          cursor: params.cursor,
+          query: params.query,
+          signal,
+        });
         const details: GroupChangelogDetails = {
           action: "read",
-          path: tail.path,
-          totalBytes: tail.totalBytes,
-          returnedBytes: tail.returnedBytes,
-          truncated: tail.truncated,
+          path: page.path,
+          totalBytes: page.totalBytes,
+          returnedBytes: page.returnedBytes,
+          truncated: page.truncated,
+          nextCursor: page.nextCursor,
+          matchedRecords: page.matchedRecords,
         };
-        if (!tail.exists) {
+        if (!page.exists) {
           return {
             content: [{ type: "text", text: "No changelog exists for this group." }],
             details,
           };
         }
-        const omission = tail.truncated
-          ? `[Older changelog content omitted; showing the latest ${tail.returnedBytes} of ${tail.totalBytes} bytes.]\n\n`
-          : "";
-        return {
-          content: [{ type: "text", text: `${omission}${tail.content}` }],
-          details,
-        };
+        const continuation = page.nextCursor
+          ? `Continue with group_changelog action=read cursor=${JSON.stringify(page.nextCursor)}${params.query ? " and the same query" : ""}.`
+          : "End of matching history.";
+        const text = `${page.content || (params.query ? "No matching changelog records." : "The group changelog is empty.")}\n\n[Newest records first; ${page.returnedBytes}/${page.totalBytes} bytes. ${continuation}]`;
+        if (Buffer.byteLength(text, "utf8") > limit || text.split("\n").length > 2000) {
+          throw new Error("Changelog pagination metadata exceeded the output budget; retry with a larger limit.");
+        }
+        return { content: [{ type: "text", text }], details };
+      }
+      if (params.action !== "append") throw new Error("Unknown group_changelog action.");
+      if (params.limit !== undefined || params.cursor !== undefined || params.query !== undefined) {
+        throw new Error("group_changelog append does not accept read options.");
       }
 
       if (params.entry === undefined || !params.entry.trim()) {
@@ -275,19 +297,22 @@ export function registerSessionGroupChangelogTool(
         "Append to shared group changelog?",
         [
           "Append this entry for every session attached to the current group?",
-          `Session: ${sessionName ?? "Unnamed session"}`,
+          `Session: ${escapeSessionGroupDisplay(sessionName ?? "Unnamed session")}`,
           "",
-          entry,
+          escapeSessionGroupDisplay(entry),
         ].join("\n"),
+        { signal },
       );
+      signal?.throwIfAborted();
       if (!approved) {
         throw new Error("The user did not approve the changelog entry.");
       }
 
       const path = store.changelogPath(groupId);
-      const appended = await withFileMutationQueue(path, () =>
-        store.appendChangelog(groupId, entry, sessionName),
-      );
+      const appended = await withFileMutationQueue(path, () => {
+        signal?.throwIfAborted();
+        return store.appendChangelog(groupId, entry, sessionName, { signal });
+      });
       const details: GroupChangelogDetails = {
         action: "append",
         path: appended.path,
@@ -307,12 +332,12 @@ export function registerSessionGroupChangelogTool(
     },
     renderCall(args, theme) {
       return new Text(
-        `${theme.fg("toolTitle", theme.bold("group_changelog"))} ${theme.fg("muted", args.action)}`,
+        `${theme.fg("toolTitle", theme.bold("group_changelog"))} ${theme.fg("muted", args.action ?? "…")}`,
         0,
         0,
       );
     },
-    renderResult(result, { isPartial }, theme) {
+    renderResult(result, { isPartial, expanded }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Using group changelog…"), 0, 0);
       const details = result.details;
       if (!details) {
@@ -320,18 +345,16 @@ export function registerSessionGroupChangelogTool(
           .filter((block): block is { type: "text"; text: string } => block.type === "text")
           .map((block) => block.text)
           .join("\n");
-        return new Text(text, 0, 0);
+        return new Text(escapeSessionGroupDisplay(text), 0, 0);
       }
-      return new Text(
-        theme.fg(
-          details.action === "append" ? "success" : "accent",
-          details.action === "append"
-            ? `Appended group changelog (${details.totalBytes} bytes total)`
-            : `Read group changelog (${details.returnedBytes ?? 0}/${details.totalBytes} bytes)`,
-        ),
-        0,
-        0,
+      const summary = theme.fg(
+        details.action === "append" ? "success" : "accent",
+        details.action === "append"
+          ? `Appended group changelog (${details.totalBytes} bytes total)`
+          : `Read group changelog (${details.returnedBytes ?? 0}/${details.totalBytes} bytes)${details.nextCursor ? " — more available" : ""}`,
       );
+      const content = result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+      return new Text(expanded || details.returnedBytes === 0 ? `${summary}\n${escapeSessionGroupDisplay(content)}` : summary, 0, 0);
     },
   });
 }
