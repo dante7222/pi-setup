@@ -209,8 +209,12 @@ test("worker prompt hook preserves discovered append text and records pre-exit a
   t.after(() => { for (const [key, value] of Object.entries(old)) if (value === undefined) delete process.env[key]; else process.env[key] = value; });
   const handlers = new Map();
   promptExtension({ on: (name, fn) => handlers.set(name, fn) });
-  const result = await handlers.get("before_agent_start")({ systemPrompt: "Base\nGlobal APPEND_SYSTEM\nTrusted project APPEND_SYSTEM" });
-  assert.equal(result.systemPrompt, "Base\nGlobal APPEND_SYSTEM\nTrusted project APPEND_SYSTEM\n\nWorker role instructions");
+  const systemPromptOptions = { appendSystemPrompt: "Discovered APPEND_SYSTEM", sections: { other: "Other extension" } };
+  assert.equal(await handlers.get("before_agent_start")({ systemPromptOptions }), undefined);
+  assert.deepEqual(systemPromptOptions, {
+    appendSystemPrompt: "Discovered APPEND_SYSTEM",
+    sections: { other: "Other extension", herdr_subagent: "Worker role instructions" },
+  });
   await handlers.get("session_shutdown")({ reason: "reload" });
   assert.equal(await stat(join(directory, "processes.json")).catch(() => undefined), undefined);
   await handlers.get("session_shutdown")({ reason: "quit" });

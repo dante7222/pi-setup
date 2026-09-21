@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { createAssistantMessageEventStream, InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentSystemPrompt, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { getKeybindings, KeybindingsManager, setKeybindings } from "@earendil-works/pi-tui";
 import extension from "../extensions/herdr-subagents/index.ts";
@@ -269,7 +269,7 @@ for (const phase of ["generation", "tool", "retry-delay", "retry-reload"]) test(
   let requests = 0;
   session.agent.streamFunction = (_model, context, options) => {
     if (++requests > 2) throw new Error(`Unexpected repeat request: ${JSON.stringify(session.messages)}`);
-    assert.equal(context.systemPrompt, `Test system prompt\nCurrent working directory: ${directory}\n`);
+    assert.equal(getCurrentSystemPrompt(context.messages), `Test system prompt\n\n<cwd>\n${directory}\n</cwd>`);
     const stream = createAssistantMessageEventStream();
     const end = (reason) => {
       const message = reply(reason);
