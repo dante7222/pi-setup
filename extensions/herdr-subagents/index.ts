@@ -1,16 +1,31 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getKeybindings } from "@earendil-works/pi-tui";
 import { agentDirectory, cleanup, scopeFor, status } from "./core.ts";
+import { registerSubagentTools } from "./tools.ts";
+import { claimScope } from "./ownership.ts";
+import { registerDurableTools } from "./durable-tools.ts";
+import { stopDurable } from "./durable/transport.ts";
 
-// No tools, prompt injections, polling, model calls, or automatic follow-up turns.
+// Deferred tools add no active declarations; no prompt injection or automatic turns.
 export default function herdrSubagents(pi: ExtensionAPI): void {
   if (process.env.HERDR_ENV !== "1" || process.env.PI_HERDR_WORKER === "1") return;
   // Anchor relative paths before a session switch changes cwd; shell tools inherit it.
   process.env.PI_CODING_AGENT_DIR = agentDirectory();
+  // CLI children share this live parent identity rather than claiming ephemeral
+  // shell/runner PIDs. Session IDs themselves are supplied by each Pi context.
+  process.env.PI_HERDR_OWNER_PID = String(process.pid);
+  registerSubagentTools(pi);
+  registerDurableTools(pi);
   const finish = async (ctx: ExtensionContext, cancel = false) => {
     try {
-      const closed = await cleanup(scopeFor(ctx.sessionManager.getSessionId()), cancel);
-      if (closed.length && ctx.hasUI) ctx.ui.notify(`Closed ${closed.length} subagent pane(s).`, "info");
+      const scope = scopeFor(ctx.sessionManager.getSessionId());
+      await claimScope(scope);
+      // Broadcast both backends independently: a stalled durable coordinator must
+      // not delay ordinary worker cancellation, nor vice versa.
+      const [ordinary, durable] = await Promise.allSettled([cleanup(scope, cancel), cancel ? stopDurable(scope) : Promise.resolve()]);
+      const failures = [ordinary, durable].filter((result) => result.status === "rejected").map((result) => String(result.reason));
+      if (failures.length) throw new Error(failures.join("; "));
+      if (ordinary.status === "fulfilled" && ordinary.value.length && ctx.hasUI) ctx.ui.notify(`Closed ${ordinary.value.length} subagent pane(s).`, "info");
     } catch (error) {
       if (ctx.hasUI) ctx.ui.notify(`Subagent cleanup: ${String(error)}`, "warning");
     }
@@ -97,16 +112,26 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
     await finish(ctx, event.reason !== "reload");
   });
   pi.registerCommand("subagents", {
-    description: "Show Herdr jobs; /subagents close or cancel (all owned panes)",
+    description: "Show Herdr jobs; enable/disable the native tool, close or cancel panes",
     handler: async (args, ctx) => {
+      if (["enable", "disable", "durable-enable", "durable-disable"].includes(args.trim())) {
+        const tool = args.trim().startsWith("durable-") ? "durable_subagents" : "subagents";
+        const enabled = args.trim().endsWith("enable");
+        const active = pi.getActiveTools().filter((name) => name !== tool);
+        if (enabled) active.push(tool);
+        pi.setActiveTools(active);
+        ctx.ui.notify(`${tool} tool ${enabled ? "enabled" : "deferred"}.`, "info");
+        return;
+      }
       if (args.trim() === "close") return finish(ctx);
       if (args.trim() === "cancel") {
         if (await ctx.ui.confirm("Cancel subagents?", "Stop and close every subagent pane owned by this session? Saved reports remain.")) await finish(ctx, true);
         return;
       }
-      if (args.trim()) { ctx.ui.notify("Usage: /subagents [close|cancel]", "warning"); return; }
+      if (args.trim()) { ctx.ui.notify("Usage: /subagents [enable|disable|durable-enable|durable-disable|close|cancel]", "warning"); return; }
       try {
         const scope = scopeFor(ctx.sessionManager.getSessionId());
+        await claimScope(scope);
         ctx.ui.notify(`${JSON.stringify(await status(scope), null, 2)}\n${scope.root}`, "info");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
     },

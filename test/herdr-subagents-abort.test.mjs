@@ -36,8 +36,8 @@ console.log(JSON.stringify({result:args[1]==='list'?{panes}:{}}));
   Object.assign(process.env, { PI_HERDR_WORKER: "", PI_CODING_AGENT_DIR: directory, HERDR_ENV: "1", HERDR_PANE_ID: "main", HERDR_WORKSPACE_ID: "w", HERDR_SOCKET_PATH: "test.sock", HERDR_BIN_PATH: backend, FAKE_STATE: statePath });
   const scope = scopeFor("parent");
   const handlers = new Map();
-  // Deliberately no registerTool/sendMessage/exec: cancellation must remain local.
-  extension({ on: (name, handler) => handlers.set(name, handler), registerCommand() {} });
+  // No sendMessage/exec: cancellation stays local; tools are deferred.
+  extension({ on: (name, handler) => handlers.set(name, handler), registerCommand() {}, registerTool(tool) { assert.equal(tool.exposure, "deferred"); } });
   let session = "parent", idle = false;
   const notices = [];
   let input;
@@ -78,7 +78,10 @@ test("Stop broadcasts all 16 cancellations before acknowledgements, closes only 
   f.controller.abort();
   for (const job of launched) await waitFor(join(f.scope.root, job.id, "cancel.json"));
   assert.ok((await jobs(f.scope)).every((job) => !job.closed));
-  for (const job of launched) await atomic(join(f.scope.root, job.id, "done.json"), { state: "cancelled", report: `partial ${job.id}` }, true);
+  for (const job of launched) {
+    await atomic(join(f.scope.root, job.id, "shutdown.json"), { verified: true }, true);
+    await atomic(join(f.scope.root, job.id, "done.json"), { state: "cancelled", report: `partial ${job.id}` }, true);
+  }
   await f.settle();
   assert.ok((await jobs(f.scope)).every((job) => job.closed && !job.collected));
   assert.equal((await jobs(other))[0].closed, undefined);
@@ -87,6 +90,21 @@ test("Stop broadcasts all 16 cancellations before acknowledgements, closes only 
     assert.equal(output.reports.length, 16);
     assert.ok(output.reports.every((report) => report.state === "cancelled" && report.text.startsWith("partial")));
   });
+});
+
+test("parent Stop persists durable cancellation while offline without starting a coordinator", async (t) => {
+  const f = await fixture(t);
+  await f.add(1);
+  await mkdir(join(f.scope.root, "durable"), { recursive: true, mode: 0o700 });
+  await f.emit("session_shutdown", { reason: "reload" });
+  assert.equal(await stat(join(f.scope.root, "durable", "parent-stop.json")).catch(() => undefined), undefined);
+  await f.emit("session_start");
+  f.controller.abort();
+  await f.settle();
+  const intent = JSON.parse(await readFile(join(f.scope.root, "durable", "parent-stop.json"), "utf8"));
+  assert.match(intent.requestId, /^parent-stop:/);
+  assert.equal(await stat(join(f.scope.root, "durable", "lease.json")).catch(() => undefined), undefined);
+  assert.equal((await jobs(f.scope))[0].closed, true);
 });
 
 test("Stop cleanup survives blocked state lock and next prompt waits without cancelling its new jobs", async (t) => {

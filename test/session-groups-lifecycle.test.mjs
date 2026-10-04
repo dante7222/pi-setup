@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
+import { isolateHerdrEnvironment } from "./helpers/herdr-test-environment.mjs";
 import {
   createAgentSession,
   createAgentSessionRuntime,
@@ -18,6 +19,12 @@ import {
 import sessionGroups from "../extensions/session-groups/index.ts";
 import { readSessionGroupMembership } from "../extensions/session-groups/membership.ts";
 import { SessionGroupStore } from "../extensions/session-groups/store.ts";
+
+// These are parent-runtime fixtures. Worker inheritance has its own tests;
+// ambient subagent policy must not change the parent lifecycle under test.
+beforeEach((t) => {
+  isolateHerdrEnvironment(t, { PI_HERDR_WORKER: "0", PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR ?? "" });
+});
 
 const request = "Add the approved decision to shared group context.";
 const editArgs = {

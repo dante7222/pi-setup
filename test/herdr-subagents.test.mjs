@@ -1,21 +1,27 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
+import { isolateHerdrEnvironment } from "./helpers/herdr-test-environment.mjs";
 import extension from "../extensions/herdr-subagents/index.ts";
 import { agentDirectory, atomic, cleanup, closeJob, closeJobs, collect, jobs, launcher, locked, PAGE_BYTES, piArgs, reportPage, save, scopeFor, spawnTasks, splitTarget, status, systemPrompt, validateTasks } from "../extensions/herdr-subagents/core.ts";
 import { finalReport } from "../extensions/herdr-subagents/worker.ts";
+import { processIdentity } from "../extensions/herdr-subagents/identity.ts";
+import { configurePresets } from "../extensions/herdr-subagents/policy.ts";
 
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), "pi-herdr-test-"));
-  t.after(() => rm(directory, { recursive: true, force: true }));
   const backend = join(directory, "herdr.mjs");
   const statePath = join(directory, "panes.json");
+  const env = isolateHerdrEnvironment(t, {
+    PI_CODING_AGENT_DIR: directory, HERDR_ENV: "1", HERDR_PANE_ID: "w:p-main", HERDR_WORKSPACE_ID: "w",
+    HERDR_SOCKET_PATH: "test.sock", HERDR_BIN_PATH: backend, PI_HERDR_PI_BIN: process.execPath, FAKE_STATE: statePath,
+  }, () => rm(directory, { recursive: true, force: true }));
   await writeFile(statePath, JSON.stringify({ calls: [], panes: [{ pane_id: "w:p-main", terminal_id: "main" }], next: 1 }));
   await writeFile(backend, `#!${process.execPath}
 import {readFileSync,writeFileSync} from 'node:fs';
@@ -39,16 +45,15 @@ if(process.env.FAKE_FAIL===args[1]) { console.error('injected failure'); process
 if(!['run','report-agent'].includes(args[1])) console.log(JSON.stringify({result}));
 `);
   await chmod(backend, 0o700);
-  const env = { ...process.env, PI_HERDR_WORKER: "", PI_CODING_AGENT_DIR: directory, HERDR_ENV: "1", HERDR_PANE_ID: "w:p-main", HERDR_WORKSPACE_ID: "w", HERDR_SOCKET_PATH: "test.sock", HERDR_BIN_PATH: backend, PI_HERDR_PI_BIN: process.execPath, FAKE_STATE: statePath };
   const scope = scopeFor("test-session", env);
   return { directory, statePath, env, scope, backend };
 }
 
 function task(name, extra = {}) { return validateTasks([{ name, prompt: "test task", ...extra }], {}, process.cwd())[0]; }
 
-async function cli(scope, args, input = "") {
+async function cli(scope, args, input = "", cwd) {
   const child = spawn(process.execPath, [launcher, ...args], {
-    env: { ...scope.env, PI_SESSION_ID: "test-session" }, stdio: "pipe",
+    env: { ...scope.env, PI_SESSION_ID: "test-session" }, stdio: "pipe", cwd,
   });
   const closed = once(child, "close");
   let stdout = "", stderr = "";
@@ -63,6 +68,7 @@ async function cli(scope, args, input = "") {
 
 async function completed(scope, job, text, state = "done") {
   await writeFile(join(scope.root, job.id, "result.md"), text);
+  await atomic(join(scope.root, job.id, "shutdown.json"), { verified: true }, true);
   await atomic(join(scope.root, job.id, "done.json"), { state, report: text }, true);
 }
 
@@ -97,12 +103,12 @@ test("all roles retain normal Pi resource and tool discovery; extra extensions a
   }
 });
 
-test("scope cannot follow focus or recurse; session and socket isolate ownership", async (t) => {
+test("scope follows a session across Herdr restore but never a fork or worker recursion", async (t) => {
   const { env, scope } = await fixture(t);
   assert.throws(() => scopeFor(undefined, { ...env, HERDR_ENV: "0" }));
   assert.throws(() => scopeFor("x", { ...env, PI_HERDR_WORKER: "1" }));
   assert.notEqual(scope.root, scopeFor("other", env).root);
-  assert.notEqual(scope.root, scopeFor("test-session", { ...env, HERDR_SOCKET_PATH: "other.sock" }).root);
+  assert.equal(scope.root, scopeFor("test-session", { ...env, HERDR_SOCKET_PATH: "other.sock", HERDR_PANE_ID: "restored:pane" }).root);
 });
 
 test("layout leaves main alone after first split, chooses largest owned area", () => {
@@ -297,8 +303,8 @@ test("disappeared/replaced panes never count as success and identity prevents un
   state.panes = state.panes.slice(0, 1);
   await writeFile(statePath, JSON.stringify(state));
   await collect(scope, 0, async (output) => assert.equal(output.reports[0].state, "failed"));
-  await cleanup(scope);
-  assert.equal((await jobs(scope))[0].closed, true);
+  await assert.rejects(cleanup(scope), /cleanup not verified/);
+  assert.equal((await jobs(scope))[0].closed, undefined);
 });
 
 test("close tolerates Herdr auto-removing a completed pane", async (t) => {
@@ -354,7 +360,7 @@ test("worker captures exact events/final text and retains its pane without regis
   await writeFile(fakePi, `import {writeFileSync} from 'node:fs';
 let input='';for await(const chunk of process.stdin) input+=chunk;
 writeFileSync(${JSON.stringify(join(directory, "stdin"))},input);
-const events=[{type:'agent_start'},{type:'message_end',message:{role:'assistant',content:[{type:'text',text:'result 😀\\nEND'}],stopReason:'stop'}},{type:'agent_end'}];
+const events=[{type:'agent_start'},{type:'message_end',message:{role:'assistant',content:[{type:'text',text:'result 😀\\nEND'}],stopReason:'stop'}},{type:'agent_end'},{type:'agent_settled'}];
 const bytes=Buffer.from(events.map(e=>JSON.stringify(e)).join('\\n')+'\\n');
 for(let i=0;i<bytes.length;i+=3) process.stdout.write(bytes.subarray(i,i+3));
 `);
@@ -373,7 +379,7 @@ for(let i=0;i<bytes.length;i+=3) process.stdout.write(bytes.subarray(i,i+3));
   assert.equal(await readFile(join(jobdir, "result.md"), "utf8"), "result 😀\nEND");
   const events = await readFile(join(jobdir, "events.jsonl"), "utf8");
   assert.match(events, /😀/);
-  assert.equal(events.trim().split("\n").length, 3);
+  assert.equal(events.trim().split("\n").length, 4);
   assert.equal(child.exitCode, null);
   child.kill("SIGTERM");
   await closed;
@@ -403,14 +409,11 @@ for (const trigger of ["timeout", "cancel"]) test(`worker ${trigger} kills its p
   assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")).calls, calls, "Interrupted workers must not register agent state either");
 });
 
-test("extension adds zero tools/prompt messages; settle closes only consumed panes, reload preserves workers", async (t) => {
-  const { scope, env } = await fixture(t);
-  const old = { ...process.env };
-  Object.assign(process.env, env);
-  t.after(() => { for (const key of Object.keys(process.env)) if (!(key in old)) delete process.env[key]; Object.assign(process.env, old); });
+test("extension registers only deferred tools; settle closes consumed panes and reload preserves workers", async (t) => {
+  const { scope } = await fixture(t);
   const handlers = new Map();
   const commands = new Map();
-  extension({ on: (name, fn) => handlers.set(name, fn), registerCommand: (name, fn) => commands.set(name, fn) });
+  extension({ on: (name, fn) => handlers.set(name, fn), registerCommand: (name, fn) => commands.set(name, fn), registerTool: (tool) => assert.equal(tool.exposure, "deferred") });
   assert.deepEqual([...handlers.keys()], ["session_start", "before_agent_start", "agent_start", "session_before_compact", "agent_end", "agent_settled", "session_shutdown"]);
   const [read, unread] = await spawnTasks(scope, [task("read"), task("unread")]);
   await completed(scope, read, "ok");
@@ -431,10 +434,8 @@ test("tilde config paths match Pi and extension anchors relative paths", async (
   assert.equal(agentDirectory({ PI_CODING_AGENT_DIR: "~/.pi/agent" }), agentDirectory({}));
   const path = join(env.PI_CODING_AGENT_DIR, "config with spaces");
   assert.equal(agentDirectory({ PI_CODING_AGENT_DIR: pathToFileURL(path).href }), path);
-  const old = { ...process.env };
-  Object.assign(process.env, env, { PI_CODING_AGENT_DIR: ".test-agent-dir" });
-  t.after(() => { for (const key of Object.keys(process.env)) if (!(key in old)) delete process.env[key]; Object.assign(process.env, old); });
-  extension({ on() {}, registerCommand() {} });
+  process.env.PI_CODING_AGENT_DIR = ".test-agent-dir";
+  extension({ on() {}, registerCommand() {}, registerTool() {} });
   assert.equal(process.env.PI_CODING_AGENT_DIR, join(process.cwd(), ".test-agent-dir"));
 });
 
@@ -563,4 +564,105 @@ test("failed process cleanup prevents automatic pane closure", async (t) => {
   await atomic(join(scope.root, job.id, "done.json"), { state: "failed", report: "", cleanupError: "ps unavailable" }, true);
   await collect(scope, 0, async () => {});
   await assert.rejects(cleanup(scope), /ps unavailable.*pane retained/);
+});
+
+test("synthetic completion recovers checkpoint text but never acknowledges process cleanup", async (t) => {
+  const { scope, statePath } = await fixture(t);
+  const [job] = await spawnTasks(scope, [task("orphan")]);
+  const directory = join(scope.root, job.id);
+  await atomic(join(directory, "worker.json"), { pid: process.pid, identity: { ...await processIdentity(), start: "dead supervisor" } }, true);
+  await atomic(join(directory, "checkpoint.json"), { report: "Recoverable evidence", settled: true });
+  await writeFile(join(directory, "result.md"), "");
+  job.endedAt = Date.now() - 6000;
+  await save(scope, job);
+  await collect(scope, 0, async (output) => {
+    assert.equal(output.reports[0].state, "failed");
+    assert.match(output.reports[0].text, /Recoverable evidence/);
+  });
+  await assert.rejects(closeJob(scope, job, true, Date.now() + 150), /not acknowledged/);
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).panes.length, 2);
+});
+
+test("live handoff retains a proven worker as unattached, never synthesizes death", async (t) => {
+  const { scope, statePath } = await fixture(t);
+  const [job] = await spawnTasks(scope, [task("handoff")]);
+  await atomic(join(scope.root, job.id, "worker.json"), { pid: process.pid, identity: await processIdentity() }, true);
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.panes[1].terminal_id = "new-server-terminal";
+  await writeFile(statePath, JSON.stringify(state));
+  job.endedAt = Date.now() - 6000; // provisional disappearance before the startup claim
+  await save(scope, job);
+  assert.equal((await status(scope)).jobs[0].state, "unattached");
+  assert.equal((await jobs(scope))[0].endedAt, undefined);
+  await assert.rejects(closeJob(scope, job, true), /identity changed/);
+});
+
+test("a live reused PID cannot strand a stale bakery-lock claim", async (t) => {
+  const { scope } = await fixture(t);
+  await mkdir(join(scope.root, "locks"), { recursive: true });
+  const path = join(scope.root, "locks", "00000000-deadbeef.json");
+  await atomic(path, { pid: process.pid, identity: { ...await processIdentity(), start: "previous process" }, choosing: true, ticket: 0 });
+  assert.equal(await locked(scope, async () => "acquired"), "acquired");
+  assert.equal(await stat(path).catch(() => undefined), undefined);
+});
+
+test("spawn request IDs replay the same jobs after response loss and reject changed tasks", async (t) => {
+  const { scope, statePath } = await fixture(t);
+  const tasks = [task("idempotent")];
+  const first = await spawnTasks(scope, tasks, "request-1");
+  assert.deepEqual(await spawnTasks(scope, tasks, "request-1"), JSON.parse(JSON.stringify(first)));
+  await assert.rejects(spawnTasks(scope, [task("other")], "request-1"), /different tasks/);
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).calls.filter((args) => args[1] === "split").length, 1);
+  await completed(scope, first[0], "done");
+  await collect(scope, 0, async () => {});
+  await cleanup(scope);
+  assert.equal((await spawnTasks(scope, tasks, "request-1"))[0].id, first[0].id);
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).panes.length, 1);
+});
+
+test("CLI retries retain raw identity after inherited model/thinking/cwd and presets change", async (t) => {
+  const { scope, directory, statePath } = await fixture(t);
+  Object.assign(scope.env, { PI_HERDR_OWNER_PID: String(process.pid), PI_SESSION_FILE: undefined, PI_PROVIDER: "first", PI_MODEL: "model", PI_REASONING_LEVEL: "high" });
+  await mkdir(scope.root, { recursive: true });
+  await configurePresets(scope, { review: { model: "preset/model", thinking: "low" } });
+  const request = [{ name: "inherited", prompt: "Inspect" }, { name: "preset", prompt: "Inspect", preset: "review" }];
+  const first = await cli(scope, ["spawn", "-", "stable-cli"], JSON.stringify(request), directory);
+  const original = await jobs(scope);
+  assert.equal(original.find((job) => job.task.name === "inherited").task.cwd, await realpath(directory));
+  assert.equal(original.find((job) => job.task.name === "inherited").task.model, "first/model");
+  assert.equal(original.find((job) => job.task.name === "inherited").task.thinking, "high");
+  const changedCwd = join(directory, "changed");
+  await mkdir(changedCwd);
+  Object.assign(scope.env, { PI_PROVIDER: "changed", PI_MODEL: "other", PI_REASONING_LEVEL: "off" });
+  for (const presets of [{ review: { model: "changed/preset", thinking: "max" } }, {}]) {
+    await configurePresets(scope, presets);
+    assert.deepEqual(await cli(scope, ["spawn", "-", "stable-cli"], JSON.stringify(request), changedCwd), first);
+  }
+  assert.deepEqual(await jobs(scope), original);
+  await assert.rejects(cli(scope, ["spawn", "-", "stable-cli"], JSON.stringify([{ ...request[0], model: "first/model" }, request[1]]), changedCwd), /different tasks/);
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).calls.filter((args) => args[1] === "split").length, 2);
+});
+
+test("failed idempotent launch never blindly replays a possibly delivered pane split", async (t) => {
+  const { scope, statePath } = await fixture(t);
+  const tasks = [task("uncertain")];
+  await assert.rejects(spawnTasks({ ...scope, env: { ...scope.env, FAKE_FAIL: "split" } }, tasks, "request-uncertain"), /ownership is unresolved/);
+  await assert.rejects(spawnTasks(scope, tasks, "request-uncertain"), /failed.*not be replayed/);
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).calls.filter((args) => args[1] === "split").length, 1);
+});
+
+test("spawn queued behind cancellation cannot launch after cleanup finishes", async (t) => {
+  const { scope, statePath } = await fixture(t);
+  const controller = new AbortController();
+  let stopped, rejected;
+  await locked(scope, async () => {
+    stopped = cleanup(scope, true);
+    await delay(50);
+    rejected = assert.rejects(spawnTasks(scope, [task("late")], "cancelled-request", controller.signal), /abort/i);
+    controller.abort();
+  });
+  await rejected;
+  assert.deepEqual(await stopped, []);
+  assert.deepEqual(await jobs(scope), []);
+  assert.ok(!JSON.parse(await readFile(statePath, "utf8")).calls.some((args) => args[1] === "split" || args[1] === "run"));
 });

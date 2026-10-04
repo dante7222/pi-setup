@@ -65,6 +65,10 @@ test("injected default reaches real Bash and preserves output on timeout", { tim
     await readyPromise;
     // Advance the real backend's deadline, not a mocked execute implementation.
     t.mock.timers.tick(120000);
+    // Pi arms a short stdio-drain timer asynchronously after child exit. The
+    // deadline already fired; leave subsequent process cleanup on real timers
+    // rather than freezing it after the single mock-clock advance under load.
+    t.mock.timers.reset();
     await rejected;
   } finally {
     abort.abort();
@@ -90,5 +94,9 @@ test("normal results and exit failures retain built-in behavior", async () => {
   assert.equal(result.content[0].text, "ok");
   const failure = bashEvent({ command: "printf problem >&2; exit 7" });
   loadHook()(failure);
-  await assert.rejects(tool.execute("test", failure.input), /problem[\s\S]*Command exited with code 7/);
+  const failed = await tool.execute("test", failure.input);
+  assert.equal(failed.isError, true);
+  assert.match(failed.content[0].text, /problem[\s\S]*Command exited with code 7/);
+  assert.equal(failed.structuredContent.exit_code, 7);
+  assert.equal(failed.structuredContent.output, "problem");
 });

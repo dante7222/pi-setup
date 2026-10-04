@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
+import { isolateHerdrEnvironment } from "./helpers/herdr-test-environment.mjs";
 import sessionGroups from "../extensions/session-groups/index.ts";
 import { readSessionGroupMembership } from "../extensions/session-groups/membership.ts";
 import { SessionGroupStore } from "../extensions/session-groups/store.ts";
+
+// Parent fixtures must not inherit the invoking worker's group policy.
+beforeEach((t) => { isolateHerdrEnvironment(t, {}); });
 
 async function startUserPrompt(handlers, ctx, prompt) {
   const result = await handlers.get("before_agent_start")(

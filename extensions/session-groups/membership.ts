@@ -8,6 +8,7 @@ import type {
   SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
+  isSessionGroupId,
   parseSessionGroupMembership,
   parseSessionGroupToolState,
   SESSION_GROUP_CHANGELOG_TOOL_STATE_ENTRY,
@@ -62,7 +63,7 @@ export interface SessionStartMembershipInput {
 export interface SessionStartMembershipResolution {
   groupId: string | null;
   shouldAppend: boolean;
-  origin: "stored" | "active" | "inherited" | "ungrouped";
+  origin: "stored" | "active" | "inherited" | "ungrouped" | "worker";
 }
 
 export class SessionGroupMembershipError extends Error {
@@ -256,11 +257,29 @@ export function consumeSessionGroupTransition(
   return { version: SESSION_GROUPS_VERSION, groupId: handoff.sourceGroupId };
 }
 
+/**
+ * Herdr's PI_HERDR_GROUP is a resolved launch policy ("none" or a group UUID),
+ * never "inherit": the dispatcher resolves inheritance from parent metadata.
+ * With PI_HERDR_WORKER=1, missing/invalid policy fails closed to ungrouped, and
+ * neither the global active group nor source-session fallback can override it.
+ * The session-start controller validates the selected group's existence before
+ * presentation/context injection; deleted groups become ungrouped, not active.
+ *
+ * Launch policy initializes membership only. Startup with stored membership and
+ * resume/reload preserve it (including an explicit null), even if launch policy
+ * changes. Existing legacy sessions without membership remain ungrouped. Use
+ * /group join or /group leave to change a persistent worker's stored membership.
+ * New/fork lifecycle destinations use the worker launch policy again.
+ */
 export function resolveSessionStartMembership(
   input: SessionStartMembershipInput,
+  environment: Partial<Pick<NodeJS.ProcessEnv, "PI_HERDR_WORKER" | "PI_HERDR_GROUP">> = process.env,
 ): SessionStartMembershipResolution {
   const stored = input.destinationMembership;
-  if (input.reason === "resume" || input.reason === "reload") {
+  if (
+    input.reason === "resume" || input.reason === "reload" ||
+    (input.reason === "startup" && stored !== undefined)
+  ) {
     return {
       groupId: stored?.groupId ?? null,
       shouldAppend: stored === undefined,
@@ -268,14 +287,15 @@ export function resolveSessionStartMembership(
     };
   }
 
+  if (environment.PI_HERDR_WORKER === "1") {
+    const existingUngrouped = input.reason === "startup" && input.destinationIsExistingSession;
+    const groupId = !existingUngrouped && isSessionGroupId(environment.PI_HERDR_GROUP)
+      ? environment.PI_HERDR_GROUP
+      : null;
+    return { groupId, shouldAppend: true, origin: groupId === null ? "ungrouped" : "worker" };
+  }
+
   if (input.reason === "startup") {
-    if (stored !== undefined) {
-      return {
-        groupId: stored.groupId,
-        shouldAppend: false,
-        origin: stored.groupId ? "stored" : "ungrouped",
-      };
-    }
     if (input.destinationHasParent) {
       return {
         groupId: input.sourceGroupId ?? input.activeGroupId,

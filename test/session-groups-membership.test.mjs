@@ -2,13 +2,17 @@ import assert from "node:assert/strict";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
+import { isolateHerdrEnvironment } from "./helpers/herdr-test-environment.mjs";
 import {
   consumeSessionGroupTransition,
   readSessionGroupMembershipFromFile,
   recordSessionGroupTransition,
   resolveSessionStartMembership,
 } from "../extensions/session-groups/membership.ts";
+
+// Parent fixtures must not inherit the invoking worker's group policy.
+beforeEach((t) => { isolateHerdrEnvironment(t, {}); });
 
 const SOURCE_ID = "019cda47-9baf-7000-8000-000000000001";
 const ACTIVE_ID = "019cda47-9baf-7000-8000-000000000002";

@@ -12,6 +12,12 @@ export interface ProcessEntry {
   start: string;
 }
 export type ProcessSnapshot = readonly ProcessEntry[];
+export interface ProcessEvidence {
+  root: number;
+  start: string;
+  processes: Array<[number, string]>;
+  groups: Array<[number, string]>;
+}
 
 /** Only process identities/relationships: never commands, arguments or environment. */
 export async function snapshotProcesses(): Promise<ProcessSnapshot> {
@@ -65,6 +71,28 @@ export class ProcessTree {
       throw new Error("ProcessTree requires an owned child PID greater than 1.");
     }
     this.pid = pid;
+  }
+
+  /** Private durable discovery evidence, never authority without live revalidation. */
+  async evidence(): Promise<ProcessEvidence> {
+    return this.enqueue(async () => {
+      if (!this.rootStart) throw new Error("Root identity was never established.");
+      return { root: this.pid, start: this.rootStart, processes: [...this.processes], groups: [...this.groups] };
+    });
+  }
+
+  static restore(evidence: ProcessEvidence): ProcessTree {
+    if (!evidence || typeof evidence.start !== "string" || !evidence.start ||
+      ![evidence.processes, evidence.groups].every((entries) => Array.isArray(entries) && entries.every((entry) =>
+        Array.isArray(entry) && entry.length === 2 && Number.isSafeInteger(entry[0]) && entry[0] > 1 && typeof entry[1] === "string" && !!entry[1]))) {
+      throw new Error("Invalid saved process evidence.");
+    }
+    const tree = new ProcessTree(evidence.root);
+    tree.initialized = true;
+    tree.rootStart = evidence.start;
+    for (const [pid, start] of evidence.processes) tree.processes.set(pid, start);
+    for (const [pid, start] of evidence.groups) tree.groups.set(pid, start);
+    return tree;
   }
 
   /** With an argument, merge a trusted pre-exit snapshot rather than sample ps. */
