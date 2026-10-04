@@ -9,7 +9,6 @@ import { Check } from "typebox/value";
 import * as core from "../extensions/herdr-subagents/core.ts";
 import * as reports from "../extensions/herdr-subagents/reports.ts";
 import * as conversations from "../extensions/herdr-subagents/conversations.ts";
-import * as groups from "../extensions/herdr-subagents/groups.ts";
 import * as presentation from "../extensions/herdr-subagents/presentation.ts";
 import * as scheduler from "../extensions/herdr-subagents/scheduler.ts";
 import * as recovery from "../extensions/herdr-subagents/recovery.ts";
@@ -34,7 +33,6 @@ function tool(coreOverrides = {}, reportOverrides = {}, workflowOverrides = {}) 
     "./reports.ts": { ...reports, ...reportOverrides },
     "./ownership.ts": { claimScope: async () => {} },
     "./conversations.ts": conversations,
-    "./groups.ts": groups,
     "./presentation.ts": presentation,
     "./scheduler.ts": scheduler,
     "./recovery.ts": recovery,
@@ -206,7 +204,7 @@ if(action!=='run')console.log(JSON.stringify({result}));
     { name: "preset", prompt: "inspect", preset: "review" },
   ];
   const preparationContext = {
-    sessionManager: { getSessionId: () => "current-session", getEntries() { assert.fail("Preparation must not resolve group"); } },
+    sessionManager: { getSessionId: () => "current-session" },
     get model() { assert.fail("Preparation must not resolve model"); },
     get thinkingLevel() { assert.fail("Preparation must not resolve thinking"); },
     get cwd() { assert.fail("Preparation must not resolve cwd"); },
@@ -221,15 +219,14 @@ if(action!=='run')console.log(JSON.stringify({result}));
   assert.equal(snapshot.find((job) => job.task.name === "preset").task.model, "preset/first");
   for (const presets of [{ review: { model: "preset/changed", thinking: "max" } }, {}]) {
     await policy.configurePresets(scope, presets);
-    const changed = { ...context, model: { provider: "changed", id: "changed" }, thinkingLevel: "off", cwd: "/missing/retry-cwd",
-      sessionManager: { ...ctx.sessionManager, getEntries() { throw new Error("Retry must not resolve group"); } } };
+    const changed = { ...context, model: { provider: "changed", id: "changed" }, thinkingLevel: "off", cwd: "/missing/retry-cwd" };
     assert.deepEqual(envelope(definition, await execute(definition, request, changed), "spawn").data, first);
     assert.deepEqual(envelope(definition, await execute(definition, request, { ...changed, model: undefined }), "spawn").data, first);
   }
   const record = JSON.parse(await readFile(join(scope.root, "requests", (await readdir(join(scope.root, "requests")))[0]), "utf8"));
   assert.deepEqual(record.intent, intent);
   assert.deepEqual(record.tasks, first.jobs.map(({ id }) => snapshot.find((job) => job.id === id).task));
-  for (const change of [{ model: "explicit/model" }, { thinking: "high" }, { cwd: scope.root }, { group: "none" }, { prompt: "changed" }, { preset: "deleted" }]) {
+  for (const change of [{ model: "explicit/model" }, { thinking: "high" }, { cwd: scope.root }, { prompt: "changed" }, { preset: "deleted" }]) {
     const changed = { ...request, tasks: [{ ...intent[0], ...change }, intent[1]] };
     const failure = envelope(definition, await execute(definition, changed, context), "spawn", false);
     assert.match(failure.error, /different tasks/);

@@ -373,13 +373,13 @@ test("cancellation cannot miss a generation-to-tool handoff behind a stale task 
 test("durable coding shells inherit the recursive-delegation fence", async (t) => {
 	let result;
 	const script = scripted([
-		fauxAssistantMessage(fauxToolCall("bash", { command: "printf '%s:%s' \"$PI_HERDR_WORKER\" \"$PI_HERDR_GROUP\"" }), { stopReason: "toolUse" }),
+		fauxAssistantMessage(fauxToolCall("bash", { command: "printf 'worker=%s' \"$PI_HERDR_WORKER\"" }), { stopReason: "toolUse" }),
 		(context) => { result = context.messages.findLast((message) => message.role === "toolResult"); return fauxAssistantMessage("Checked fence"); },
 	]);
 	const f = await fixture(t, script);
 	const job = await f.engine.dispatch(spawn("fence", { tools: "coding" }));
 	await report(f.engine, job.id);
-	assert.match(JSON.stringify(result.content), /1:none/);
+	assert.match(JSON.stringify(result.content), /worker=1/);
 });
 
 test("wait does not block cancellation; cancel all stops active and queued intents durably", async (t) => {

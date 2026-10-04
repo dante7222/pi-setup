@@ -8,7 +8,6 @@
 - `timeout`: execution seconds, default 1800; range 1–86400. Queue time is separate.
 - `extensions`: additive local extension paths; normal Pi resource discovery remains enabled.
 - `persistent`: opt in to a private saved Pi conversation and supervised RPC; default false.
-- `group`: `inherit` (default), `none`, or a session-group UUID. Inheritance uses the parent's persisted membership, never the global active group. Stored membership wins on continuation; invalid/deleted groups cannot join the global active group.
 - `presentation`: `quiet` (default) or `agent` for Herdr agent metadata/custom restore. Herdr restore opens a **read-only report viewer**, never replays the task or launches unsupervised Pi.
 - `maxTokens`, `maxCost`: positive soft per-attempt budgets, checked after finalized usage. An in-flight request can exceed them; missing provider cost data cannot enforce a cost limit.
 - `preset`: a configured per-parent model policy; explicit fields override it. Changing model drops inherited preset thinking unless supplied explicitly.

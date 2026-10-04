@@ -88,7 +88,7 @@ class DurableEnvironment extends NodeExecutionEnv {
     try {
       // Environment values must never enter the durable journal or argv. Bound
       // the private pipe payload (the gated receiver enforces the same limit).
-      const env = { ...(options?.inheritEnv === false ? {} : process.env), ...options?.env, PI_HERDR_WORKER: "1", PI_HERDR_GROUP: "none" };
+      const env = { ...(options?.inheritEnv === false ? {} : process.env), ...options?.env, PI_HERDR_WORKER: "1" };
       let environmentBytes = 0;
       for (const [key, value] of Object.entries(env)) {
         if (typeof value !== "string" || key.includes("\0") || key.includes("=") || value.includes("\0")) {
@@ -115,7 +115,7 @@ class DurableEnvironment extends NodeExecutionEnv {
         detached: true, stdio: ["pipe", "pipe", "ignore", "pipe"],
         // In particular, never allow inherited NODE_OPTIONS/loader hooks to run
         // in the supervisor before it claims ownership.
-        env: { PATH: "/usr/bin:/bin", PI_HERDR_WORKER: "1", PI_HERDR_GROUP: "none" },
+        env: { PATH: "/usr/bin:/bin", PI_HERDR_WORKER: "1" },
       });
       launched = true;
       child.once("exit", () => { exited = true; });

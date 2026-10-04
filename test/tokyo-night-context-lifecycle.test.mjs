@@ -3,7 +3,6 @@ import { stripVTControlCharacters } from "node:util";
 import test from "node:test";
 import tokyoNightFooter from "../extensions/tokyo-night-footer/index.ts";
 import { estimateLoadedContextTokens } from "../extensions/tokyo-night-footer/context-usage.ts";
-import { SESSION_GROUP_PRESENTATION_EVENT } from "../extensions/session-groups/contracts.ts";
 
 function formatExpectedTokens(count) {
   if (count < 1_000) return count.toString();
@@ -11,12 +10,11 @@ function formatExpectedTokens(count) {
   return `${Math.round(count / 1_000)}k`;
 }
 
-test("calculates context after session-group tool gating and prompt injection", async () => {
+test("calculates context after dynamic tool loadout and prompt changes", async () => {
   const previousNerdFonts = process.env.POWERLINE_NERD_FONTS;
   process.env.POWERLINE_NERD_FONTS = "0";
 
   const handlers = new Map();
-  const eventHandlers = new Map();
   const widgets = [];
   const tools = [
     {
@@ -25,13 +23,13 @@ test("calculates context after session-group tool gating and prompt injection", 
       parameters: { type: "object", properties: { path: { type: "string" } } },
     },
     {
-      name: "edit_group_context",
-      description: "Large shared-context editing tool schema",
+      name: "edit_document",
+      description: "Large document editing tool schema",
       parameters: { type: "object", properties: { edits: { type: "array" } } },
     },
     {
-      name: "group_changelog",
-      description: "Large group changelog tool schema",
+      name: "query_history",
+      description: "Large history query tool schema",
       parameters: { type: "object", properties: { action: { type: "string" } } },
     },
   ];
@@ -42,15 +40,6 @@ test("calculates context after session-group tool gating and prompt injection", 
   const pi = {
     on(name, handler) {
       handlers.set(name, handler);
-    },
-    events: {
-      on(channel, handler) {
-        eventHandlers.set(channel, handler);
-        return () => eventHandlers.delete(channel);
-      },
-      emit(channel, value) {
-        eventHandlers.get(channel)?.(value);
-      },
     },
     getActiveTools: () => [...activeToolNames],
     getAllTools: () => tools,
@@ -99,11 +88,7 @@ test("calculates context after session-group tool gating and prompt injection", 
     await handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
 
     activeToolNames = ["read"];
-    pi.events.emit(SESSION_GROUP_PRESENTATION_EVENT, {
-      version: 1,
-      sessionId: "session-1",
-      group: null,
-    });
+    await handlers.get("resources_discover")({ type: "resources_discover" }, ctx);
     const startupEstimate = estimateLoadedContextTokens(
       effectiveSystemPrompt,
       tools,
@@ -124,7 +109,7 @@ test("calculates context after session-group tool gating and prompt injection", 
     assert.match(widgets.at(-1), new RegExp(`~${formatExpectedTokens(startupEstimate)}/230k`));
 
     activeToolNames = ["read"];
-    effectiveSystemPrompt = "base system prompt\n\n<session_group_context>shared plan</session_group_context>";
+    effectiveSystemPrompt = "base system prompt\n\nUse the current document plan.";
     await handlers.get("agent_start")({ type: "agent_start" }, ctx);
     const requestEstimate = estimateLoadedContextTokens(
       effectiveSystemPrompt,

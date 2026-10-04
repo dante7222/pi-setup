@@ -7,7 +7,7 @@
 - `cwd`: caller directory; worktrees must exist.
 - `timeout`: execution seconds, default 1800; range 1–86400.
 - `extensions`: additive local paths; normal Pi discovery stays enabled.
-- `persistent`, `group`, `presentation`, `maxTokens`, `maxCost`, `preset`: opt-in conversation/control and policy options in [persistent.md](persistent.md).
+- `persistent`, `presentation`, `maxTokens`, `maxCost`, `preset`: opt-in conversation/control and policy options in [persistent.md](persistent.md).
 
 Default concurrency: 4; maximum open jobs: 16. `collect [seconds]` waits 0–60 seconds and paginates losslessly (12 KB/call); use replayable `read`/`ack` in codemode.
 

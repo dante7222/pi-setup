@@ -3,7 +3,6 @@ import { readFile } from "node:fs/promises";
 import { cleanup, closeJobs, collect, jobs, locked, scopeFor, spawnTasks, status } from "../../extensions/herdr-subagents/core.ts";
 import { claimScope } from "../../extensions/herdr-subagents/ownership.ts";
 import { continueTask, sendTask, stopTask } from "../../extensions/herdr-subagents/conversations.ts";
-import { parentGroupFromFile } from "../../extensions/herdr-subagents/groups.ts";
 import { reattachJob, replayViewer } from "../../extensions/herdr-subagents/presentation.ts";
 import { configure, settings } from "../../extensions/herdr-subagents/scheduler.ts";
 import { recoverTask } from "../../extensions/herdr-subagents/recovery.ts";
@@ -32,9 +31,7 @@ try {
         const intent = JSON.parse(await readFile(!args[0] || args[0] === "-" ? "/dev/stdin" : args[0], "utf8"));
         const created = await spawnTasks(scope, {
           intent,
-          resolve: async (input) => resolveTasks(scope, input, {
-            ...process.env, PI_HERDR_PARENT_GROUP: await parentGroupFromFile(process.env.PI_SESSION_FILE),
-          }, process.cwd()),
+          resolve: (input) => resolveTasks(scope, input, process.env, process.cwd()),
         }, args[1]);
         await emit({ jobs: created.map((job) => ({ id: job.id, name: job.task.name })) });
         break;

@@ -53,13 +53,13 @@ test("durable shell delegates files; streams and spills complete output; forces 
   assert.equal((await env.writeFile("file", "text", ctx)).ok, true);
   assert.equal((await env.readTextFile("file", ctx)).value, "text");
   let output = "";
-  const result = await env.exec('printf "%s/%s\\n" "$PI_HERDR_WORKER" "$PI_HERDR_GROUP"; printf err >&2; printf "\\303\\251"', {
-    inheritEnv: false, env: { PI_HERDR_WORKER: "0", PI_HERDR_GROUP: "inherited" },
+  const result = await env.exec('printf "worker=%s\\n" "$PI_HERDR_WORKER"; printf err >&2; printf "\\303\\251"', {
+    inheritEnv: false, env: { PI_HERDR_WORKER: "0" },
     spill: { afterBytes: 2, afterLines: 2 }, onOutput: (text, context) => { assert.equal(context, ctx); output += text; },
   }, ctx);
   assert.equal(result.ok, true);
   assert.equal(result.value.exitCode, 0);
-  assert.match(output, /1\/none/); assert.match(output, /err/); assert.match(output, /é/);
+  assert.match(output, /worker=1/); assert.match(output, /err/); assert.match(output, /é/);
   assert.equal(await readFile(result.value.spillPath, "utf8"), output);
   await acknowledgement(dir);
   const request = JSON.parse(await readFile(join(await execution(dir), "request.json"), "utf8"));
@@ -81,8 +81,8 @@ test("private inherited and explicit environments use bounded anonymous pipes, n
     else process.env.NODE_OPTIONS = saved.nodeOptions;
   });
   let output = "";
-  const pending = env.exec('[ -n "$DURABLE_INHERITED_SECRET" ] && [ -n "$DURABLE_EXPLICIT_SECRET" ] && [ -n "$NODE_OPTIONS" ] && [ "$PI_HERDR_WORKER/$PI_HERDR_GROUP" = 1/none ] && [ "${#PAD_A}/${#PAD_B}/${#PAD_C}" = 49152/49152/49152 ] && printf "present\\n"; touch ready; while [ ! -e release ]; do sleep 0.05; done', {
-    env: { DURABLE_EXPLICIT_SECRET: explicit, PAD_A: "a".repeat(49152), PAD_B: "b".repeat(49152), PAD_C: "c".repeat(49152), PI_HERDR_WORKER: "0", PI_HERDR_GROUP: explicit },
+  const pending = env.exec('[ -n "$DURABLE_INHERITED_SECRET" ] && [ -n "$DURABLE_EXPLICIT_SECRET" ] && [ -n "$NODE_OPTIONS" ] && [ "$PI_HERDR_WORKER" = 1 ] && [ "${#PAD_A}/${#PAD_B}/${#PAD_C}" = 49152/49152/49152 ] && printf "present\\n"; touch ready; while [ ! -e release ]; do sleep 0.05; done', {
+    env: { DURABLE_EXPLICIT_SECRET: explicit, PAD_A: "a".repeat(49152), PAD_B: "b".repeat(49152), PAD_C: "c".repeat(49152), PI_HERDR_WORKER: "0" },
     spill: { afterBytes: 0, afterLines: 0 }, onOutput: (text) => { output += text; },
   }, ctx);
   try {
@@ -113,8 +113,8 @@ test("private inherited and explicit environments use bounded anonymous pipes, n
   let isolatedOutput = "";
   const isolated = createDurableEnvironment(dir, "isolated", dir);
   try {
-    const result = await isolated.exec('[ -z "${DURABLE_INHERITED_SECRET+x}" ] && [ -z "${NODE_OPTIONS+x}" ] && [ -n "$DURABLE_EXPLICIT_SECRET" ] && [ "$PI_HERDR_WORKER/$PI_HERDR_GROUP" = 1/none ] && printf "present\\n"', {
-      inheritEnv: false, env: { DURABLE_EXPLICIT_SECRET: explicit, PI_HERDR_WORKER: "0", PI_HERDR_GROUP: explicit },
+    const result = await isolated.exec('[ -z "${DURABLE_INHERITED_SECRET+x}" ] && [ -z "${NODE_OPTIONS+x}" ] && [ -n "$DURABLE_EXPLICIT_SECRET" ] && [ "$PI_HERDR_WORKER" = 1 ] && printf "present\\n"', {
+      inheritEnv: false, env: { DURABLE_EXPLICIT_SECRET: explicit, PI_HERDR_WORKER: "0" },
       onOutput: (text) => { isolatedOutput += text; },
     }, ctx);
     assert.equal(result.ok, true);

@@ -206,7 +206,7 @@ export async function runWorker(directory: string): Promise<void> {
       if (failure) throw new Error(failure);
       events = openSync(join(directory, "events.jsonl"), "w", 0o600);
       errors = openSync(join(directory, "stderr.log"), "w", 0o600);
-      const env: NodeJS.ProcessEnv = { ...process.env, PI_OFFLINE: "1", PI_HERDR_JOB_DIR: directory, PI_HERDR_GROUP: job.task.group || "none" };
+      const env: NodeJS.ProcessEnv = { ...process.env, PI_OFFLINE: "1", PI_HERDR_JOB_DIR: directory };
       for (const key of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) delete env[key];
       child = spawn(launch.pi, launch.args, { cwd: job.task.cwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
       if (child.pid) tree = new ProcessTree(child.pid);

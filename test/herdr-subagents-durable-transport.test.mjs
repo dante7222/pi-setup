@@ -93,7 +93,7 @@ test("fixture restores inherited environment and removes storage after setup err
     assert.notEqual(root, previous.PI_CODING_AGENT_DIR);
     assert.equal(process.env.PI_HERDR_WORKER, "0");
     assert.equal(process.env.PI_HERDR_DURABLE_FAUX, "1");
-    for (const key of ["PI_HERDR_GROUP", "PI_HERDR_PARENT_GROUP", "PI_HERDR_JOB_DIR", "PI_HERDR_DURABLE_BOOT"]) {
+    for (const key of ["PI_HERDR_JOB_DIR", "PI_HERDR_DURABLE_BOOT"]) {
       assert.equal(process.env[key], undefined);
     }
   });

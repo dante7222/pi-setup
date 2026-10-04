@@ -31,7 +31,6 @@ export interface Task {
   timeout: number;
   extensions: string[];
   persistent?: boolean;
-  group?: string;
   presentation?: "quiet" | "agent";
   maxTokens?: number;
   maxCost?: number;
@@ -219,7 +218,7 @@ export function validateTasks(input: unknown, env = process.env, cwd = process.c
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Each task must be an object.");
     const item = value as Record<string, unknown>;
     for (const key of Object.keys(item)) {
-      if (!["name", "prompt", "role", "cwd", "model", "thinking", "timeout", "extensions", "persistent", "group", "presentation", "maxTokens", "maxCost"].includes(key)) throw new Error(`Unknown task field: ${key}`);
+      if (!["name", "prompt", "role", "cwd", "model", "thinking", "timeout", "extensions", "persistent", "presentation", "maxTokens", "maxCost"].includes(key)) throw new Error(`Unknown task field: ${key}`);
     }
     if (typeof item.name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(item.name)) throw new Error("Task name must match [a-z][a-z0-9_-]{0,31}.");
     if (names.has(item.name)) throw new Error(`Duplicate task name: ${item.name}`);
@@ -235,8 +234,6 @@ export function validateTasks(input: unknown, env = process.env, cwd = process.c
     if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1 || timeout > 86400) throw new Error("timeout must be 1..86400 seconds.");
     if (item.persistent !== undefined && typeof item.persistent !== "boolean") throw new Error("persistent must be boolean.");
     if (item.presentation !== undefined && !["quiet", "agent"].includes(String(item.presentation))) throw new Error("presentation must be quiet or agent.");
-    const group = item.group === undefined || item.group === "inherit" ? env.PI_HERDR_PARENT_GROUP || "none" : item.group;
-    if (typeof group !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(group)) throw new Error("group must be inherit, none or a group ID.");
     if (item.maxTokens !== undefined && (!Number.isSafeInteger(item.maxTokens) || Number(item.maxTokens) < 1)) throw new Error("maxTokens must be a positive integer.");
     if (item.maxCost !== undefined && (typeof item.maxCost !== "number" || !Number.isFinite(item.maxCost) || item.maxCost <= 0)) throw new Error("maxCost must be positive and finite.");
     const extensions = item.extensions ?? [];
@@ -246,7 +243,7 @@ export function validateTasks(input: unknown, env = process.env, cwd = process.c
       model: item.model as string | undefined ?? (env.PI_PROVIDER && env.PI_MODEL ? `${env.PI_PROVIDER}/${env.PI_MODEL}` : undefined),
       thinking: item.thinking as string | undefined ?? (item.model ? undefined : env.PI_REASONING_LEVEL),
       timeout, extensions: extensions.map((e: string) => resolve(cwd, e)),
-      persistent: item.persistent === true, group, presentation: item.presentation === "agent" ? "agent" : "quiet",
+      persistent: item.persistent === true, presentation: item.presentation === "agent" ? "agent" : "quiet",
       maxTokens: item.maxTokens as number | undefined, maxCost: item.maxCost as number | undefined,
     };
   });

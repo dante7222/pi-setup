@@ -223,7 +223,7 @@ test("admission serializes explicit intent, settings and duplicate retries; abor
   const resolving = new Promise((resolve) => { entered = resolve; });
   const initial = spawnTasks(scope, { intent, resolve: async (input) => {
     entered(); await gate;
-    return resolveTasks(scope, input, { PI_PROVIDER: "first", PI_MODEL: "model", PI_REASONING_LEVEL: "high", PI_HERDR_PARENT_GROUP: "original-group" }, directory);
+    return resolveTasks(scope, input, { PI_PROVIDER: "first", PI_MODEL: "model", PI_REASONING_LEVEL: "high" }, directory);
   } }, "stable");
   await resolving;
   const retry = { intent: intent.map((task) => Object.fromEntries(Object.entries(task).reverse())), resolve: async () => assert.fail("Retry must not resolve defaults or presets") };
@@ -234,7 +234,6 @@ test("admission serializes explicit intent, settings and duplicate retries; abor
   release();
   const first = await initial;
   assert.deepEqual(await duplicate, JSON.parse(JSON.stringify(first)));
-  assert.equal(first[0].task.group, "original-group");
   assert.equal(first[0].task.model, "first/model");
   assert.equal(first[0].task.thinking, "high");
   assert.equal(first[0].task.cwd, directory);
@@ -245,12 +244,12 @@ test("admission serializes explicit intent, settings and duplicate retries; abor
   assert.equal(record.pi, process.execPath);
   await configurePresets(scope, {});
   const changed = { intent, resolve: (input) => resolveTasks(scope, input, {
-    PI_PROVIDER: "changed", PI_MODEL: "other", PI_REASONING_LEVEL: "off", PI_HERDR_PARENT_GROUP: "changed-group",
+    PI_PROVIDER: "changed", PI_MODEL: "other", PI_REASONING_LEVEL: "off",
   }, "/missing/cwd") };
   assert.deepEqual(await spawnTasks(scope, changed, "stable"), JSON.parse(JSON.stringify(first)));
   const stale = { ...scope, authority: { ...scope.authority, token: "stale" } };
   await assert.rejects(spawnTasks(stale, retry, "stable"), /fenced/);
-  for (const change of [{ group: "inherit" }, { model: "first/model" }, { thinking: "high" }, { cwd: directory }, { prompt: "different" }]) {
+  for (const change of [{ model: "first/model" }, { thinking: "high" }, { cwd: directory }, { prompt: "different" }]) {
     await assert.rejects(spawnTasks(scope, { ...retry, intent: [{ ...intent[0], ...change }, intent[1]] }, "stable"), /different tasks/);
   }
   assert.equal((await jobs(scope)).length, 2);

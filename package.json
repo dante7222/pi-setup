@@ -38,7 +38,6 @@
       "./extensions/compaction-transcript/index.ts",
       "./extensions/herdr-subagents/index.ts",
       "./extensions/tokyo-night-footer/index.ts",
-      "./extensions/session-groups/index.ts",
       "./extensions/web-access-toggle/index.ts",
       "./extensions/yellow-file-headers/index.ts"
     ],
@@ -55,7 +54,6 @@
   },
   "dependencies": {
     "@earendil-works/chord": "1.0.0",
-    "@earendil-works/pi-codemode": "1.0.0",
-    "diff": "8.0.4"
+    "@earendil-works/pi-codemode": "1.0.0"
   }
 }

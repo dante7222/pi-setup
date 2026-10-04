@@ -34,8 +34,7 @@ async function workerEnvironment(t, worker) {
     HERDR_PANE_ID: "inherited-worker-pane", HERDR_WORKSPACE_ID: "inherited-workspace",
     HERDR_BIN_PATH: join(root, "must-not-run-herdr"),
     PI_HERDR_WORKER: worker, PI_HERDR_OWNER_PID: String(process.pid),
-    PI_HERDR_JOB_DIR: join(root, "must-not-read-job"), PI_HERDR_GROUP: "inherited-group",
-    PI_HERDR_PARENT_GROUP: "inherited-parent-group", PI_HERDR_DURABLE_BOOT: "stale-boot-token",
+    PI_HERDR_JOB_DIR: join(root, "must-not-read-job"), PI_HERDR_DURABLE_BOOT: "stale-boot-token",
     PI_HERDR_PI_BIN: join(root, "must-not-run-pi"), PI_HERDR_DURABLE_FAUX: "1",
     PI_HERDR_FUTURE_MARKER: "also-must-not-leak",
   };
@@ -58,9 +57,9 @@ for (const worker of ["0", "1"]) {
 }
 
 for (const worker of ["0", "1"]) {
-  test(`codemode and parent-group fixtures isolate inherited PI_HERDR_WORKER=${worker}`, { timeout: 120_000 }, async (t) => {
+  test(`codemode fixtures isolate inherited PI_HERDR_WORKER=${worker}`, { timeout: 120_000 }, async (t) => {
     const env = await workerEnvironment(t, worker);
-    const files = ["herdr-subagents-codemode", "session-groups-lifecycle", "session-groups-membership"];
+    const files = ["herdr-subagents-codemode"];
     const { stdout, stderr } = await runFixture([
       "--test", "--test-reporter=tap", ...files.map((file) => fileURLToPath(new URL(`./${file}.test.mjs`, import.meta.url))),
     ], { env, timeout: 110_000, maxBuffer: 1024 * 1024 });

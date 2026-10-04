@@ -13,7 +13,6 @@ export const taskSchema = Type.Object({
   timeout: Type.Optional(Type.Integer({ minimum: 1, maximum: 86_400 })),
   extensions: Type.Optional(Type.Array(nonempty)),
   persistent: Type.Optional(Type.Boolean()),
-  group: Type.Optional(nonempty),
   presentation: Type.Optional(Type.Union([Type.Literal("quiet"), Type.Literal("agent")])),
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
   maxCost: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),

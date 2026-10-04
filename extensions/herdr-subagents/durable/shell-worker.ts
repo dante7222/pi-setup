@@ -120,7 +120,7 @@ async function supervise(directory: string): Promise<void> {
       child = spawn("/bin/bash", ["--noprofile", "--norc", "-p", "-c", 'IFS= read -r gate || exit 1; [ "$gate" = go ] || exit 1; exec "$@"', "durable-shell", process.execPath, "--experimental-strip-types", "--disable-warning=MODULE_TYPELESS_PACKAGE_JSON", fileURLToPath(import.meta.url), directory, "shell"], {
         // Pass the anonymous environment FD through without reading it here.
         // Bash preserves FD 3 across exec; only the post-gate helper consumes it.
-        cwd: request.cwd, env: { PATH: "/usr/bin:/bin", PI_HERDR_WORKER: "1", PI_HERDR_GROUP: "none" }, detached: true, stdio: ["pipe", "pipe", "pipe", 3],
+        cwd: request.cwd, env: { PATH: "/usr/bin:/bin", PI_HERDR_WORKER: "1" }, detached: true, stdio: ["pipe", "pipe", "pipe", 3],
       });
       child.on("exit", (code, signal) => {
         exited = true;
@@ -216,7 +216,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       if (!existsSync(join(directory, "cancel.json"))) {
         const shell = spawn("/bin/bash", ["-c", request.command], {
           cwd: request.cwd,
-          env: { ...env as Record<string, string>, PI_HERDR_WORKER: "1", PI_HERDR_GROUP: "none" },
+          env: { ...env as Record<string, string>, PI_HERDR_WORKER: "1" },
           stdio: ["ignore", "inherit", "inherit"],
         });
         shell.on("error", () => { process.exitCode = 1; });

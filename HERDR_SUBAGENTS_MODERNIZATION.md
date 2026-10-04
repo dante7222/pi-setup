@@ -48,13 +48,13 @@ Status: complete.
 - [x] Continue, steer/follow-up, intentional stop, and explicit recovery.
 - [x] Stable parent ownership and safe reattachment/fork behavior.
 - [x] Optional Herdr metadata/registration/custom resume entrypoint.
-- [x] Bounded concurrency (default four), explicit group inheritance, named model presets and soft budgets.
+- [x] Bounded concurrency (default four), named model presets and soft budgets.
 - [x] Focused tests and real Herdr/Pi RPC smoke with a faux provider (no paid/network model calls).
 - [x] Independent reviews: `p3-safety-review`, `p3-rpc-review`; all findings addressed, reports consumed and panes closed.
 
 Review fixes: recovery now merges/persists the matching late shutdown process snapshot before each cleanup pass; owner leases carry generation tokens checked inside every scoped mutation lock, fencing CLI processes that outlive a parent transfer; closed RPC mailboxes reject unattempted late sends; unsupported Pi startup dialogs get a bounded responsiveness probe and actionable failure. Added regression reproductions for each. Full suite passed **433/433** before these final review fixes; all **71** affected experience/RPC/worker tests and typecheck passed afterward. One heavily loaded reviewer run hit the deliberately fail-closed initial-process-snapshot race in a fast fake process; isolated rerun passed.
 
-Implementation agents: `p3-rpc-worker` (58 worker/RPC tests), `p3-herdr-integration` (10 presentation tests), `p3-group-policy` (57 group tests), `p3-scheduler` (14 scheduler/identity/lock tests). All reports consumed and panes closed. Main integration adds stable live-parent fencing, native/CLI controls, process-ownership checkpoints and explicit orphan cleanup, model presets, and nine experience tests.
+Implementation agents: `p3-rpc-worker` (58 worker/RPC tests), `p3-herdr-integration` (10 presentation tests), `p3-scheduler` (14 scheduler/identity/lock tests). All reports consumed and panes closed. Main integration adds stable live-parent fencing, native/CLI controls, process-ownership checkpoints and explicit orphan cleanup, model presets, and nine experience tests.
 
 Validation: full suite **432/433 passed**; the only failure was the intentionally bounded options reference growing too large. Advanced documentation moved to `persistent.md`; all 62 affected worker/RPC/skill tests and typecheck passed afterward. Real Herdr 0.9.3 + installed Pi 1.0.0 smoke ran twice: persistent attempt one saw one user message, explicit continuation saw two, usage was reported, optional presentation produced no diagnostic errors, scheduler markers released, reports acknowledged, and all smoke panes closed. Temporary smoke artifacts were removed. Fresh Pi processes loaded the canonical resources; the controlling session itself has not been reloaded mid-implementation.
 
@@ -154,9 +154,9 @@ Reviews: `review-retry-safety` found no actionable defects and independently pas
 
 Validation:
 
-- Full suite **507/507 passed in the parent environment**, and **507/507 passed with worker/group/stale-owner/future markers inherited**, using `node --experimental-strip-types --test --test-concurrency=4 test/*.test.mjs`. Logs: `/tmp/herdr-ergonomics-{parent,worker}-bounded.log`. Typecheck and diff checks passed.
-- Initial unrestricted runs exposed inherited-environment leaks in older CLI/group fixtures, now isolated using one test-only namespace helper with failure-safe restoration. Expanded fixture worker independently passed all 66 affected tests in both environments. Production policies were not changed.
-- Also fixed a test-only mock-clock freeze: after firing the real Bash timeout, restore real timers before Pi asynchronously arms its post-exit stdio drain. Under unrestricted full-suite load, two other runs hit unrelated existing group-store/lock timing races in unchanged files; the store case passed isolated rerun. Bounded-concurrency full reruns both passed. These broader group races were not disguised by weakened assertions or production changes.
+- Full suite **507/507 passed in the parent environment**, and **507/507 passed with worker/stale-owner/future markers inherited**, using `node --experimental-strip-types --test --test-concurrency=4 test/*.test.mjs`. Logs: `/tmp/herdr-ergonomics-{parent,worker}-bounded.log`. Typecheck and diff checks passed.
+- Initial unrestricted runs exposed inherited-environment leaks in older CLI fixtures, now isolated using one test-only namespace helper with failure-safe restoration. Expanded fixture worker independently passed all 66 affected tests in both environments. Production policies were not changed.
+- Also fixed a test-only mock-clock freeze: after firing the real Bash timeout, restore real timers before Pi asynchronously arms its post-exit stdio drain. Bounded-concurrency full reruns both passed.
 - Real Herdr/Pi native smoke spawned two faux workers, retried identical explicit arguments after changing parent defaults to invalid values, batch-read both reports, acknowledged them separately and closed both panes. A dedicated real TUI smoke confirmed deferred registration, direct activation, `/reload`, post-reload responsiveness and clean quit. All smoke-owned panes/scopes were cleaned. No paid model calls in validation.
 - Package/lockfile JSON parsed; manifest covers all new modules/guides through the existing extension entry point and skill directory. Final `git diff --check` passed and `git status` was reviewed. Saved canonical resources are available to the controlling session after `/reload`; that session was not reloaded mid-implementation. No commits made.
 
@@ -178,7 +178,7 @@ Initial reviews: `review-next-contracts` found no actionable defects and passed 
 
 Final acceptance:
 
-- **554/554 tests passed in the parent environment** (`/tmp/herdr-next-parent-final.log`) and **554/554 with inherited worker/group/stale-owner/future markers** (`/tmp/herdr-next-worker-rerun.log`), using four-way file concurrency. An earlier worker run hit the already documented unrelated reentrant group-lock test race; the unchanged suite passed on full rerun. No assertions were weakened or unrelated production behavior changed.
+- **554/554 tests passed in the parent environment** (`/tmp/herdr-next-parent-final.log`) and **554/554 with inherited worker/stale-owner/future markers** (`/tmp/herdr-next-worker-rerun.log`), using four-way file concurrency. The unchanged suite passed on full rerun. No assertions were weakened or unrelated production behavior changed.
 - Typecheck passed. Canonical six-line cycle (215 characters) and advanced manual snippets run verbatim under actual Pi/QuickJS. Deferred discovery exposes typed action results; fresh context still contains no native subagent declarations or guide text. Context tradeoffs recorded in `HERDR_CONTEXT_AUDIT.md`.
 - Real Herdr smoke after safety fixes spawned two faux workers; initial `next` returned reports while cursors remained unchanged and panes stayed open, the following cycle acknowledged/closed both, and the terminating result contained empty reports/errors with pending zero. Dedicated TUI startup, activation, `/reload`, post-reload command and quit passed (`/tmp/herdr-next-tui-final.log`). All smoke scopes/panes cleaned; no paid model calls in validation.
 - Canonical resources remain covered by the existing extension/skills manifest; JSON and whitespace validation completed. No commits. The controlling session needs another `/reload` to load this round's code.
@@ -217,7 +217,7 @@ Pre-fix full parent suite **572/572** passed. Real native Herdr smoke passed: tw
 
 ## Follow-up — Happy-path guide and native preparation
 
-Status: implementation and independent reviews complete; full-suite validation has the existing unrelated session-groups failure documented below.
+Status: implementation and independent reviews complete; historical full-suite validation was 597/598.
 
 1. Shorten the required first-use guide: executable happy path and essential safety rules first; deeper recovery/reference detail moves to troubleshooting.
 2. Show a compact optional `details:true` progress example, not a larger default response.
@@ -236,8 +236,7 @@ Focused integration/safety tests **61/61** and typecheck passed. Implementation 
 Final validation and remaining caveat:
 
 - Final parent focused rerun **61/61 passed** (`/tmp/herdr-preparation-wrapup.log`); typecheck, package/lock JSON parsing, resource-manifest paths and `git diff --check` passed. No assertions were weakened or production safety checks removed.
-- Full parent and actual worker reruns each finished **597/598**, not clean acceptance. The remaining failure is the previously documented concurrent catalog test in unchanged `test/session-groups-store.test.mjs:629`, reporting a non-private/missing regular metadata file; an earlier parent run instead failed directory cleanup. The unchanged store tests pass alone **24/24**. An initial worker run hit the also previously documented group-lock rejection race; that unchanged subset passed alone **30/30**, and the full rerun passed that test but failed the store case. Logs: `/tmp/herdr-prepare-parent-rerun.log`, `/tmp/herdr-prepare-worker-final-rerun.log`, `/tmp/herdr-prepare-group-store-rerun.log`, `/tmp/herdr-prepare-worker-lock-rerun.log`.
-- A serial full-suite run also finished **597/598** with the same store failure (`/tmp/herdr-prepare-parent-serial.log`); lowering cross-file concurrency did not resolve it. The affected group-store production/test files are unchanged. This issue remains unfixed and separate from the approved subagent ergonomics work; no claim of a green full suite is made.
+- Historical full parent, actual worker and serial reruns each finished **597/598**, not clean acceptance. No green full-suite claim was made at that stage.
 - Real Herdr/Pi smoke passed: preparation with invalid execution defaults returned only an ID and no jobs, ID-only spawn admitted two faux workers, retry under changed defaults returned the same jobs, first delivery preserved cursors/open panes, and the later acknowledgement cycle closed both and returned `finished:true`. Historical request inspection and structured mismatched-task collision also passed (`/tmp/herdr-prepare-live-final.log`).
 - Dedicated TUI startup, deferred registration, direct activation, `/reload`, post-reload command and clean quit passed (`/tmp/herdr-prepare-tui-final.log`). All smoke-owned scopes/panes were cleaned; no paid model calls in smoke validation. The controlling session was not reloaded mid-implementation.
 - Final guide is **3,768 characters**; skill plus guide plus three-action narrow discovery totals **8,213 characters**, about **437 fewer estimated first-use tokens** than the preceding version, with **no added passive context**. Detailed accounting is in `HERDR_CONTEXT_AUDIT.md`.

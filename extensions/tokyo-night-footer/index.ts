@@ -28,7 +28,6 @@ import {
   type GitStatusTracker,
   invalidateGitStatus,
 } from "./git-status.ts";
-import { subscribeToSessionGroupPresentation } from "../session-groups/events.ts";
 import {
   assistantMatchesModel,
   type ContextTokenEstimate,
@@ -123,8 +122,6 @@ interface StatusSegment {
 }
 
 interface StatusLineState {
-  sessionId: string | undefined;
-  sessionGroupName: string | undefined;
   latestTps: number | undefined;
   latestTtftMs: number | undefined;
   contextEstimate: ContextTokenEstimate | undefined;
@@ -497,58 +494,11 @@ function currentAgentTitle(pi: ExtensionAPI): string | undefined {
   return sessionName === undefined ? undefined : normalizeAgentTitle(sessionName);
 }
 
-export function formatSessionTitle(
-  agentTitle: string | undefined,
-  groupName: string | undefined,
-): string | undefined {
-  if (agentTitle && groupName) return `${agentTitle} [${groupName}]`;
-  if (agentTitle) return agentTitle;
-  if (groupName) return `[${groupName}]`;
-  return undefined;
-}
-
 export function truncateSessionTitle(
   agentTitle: string | undefined,
-  groupName: string | undefined,
   width: number,
 ): string {
-  if (width <= 0) return "";
-  if (!groupName) {
-    return truncateToWidth(agentTitle ?? "", width, "…");
-  }
-
-  const fullGroup = `[${groupName}]`;
-  const group =
-    visibleWidth(fullGroup) <= width
-      ? fullGroup
-      : width >= 3
-        ? `[${truncateToWidth(groupName, width - 2, "…")}]`
-        : truncateToWidth(fullGroup, width, "…");
-  if (!agentTitle) return group;
-
-  const agentWidth = width - visibleWidth(group) - 1;
-  if (agentWidth <= 0) return group;
-  return `${truncateToWidth(agentTitle, agentWidth, "…")} ${group}`;
-}
-
-interface DisplayTitle {
-  accentKey: string;
-  agentTitle: string | undefined;
-  groupName: string | undefined;
-  text: string;
-}
-
-function currentDisplayTitle(
-  pi: ExtensionAPI,
-  state: StatusLineState,
-): DisplayTitle | undefined {
-  const agentTitle = currentAgentTitle(pi);
-  const groupName = state.sessionGroupName;
-  const text = formatSessionTitle(agentTitle, groupName);
-  const accentKey = agentTitle ?? groupName;
-  return text && accentKey
-    ? { accentKey, agentTitle, groupName, text }
-    : undefined;
+  return width <= 0 ? "" : truncateToWidth(agentTitle ?? "", width, "…");
 }
 
 function renderTopBorder(
@@ -560,9 +510,9 @@ function renderTopBorder(
   width: number,
 ): string {
   const theme = ctx.ui.theme;
-  const displayTitle = currentDisplayTitle(pi, state);
-  const border = displayTitle
-    ? (text: string) => sessionAccent(theme, displayTitle.accentKey, text)
+  const agentTitle = currentAgentTitle(pi);
+  const border = agentTitle
+    ? (text: string) => sessionAccent(theme, agentTitle, text)
     : fallbackBorder;
 
   if (width <= 0) return "";
@@ -582,20 +532,14 @@ function renderTopBorder(
     scrollIndicator,
   );
   const maxTitleWidth = Math.max(1, Math.min(60, availableWidth - 2));
-  const rightSegments: StatusSegment[] = displayTitle
+  const rightSegments: StatusSegment[] = agentTitle
     ? [
         {
           id: "title",
           content: sessionAccent(
             theme,
-            displayTitle.accentKey,
-            theme.bold(
-              truncateSessionTitle(
-                displayTitle.agentTitle,
-                displayTitle.groupName,
-                maxTitleWidth,
-              ),
-            ),
+            agentTitle,
+            theme.bold(truncateSessionTitle(agentTitle, maxTitleWidth)),
           ),
         },
       ]
@@ -653,14 +597,14 @@ function updatePrimeAgentWidget(pi: ExtensionAPI, state: StatusLineState): void 
 
   const nerdIcons = supportsNerdIcons();
   const segments = buildLeftSegments(pi, ctx, ctx.ui.theme, state, nerdIcons, 160, undefined);
-  const displayTitle = currentDisplayTitle(pi, state);
-  if (displayTitle) {
+  const agentTitle = currentAgentTitle(pi);
+  if (agentTitle) {
     segments.push({
       id: "title",
       content: sessionAccent(
         ctx.ui.theme,
-        displayTitle.accentKey,
-        ctx.ui.theme.bold(displayTitle.text),
+        agentTitle,
+        ctx.ui.theme.bold(agentTitle),
       ),
     });
   }
@@ -726,10 +670,10 @@ class TokyoNightStatusEditor extends CustomEditor {
 
   render(width: number): string[] {
     this.#refreshGitStatus();
-    const displayTitle = currentDisplayTitle(this.#pi, this.#state);
-    this.borderColor = displayTitle
+    const agentTitle = currentAgentTitle(this.#pi);
+    this.borderColor = agentTitle
       ? (text: string) =>
-          sessionAccent(this.#ctx.ui.theme, displayTitle.accentKey, text)
+          sessionAccent(this.#ctx.ui.theme, agentTitle, text)
       : (text: string) => this.#ctx.ui.theme.fg("border", text);
 
     if (width < 8) return super.render(width);
@@ -773,8 +717,6 @@ class TokyoNightStatusEditor extends CustomEditor {
 
 export default function (pi: ExtensionAPI): void {
   const state: StatusLineState = {
-    sessionId: undefined,
-    sessionGroupName: undefined,
     latestTps: undefined,
     latestTtftMs: undefined,
     contextEstimate: undefined,
@@ -916,15 +858,6 @@ export default function (pi: ExtensionAPI): void {
     }
   };
 
-  subscribeToSessionGroupPresentation(pi, (presentation) => {
-    if (presentation.sessionId !== state.sessionId) return;
-    state.sessionGroupName = presentation.group?.name;
-    if (state.runtimeContext) {
-      updateLoadedContext(estimateLoadedContext(pi, state.runtimeContext));
-    }
-    requestRender?.();
-  });
-
   const refreshGitStatus = (force = false) => {
     const tracker = state.gitStatus;
     if (force) invalidateGitStatus(tracker);
@@ -982,8 +915,6 @@ export default function (pi: ExtensionAPI): void {
     if (mode === undefined ? !ctx.hasUI : mode !== "tui") return;
 
     invalidateGitStatus(state.gitStatus);
-    state.sessionId = ctx.sessionManager.getSessionId();
-    state.sessionGroupName = undefined;
     state.latestTps = undefined;
     state.latestTtftMs = undefined;
     state.contextEstimate = undefined;
@@ -995,10 +926,7 @@ export default function (pi: ExtensionAPI): void {
     snapshotContextUsage(ctx);
     contextLeafId = ctx.sessionManager.getLeafId?.();
     state.checkContextEntries = checkContextEntries;
-    // Session Groups loads after the footer and applies membership-specific tool
-    // gating later in session_start. Wait for its presentation event instead of
-    // measuring the transient registration-time tool set.
-    state.loadedContextTokens = undefined;
+    state.loadedContextTokens = estimateLoadedContext(pi, ctx);
     state.footerData = undefined;
     state.gitStatus = createGitStatusTracker(ctx.cwd);
     state.runtimeContext = ctx;
@@ -1059,7 +987,7 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("resources_discover", (_event, ctx) => {
     if (!state.runtimeActive) return;
-    // Also initialize when the footer is loaded without Session Groups.
+    // Resource discovery can change the active tool loadout after startup.
     updateLoadedContext(estimateLoadedContext(pi, ctx));
     requestRender?.();
   });
@@ -1217,7 +1145,7 @@ export default function (pi: ExtensionAPI): void {
     }
     if (hasCurrentModelUsage) {
       state.contextUsageInvalidated = false;
-      // A group/tool change while streaming applies to the NEXT request, not
+      // A tool loadout change while streaming applies to the NEXT request, not
       // the one whose usage just arrived.
       state.authoritativeLoadedContextTokens = requestLoadedContextTokens;
       setContextEstimate({ tokens: contextTokens, estimated: false });
@@ -1309,8 +1237,6 @@ export default function (pi: ExtensionAPI): void {
     state.latestTps = undefined;
     state.latestTtftMs = undefined;
     requestFirstTokenAt = undefined;
-    state.sessionId = undefined;
-    state.sessionGroupName = undefined;
     state.titleGenerationAbortController.abort();
     state.titleGenerationInFlight = false;
     state.primeAgentContext?.ui.setWidget(PRIME_AGENT_WIDGET_KEY, undefined, {

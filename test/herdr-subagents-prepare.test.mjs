@@ -90,7 +90,7 @@ test("prepare rejects invalid/non-JSON tasks, duplicate names and oversize befor
   const invalid = [undefined, null, {}, [], Array(17).fill(intent[0]), [intent[0], intent[0]],
     [{ ...intent[0], name: "Bad" }], [{ ...intent[0], prompt: " " }], [{ ...intent[0], prompt: "x".repeat(100001) }],
     ...[{ role: null }, { timeout: null }, { extensions: null }, { timeout: 0 }, { timeout: 1.5 }, { role: "bad" }, { thinking: "bad" }, { maxCost: NaN }, { maxCost: Infinity },
-      { maxTokens: 0 }, { group: "bad group" }, { preset: " " }, { model: " " }, { cwd: 1 }, { persistent: null },
+      { maxTokens: 0 }, { preset: " " }, { model: " " }, { cwd: 1 }, { persistent: null },
       { unknown: true }, { extensions: [""] }, { model: undefined }, { prompt: new Date() }, { toJSON() { return intent[0]; } }].map((extra) => [{ ...intent[0], ...extra }])];
   for (const value of invalid) await assert.rejects(prepareTasks(f.scope, value));
   const large = [{ ...intent[0], extensions: ["x".repeat(16 * 1024 * 1024)] }];

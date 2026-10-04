@@ -12,7 +12,7 @@ export default function workerPrompt(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event) => {
     const rolePrompt = await readFile(join(directory, "system.md"), "utf8");
     event.systemPromptOptions.sections.herdr_subagent = rolePrompt;
-    // A prior whole-prompt override (e.g. session-groups) hides section edits
+    // A prior whole-prompt override hides section edits
     // from the provider. Preserve it and append the role there as well.
     if (event.systemPromptOptions.forceSystemPrompt !== undefined) {
       event.systemPromptOptions.forceSystemPrompt += `\n\n${rolePrompt}`;

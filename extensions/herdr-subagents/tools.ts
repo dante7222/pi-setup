@@ -6,7 +6,6 @@ import { cleanup, closeJobs, jobs, locked, PAGE_BYTES, prepareTasks, reportPage,
 import { acknowledgeReport, readManyReports, readReport, waitForReports } from "./reports.ts";
 import { claimScope } from "./ownership.ts";
 import { continueTask, sendTask, stopTask } from "./conversations.ts";
-import { parentGroupFromBranch } from "./groups.ts";
 import { reattachJob } from "./presentation.ts";
 import { configure, settings } from "./scheduler.ts";
 import { recoverTask } from "./recovery.ts";
@@ -79,7 +78,6 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
                 PI_PROVIDER: ctx.model?.provider,
                 PI_MODEL: ctx.model?.id,
                 PI_REASONING_LEVEL: ctx.thinkingLevel,
-                PI_HERDR_PARENT_GROUP: parentGroupFromBranch(ctx.sessionManager.getEntries()),
               }, ctx.cwd),
             }, params.requestId, signal);
             data = { jobs: started.map((job) => ({ id: job.id, name: job.task.name })) };

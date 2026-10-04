@@ -33,7 +33,7 @@ A viewer does not own storage, execute a model, or replay a prompt. Closing a vi
 
 ## Different resource contract
 
-This prototype reuses Pi's saved authentication/model configuration, **not** ordinary extension factories, skills, prompt templates, group context, permission extensions, or custom extension providers. Use ordinary workers when those resources matter. Providers installed only by an extension may be unavailable here.
+This prototype reuses Pi's saved authentication/model configuration, **not** ordinary extension factories, skills, prompt templates, permission extensions, or custom extension providers. Use ordinary workers when those resources matter. Providers installed only by an extension may be unavailable here.
 
 Default tools are **read-only**. `tools:"coding"` explicitly enables durable's built-in read/write/edit/bash tools in the supplied cwd. This is not an OS sandbox. Do not use the prototype to bypass an approval requirement; isolate untrusted work externally. The durable tools are not replacements for this package's ordinary Bash timeout/permission extensions. Durable Bash has independent process supervision and a 120-second default timeout. Startup recovery verifies cleanup before reopening tasks; unknown cleanup blocks progress rather than reporting success. This uses sampled process identities, not an OS sandbox: second-precision PID reuse and daemon escapes between samples remain limitations.
 
