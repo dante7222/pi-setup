@@ -9,6 +9,7 @@
     "fg": "#c0caf5",
     "fgDark": "#a9b1d6",
     "comment": "#565f89",
+    "secondaryText": "#8d98c6",
     "blue": "#7aa2f7",
     "cyan": "#7dcfff",
     "cyanDark": "#2ac3de",
@@ -33,7 +34,9 @@
     "muted": "fgDark",
     "dim": "comment",
     "text": "fg",
-    "thinkingText": "comment",
+    "thinkingText": "secondaryText",
+    "scrollbarTrack": "comment",
+    "scrollbarThumb": "fg",
 
     "selectedBg": "bgVisual",
     "userMessageBg": "bgHighlight",
@@ -49,7 +52,7 @@
 
     "mdHeading": "purple",
     "mdLink": "blue",
-    "mdLinkUrl": "comment",
+    "mdLinkUrl": "secondaryText",
     "mdCode": "green",
     "mdCodeBlock": "fgDark",
     "mdCodeBlockBorder": "comment",
@@ -60,9 +63,9 @@
 
     "toolDiffAdded": "green",
     "toolDiffRemoved": "red",
-    "toolDiffContext": "comment",
+    "toolDiffContext": "secondaryText",
 
-    "syntaxComment": "comment",
+    "syntaxComment": "secondaryText",
     "syntaxKeyword": "purple",
     "syntaxFunction": "blue",
     "syntaxVariable": "fg",

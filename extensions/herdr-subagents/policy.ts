@@ -9,7 +9,7 @@ export async function presets(scope: Scope): Promise<Presets> {
 }
 
 /** Explicit per-session presets: no cloud/provider names or prices are hardcoded. */
-export async function configurePresets(scope: Scope, input: unknown): Promise<Presets> {
+export async function configurePresets(scope: Scope, input: unknown, signal?: AbortSignal): Promise<Presets> {
   if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length > 32) throw new Error("Expected at most 32 named model presets.");
   const validated: Presets = {};
   for (const [name, value] of Object.entries(input)) {
@@ -19,7 +19,7 @@ export async function configurePresets(scope: Scope, input: unknown): Promise<Pr
     const [task] = validateTasks([{ name, prompt: "validate preset", ...entry }], {});
     validated[name] = { model: task.model!, thinking: task.thinking, maxTokens: task.maxTokens, maxCost: task.maxCost };
   }
-  await locked(scope, async () => { await atomic(join(scope.root, "presets.json"), validated); });
+  await locked(scope, async () => { await atomic(join(scope.root, "presets.json"), validated); }, signal);
   return validated;
 }
 

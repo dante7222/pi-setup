@@ -1,9 +1,9 @@
-import {
-  createEditToolDefinition,
-  createWriteToolDefinition,
-  type ExtensionAPI,
-  type Theme,
-  type ThemeColor,
+import type {
+  ExtensionAPI,
+  Theme,
+  ThemeColor,
+  ThemeStyle,
+  ToolRenderers,
 } from "@earendil-works/pi-coding-agent";
 
 function withYellowHeader(theme: Theme): Theme {
@@ -14,6 +14,13 @@ function withYellowHeader(theme: Theme): Theme {
           target.fg(color === "toolTitle" || color === "accent" ? "warning" : color, text);
       }
 
+      if (property === "style") {
+        return (text: string, options: ThemeStyle) => target.style(text, {
+          ...options,
+          fg: options.fg === "toolTitle" || options.fg === "accent" ? "warning" : options.fg,
+        });
+      }
+
       const value: unknown = Reflect.get(target, property, target);
       return typeof value === "function" ? value.bind(target) : value;
     },
@@ -21,26 +28,23 @@ function withYellowHeader(theme: Theme): Theme {
 }
 
 export default function yellowFileHeaders(pi: ExtensionAPI): void {
-  const edit = createEditToolDefinition(process.cwd());
-  const write = createWriteToolDefinition(process.cwd());
+  pi.registerToolRenderer((toolName, next) => {
+    const original = next();
+    if ((toolName !== "edit" && toolName !== "write") || !original) return original;
 
-  pi.registerTool({
-    ...edit,
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      return createEditToolDefinition(ctx.cwd).execute(toolCallId, params, signal, onUpdate, ctx);
-    },
-    renderCall(args, theme, context) {
-      return edit.renderCall!(args, withYellowHeader(theme), context);
-    },
-  });
-
-  pi.registerTool({
-    ...write,
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      return createWriteToolDefinition(ctx.cwd).execute(toolCallId, params, signal, onUpdate, ctx);
-    },
-    renderCall(args, theme, context) {
-      return write.renderCall!(args, withYellowHeader(theme), context);
-    },
+    const renderers: ToolRenderers = { ...original };
+    if (original.renderCall) {
+      const renderCall = original.renderCall;
+      renderers.renderCall = (args, theme, context) =>
+        renderCall(args, withYellowHeader(theme), context);
+    }
+    if (original.renderResult) {
+      const renderResult = original.renderResult;
+      // Native edit results rebuild their call header after settling. Apply
+      // the same presentation there without replacing executable tools.
+      renderers.renderResult = (result, options, theme, context) =>
+        renderResult(result, options, withYellowHeader(theme), context);
+    }
+    return renderers;
   });
 }

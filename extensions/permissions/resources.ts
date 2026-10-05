@@ -1,11 +1,15 @@
+import { constants } from "node:fs";
+import { access } from "node:fs/promises";
 import { homedir } from "node:os";
 import {
   dirname,
   isAbsolute,
+  join,
   relative,
   resolve,
   sep,
 } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { PermissionRequest } from "./policy.ts";
 
 interface NormalizedToolPath {
@@ -41,13 +45,24 @@ function optionalString(
   return value;
 }
 
-function expandToolPath(rawPath: string): string {
-  const withoutAt = rawPath.startsWith("@") ? rawPath.slice(1) : rawPath;
-  if (withoutAt === "~") return homedir();
-  if (withoutAt.startsWith("~/") || withoutAt.startsWith("~\\")) {
-    return homedir() + withoutAt.slice(1);
+// Match Pi 1.0.2 resolveToCwd/normalizePath without importing private runtime
+// modules. This is lexical classification, not symlink-safe containment.
+function expandToolPath(rawPath: string, toolInput = true): string {
+  let path = toolInput
+    ? rawPath.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ")
+    : rawPath;
+  if (toolInput && path.startsWith("@")) path = path.slice(1);
+  if (process.platform === "win32" && path.startsWith("/") && !path.startsWith("//") && !path.includes("\\")) {
+    const match = path.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+    if (match) path = `${match[1].toUpperCase()}:\\${match[2]?.replaceAll("/", "\\") ?? ""}`;
   }
-  return withoutAt;
+  if (path === "~") return homedir();
+  if (path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"))) {
+    return join(homedir(), path.slice(2));
+  }
+  // Decode only lowercase file:// URLs, just like the tools. Malformed URLs
+  // must throw; ordinary filenames containing percent escapes remain literal.
+  return path.startsWith("file://") ? fileURLToPath(path) : path;
 }
 
 function toSlashPath(value: string): string {
@@ -55,8 +70,12 @@ function toSlashPath(value: string): string {
 }
 
 function normalizeToolPath(cwd: string, rawPath: string): NormalizedToolPath {
-  const absoluteCwd = resolve(cwd);
+  const absoluteCwd = resolve(expandToolPath(cwd, false));
   const absolute = resolve(absoluteCwd, expandToolPath(rawPath));
+  return classifyAbsolutePath(absoluteCwd, absolute);
+}
+
+function classifyAbsolutePath(absoluteCwd: string, absolute: string): NormalizedToolPath {
   const relativePath = relative(absoluteCwd, absolute);
   const external =
     relativePath === ".." ||
@@ -85,11 +104,9 @@ function externalDirectoryRequest(
 function addPathRequests(
   requests: PermissionRequest[],
   permission: string,
-  cwd: string,
-  rawPath: string,
+  path: NormalizedToolPath,
   kind: PathKind,
 ): void {
-  const path = normalizeToolPath(cwd, rawPath);
   requests.push({ permission, resource: path.resource });
   const external = externalDirectoryRequest(path, kind);
   if (external) requests.push(external);
@@ -202,6 +219,53 @@ function adapterName(toolName: string): string {
   return toolName.split(".").at(-1) ?? toolName;
 }
 
+// Native read selects an existing spelling, not just a lexical path. Mirror
+// resolveReadPathAsync's ordered fallbacks without a private runtime import.
+// Existence checks do not make this a sandbox: symlinks and TOCTOU still apply.
+export async function permissionRequestsForToolAsync(
+  toolName: string,
+  input: Record<string, unknown>,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<PermissionRequest[]> {
+  signal?.throwIfAborted();
+  if (adapterName(toolName) !== "read") return permissionRequestsForTool(toolName, input, cwd);
+
+  const absoluteCwd = resolve(expandToolPath(cwd, false));
+  const resolved = resolve(absoluteCwd, expandToolPath(requiredString(input, "path", "read")));
+  const nfd = resolved.normalize("NFD");
+  const variants = [
+    resolved.replace(/ (AM|PM)\./gi, "\u202F$1."),
+    nfd,
+    resolved.replace(/'/g, "\u2019"),
+    nfd.replace(/'/g, "\u2019"),
+  ];
+  let selected = resolved;
+  for (const candidate of [resolved, ...variants.filter((variant) => variant !== resolved)]) {
+    signal?.throwIfAborted();
+    let exists = false;
+    try {
+      await access(candidate, constants.F_OK);
+      exists = true;
+    } catch {
+      // Native read treats all access failures as a missing candidate.
+    }
+    signal?.throwIfAborted();
+    if (exists) {
+      selected = candidate;
+      break;
+    }
+  }
+
+  const requests: PermissionRequest[] = [];
+  // Never pass the selected path back through tool-input normalization: that
+  // would erase narrow spaces, including those decoded from a file URL.
+  addPathRequests(requests, "read", classifyAbsolutePath(absoluteCwd, selected), "file");
+  return requests;
+}
+
+// Lexical adapter for non-read tools and lexical path parity tests. Production
+// permission checks must use the async adapter above for native read targets.
 export function permissionRequestsForTool(
   toolName: string,
   input: Record<string, unknown>,
@@ -211,12 +275,12 @@ export function permissionRequestsForTool(
   const name = adapterName(toolName);
 
   if (name === "read") {
-    addPathRequests(requests, "read", cwd, requiredString(input, "path", name), "file");
+    addPathRequests(requests, "read", normalizeToolPath(cwd, requiredString(input, "path", name)), "file");
     return deduplicate(requests);
   }
 
   if (name === "edit" || name === "write") {
-    addPathRequests(requests, "edit", cwd, requiredString(input, "path", name), "file");
+    addPathRequests(requests, "edit", normalizeToolPath(cwd, requiredString(input, "path", name)), "file");
     return deduplicate(requests);
   }
 
@@ -254,7 +318,7 @@ export function permissionRequestsForTool(
 
   if (name === "ls") {
     const rawPath = optionalString(input, "path", name) ?? ".";
-    addPathRequests(requests, "list", cwd, rawPath || ".", "directory");
+    addPathRequests(requests, "list", normalizeToolPath(cwd, rawPath || "."), "directory");
     return deduplicate(requests);
   }
 

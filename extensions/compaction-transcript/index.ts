@@ -19,16 +19,25 @@ interface TranscriptPaths {
   raw: string;
 }
 
+const MAX_FILENAME_BYTES = 255;
 let exportQueue: Promise<void> = Promise.resolve();
 
-function filenameSlug(value: string): string {
+function filenameSlug(value: string, maxBytes: number): string {
   const normalized = value
     .normalize("NFKC")
     .toLocaleLowerCase("en-US")
     .replace(/[^\p{L}\p{N}._-]+/gu, "-")
     .replace(/-+/g, "-")
     .replace(/^[.-]+|[.-]+$/g, "");
-  const bounded = Array.from(normalized).slice(0, 60).join("").replace(/[.-]+$/g, "");
+  let prefix = "";
+  let bytes = 0;
+  for (const character of Array.from(normalized).slice(0, 60)) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (bytes + size > maxBytes) break;
+    prefix += character;
+    bytes += size;
+  }
+  const bounded = prefix.replace(/[.-]+$/g, "");
   if (!bounded) return "conversation";
   return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(bounded)
     ? `session-${bounded}`
@@ -45,20 +54,26 @@ function transcriptPaths(
   const legacyStem = path.basename(sessionFile, extension);
   const directory = path.join(path.dirname(sessionFile), "transcripts");
   const sessionKey = createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
-  const readableStem = `${filenameSlug(title)}--${sessionKey}`;
   const snapshotId = createHash("sha256").update(raw).digest("hex");
+  const snapshotSuffix = `.${snapshotId}.active-branch.jsonl`;
+  const keySuffix = `--${sessionKey}`;
+  // Budget the longest published basename in UTF-8 bytes, not characters.
+  const slugBudget = MAX_FILENAME_BYTES - Buffer.byteLength(keySuffix + snapshotSuffix, "utf8");
+  const readableStem = `${filenameSlug(title, slugBudget)}${keySuffix}`;
 
   return {
     directory,
     legacyMarkdown: path.join(directory, `${legacyStem}.md`),
     markdown: path.join(directory, `${readableStem}.md`),
     markdownSuffix: `--${sessionKey}.md`,
-    raw: path.join(directory, `${readableStem}.${snapshotId}.active-branch.jsonl`),
+    raw: path.join(directory, `${readableStem}${snapshotSuffix}`),
   };
 }
 
 async function atomicWrite(filePath: string, content: string): Promise<void> {
-  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  // Keep the temporary name short and in the same directory for atomic rename.
+  // Appending a UUID to a valid long destination can exceed NAME_MAX again.
+  const temporaryPath = path.join(path.dirname(filePath), `.pi-transcript-${randomUUID()}.tmp`);
 
   try {
     await fs.promises.writeFile(temporaryPath, content, {

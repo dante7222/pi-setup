@@ -4,14 +4,19 @@ import { join } from "node:path";
 
 const STATE_FILE = join(homedir(), ".pi", "agent", "state", "codex-fast-mode.json");
 const SUPPORTED_MODEL_IDS: ReadonlySet<string> = new Set([
-  "gpt-5.4",
   "gpt-5.5",
   "gpt-5.6-luna",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
+  "gpt-6-astra",
+  "gpt-6-luna",
+  "gpt-6-sol",
+  "gpt-6.1-sol",
 ]);
 
-export function isCodexFastModeEffective(
+// Mirrors the installed codex-fast-mode integration. This is a request for
+// priority service, not evidence that the provider scheduled it at that tier.
+export function isCodexFastModeRequested(
   provider: string | undefined,
   modelId: string | undefined,
   stateFile = STATE_FILE,

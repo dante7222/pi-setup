@@ -63,12 +63,12 @@ export async function sendTask(scope: Scope, id: string, message: string, kind: 
 }
 
 /** Stop execution without discarding its report or closing its inspection pane. */
-export async function stopTask(scope: Scope, id: string): Promise<{ stopped: string; settled: boolean }> {
+export async function stopTask(scope: Scope, id: string, signal?: AbortSignal): Promise<{ stopped: string; settled: boolean }> {
   return locked(scope, async () => {
     const job = (await jobs(scope)).find((job) => job.id === id);
     if (!job) throw new Error(`Unknown subagent: ${id}`);
     const settled = !!await json(join(scope.root, id, "done.json"));
     if (!settled) await atomic(join(scope.root, id, "cancel.json"), {});
     return { stopped: id, settled };
-  });
+  }, signal);
 }

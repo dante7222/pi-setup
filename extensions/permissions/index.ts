@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import {
   parsePermissionConfig,
@@ -13,7 +14,7 @@ import {
   type CompiledPermissionConfig,
   type PermissionRequest,
 } from "./policy.ts";
-import { permissionRequestsForTool } from "./resources.ts";
+import { permissionRequestsForToolAsync } from "./resources.ts";
 
 const CONFIG_ENV = "PI_PERMISSION_CONFIG";
 const CONFIG_PATH = fileURLToPath(new URL("../../pi.json", import.meta.url));
@@ -183,6 +184,29 @@ function updateStatus(ctx: ExtensionContext, state: RuntimeState): void {
   ctx.ui.setStatus(STATUS_KEY, status);
 }
 
+// Cancellation cannot rely on an adapter settling its promise. Always consume
+// late failures, but stop waiting (and remove our listener) immediately on abort.
+function untilAborted<T>(pending: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(undefined);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    pending.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 export default function permissions(pi: ExtensionAPI): void {
   pi.registerFlag("yolo", {
     description: "Bypass all agent tool permission checks, including configured denies",
@@ -197,8 +221,24 @@ export default function permissions(pi: ExtensionAPI): void {
     error: "not initialized",
   };
   const sessionGrants = new Set<string>();
+  let sessionId: string | undefined;
+  let lifecycle = new AbortController();
+  let promptQueue = Promise.resolve();
+
+  // Pi 1.0.2 tears down the runtime for new/resume/fork/reload/quit. The
+  // cancellable before_switch event is not a committed session transition.
+  pi.on("session_shutdown", () => {
+    lifecycle.abort();
+    sessionId = undefined;
+    sessionGrants.clear();
+    state = { configPath: CONFIG_PATH, cliYolo: false, yolo: false, error: "session shut down" };
+  });
 
   pi.on("session_start", async (_event, ctx) => {
+    lifecycle.abort();
+    lifecycle = new AbortController();
+    const startedLifecycle = lifecycle;
+    sessionId = ctx.sessionManager.getSessionId();
     sessionGrants.clear();
     const cliYolo = pi.getFlag("yolo") === true;
     const sessionYolo = restoreSessionState(ctx, sessionGrants);
@@ -221,11 +261,14 @@ export default function permissions(pi: ExtensionAPI): void {
       return;
     }
 
+    const loadingState = state;
     try {
-      const policy = await loadPolicy(state.configPath);
-      state = { ...state, policy, error: undefined };
+      const policy = await loadPolicy(loadingState.configPath);
+      if (startedLifecycle.signal.aborted || state !== loadingState) return;
+      state = { ...loadingState, policy, error: undefined };
     } catch (error) {
-      state = { ...state, policy: undefined, error: errorMessage(error) };
+      if (startedLifecycle.signal.aborted || state !== loadingState) return;
+      state = { ...loadingState, policy: undefined, error: errorMessage(error) };
       if (ctx.hasUI) {
         ctx.ui.notify(
           `Permissions blocked all agent tools: ${state.configPath}: ${state.error}`,
@@ -238,84 +281,132 @@ export default function permissions(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    // Pi 1.0.2 exposes only the agent/run signal here, not executeTool()'s
+    // separate nested-call signal. An isolated nested abort cannot dismiss
+    // this prompt or prevent a late session grant; run/lifecycle aborts can.
+    const callSessionId = ctx.sessionManager.getSessionId();
+    const signal = ctx.signal
+      ? AbortSignal.any([ctx.signal, lifecycle.signal])
+      : lifecycle.signal;
+    const cancelled = { block: true, reason: "Permission check cancelled: operation or session ended" };
+    if (signal.aborted || callSessionId !== sessionId) return cancelled;
+
+    // YOLO intentionally bypasses even malformed input and filesystem probes.
     if (state.yolo) return undefined;
-    if (!state.policy) {
-      return {
-        block: true,
-        reason: `Permissions unavailable: ${state.configPath}: ${state.error ?? "unknown configuration error"}`,
-      };
+    let requests: PermissionRequest[] | undefined;
+    if (state.policy) {
+      try {
+        requests = await untilAborted(
+          permissionRequestsForToolAsync(event.toolName, event.input, ctx.cwd, signal),
+          signal,
+        );
+      } catch (error) {
+        if (signal.aborted) return cancelled;
+        if (state.yolo) return undefined;
+        return {
+          block: true,
+          reason: `Permissions rejected malformed ${event.toolName} input: ${errorMessage(error)}`,
+        };
+      }
+      // Filesystem probes can outlive a call or runtime. Never use an old
+      // context, open a dialog, or approve after their lifecycle was aborted.
+      if (signal.aborted) return cancelled;
     }
+    const check = (): PermissionRequest[] | ToolCallEventResult => {
+      if (state.yolo) return [];
+      if (!state.policy) {
+        return {
+          block: true,
+          reason: `Permissions unavailable: ${state.configPath}: ${state.error ?? "unknown configuration error"}`,
+        };
+      }
+      if (!requests) return cancelled;
+      const resolution = resolvePermissions(state.policy.rules, requests);
+      if (resolution.denied.length > 0) {
+        return {
+          block: true,
+          reason: `Denied by ${state.configPath}: ${describeRequest(resolution.denied[0])}`,
+        };
+      }
+      const unresolved = resolution.asked.filter(
+        (request) => !sessionGrants.has(grantKey(request)),
+      );
+      if (unresolved.length > 0 && !ctx.hasUI) {
+        return {
+          block: true,
+          reason: `Approval required but ${ctx.mode} mode has no permission UI: ${describeRequest(unresolved[0])}`,
+        };
+      }
+      return unresolved;
+    };
 
-    let requests: PermissionRequest[];
+    const initial = check();
+    if (!Array.isArray(initial)) return initial;
+    if (initial.length === 0) return undefined;
+
+    const previous = promptQueue;
+    let release = (): void => {};
+    const slot = new Promise<void>((resolve) => { release = resolve; });
+    promptQueue = previous.then(() => slot);
+    let selection: Promise<string | undefined> | undefined;
     try {
-      requests = permissionRequestsForTool(event.toolName, event.input, ctx.cwd);
-    } catch (error) {
-      return {
-        block: true,
-        reason: `Permissions rejected malformed ${event.toolName} input: ${errorMessage(error)}`,
-      };
-    }
+      await untilAborted(previous, signal);
+      if (signal.aborted) return cancelled;
+      // A preceding prompt may have granted the same exact resources, or a
+      // command may have changed the policy/YOLO state while this call waited.
+      const unresolved = check();
+      if (!Array.isArray(unresolved)) return unresolved;
+      if (unresolved.length === 0) return undefined;
 
-    const resolution = resolvePermissions(state.policy.rules, requests);
-    if (resolution.denied.length > 0) {
-      return {
-        block: true,
-        reason: `Denied by ${state.configPath}: ${describeRequest(resolution.denied[0])}`,
-      };
-    }
-
-    const unresolved = resolution.asked.filter(
-      (request) => !sessionGrants.has(grantKey(request)),
-    );
-    if (unresolved.length === 0) return undefined;
-
-    if (!ctx.hasUI) {
-      return {
-        block: true,
-        reason: `Approval required but ${ctx.mode} mode has no permission UI: ${describeRequest(unresolved[0])}`,
-      };
-    }
-
-    let choice: string | undefined;
-    try {
-      choice = await ctx.ui.select(
+      selection = ctx.ui.select(
         `Permission required\n\n${describeRequests(unresolved)}`,
         [CHOICE_DENY, CHOICE_ONCE, CHOICE_SESSION],
         {
-          signal: ctx.signal,
+          signal,
           timeout: ctx.mode === "rpc" ? RPC_PROMPT_TIMEOUT_MS : undefined,
         },
       );
-    } catch (error) {
+      const choice = await untilAborted(selection, signal);
+      // Even an adapter that resolves an approval after abort cannot allow or
+      // persist it. Never access a replaced context after a lifecycle abort.
+      if (signal.aborted) return cancelled;
+      if (choice === CHOICE_ONCE) return undefined;
+      if (choice === CHOICE_SESSION) {
+        const keys = unresolved.map(grantKey);
+        for (const key of keys) sessionGrants.add(key);
+        pi.appendEntry(ENTRY_TYPE, {
+          version: ENTRY_VERSION,
+          sessionId: callSessionId,
+          operation: "grant",
+          keys,
+        } satisfies PermissionStateEntry);
+        updateStatus(ctx, state);
+        return undefined;
+      }
       return {
+        block: true,
+        reason: `Permission denied by user: ${describeRequest(unresolved[0])}`,
+      };
+    } catch (error) {
+      return signal.aborted ? cancelled : {
         block: true,
         reason: `Permission prompt failed: ${errorMessage(error)}`,
       };
+    } finally {
+      // An aborted caller returns promptly, but a noncooperative UI retains
+      // its slot until it settles: never open a second dialog over a live one.
+      // Cancelled waiters release their own slot without overtaking previous.
+      if (selection) void selection.then(release, release);
+      else release();
     }
-
-    if (choice === CHOICE_ONCE) return undefined;
-    if (choice === CHOICE_SESSION) {
-      const keys = unresolved.map(grantKey);
-      for (const key of keys) sessionGrants.add(key);
-      pi.appendEntry(ENTRY_TYPE, {
-        version: ENTRY_VERSION,
-        sessionId: ctx.sessionManager.getSessionId(),
-        operation: "grant",
-        keys,
-      } satisfies PermissionStateEntry);
-      updateStatus(ctx, state);
-      return undefined;
-    }
-
-    return {
-      block: true,
-      reason: `Permission denied by user: ${describeRequest(unresolved[0])}`,
-    };
   });
 
   pi.registerCommand("yolo", {
     description: "Toggle YOLO permission bypass for this session",
     handler: async (args, ctx) => {
+      const commandLifecycle = lifecycle;
+      const commandSessionId = ctx.sessionManager.getSessionId();
+      if (commandLifecycle.signal.aborted || commandSessionId !== sessionId) return;
       if (args.trim()) {
         ctx.ui.notify("Usage: /yolo", "warning");
         return;
@@ -347,21 +438,26 @@ export default function permissions(pi: ExtensionAPI): void {
       }
 
       state = { ...state, yolo: false };
-      if (!state.policy) {
-        state = { ...state, error: "configuration is loading" };
-        try {
-          const policy = await loadPolicy(state.configPath);
-          state = { ...state, policy, error: undefined };
-        } catch (error) {
-          state = { ...state, policy: undefined, error: errorMessage(error) };
-        }
-      }
+      // Persist the user's disable before loading: reload/resume must not
+      // resurrect an earlier durable enable if this runtime ends mid-load.
       pi.appendEntry(ENTRY_TYPE, {
         version: ENTRY_VERSION,
-        sessionId: ctx.sessionManager.getSessionId(),
+        sessionId: commandSessionId,
         operation: "yolo",
         enabled: false,
       } satisfies PermissionStateEntry);
+      if (!state.policy) {
+        state = { ...state, error: "configuration is loading" };
+        const loadingState = state;
+        try {
+          const policy = await loadPolicy(loadingState.configPath);
+          if (commandLifecycle.signal.aborted || state !== loadingState) return;
+          state = { ...loadingState, policy, error: undefined };
+        } catch (error) {
+          if (commandLifecycle.signal.aborted || state !== loadingState) return;
+          state = { ...loadingState, policy: undefined, error: errorMessage(error) };
+        }
+      }
       updateStatus(ctx, state);
       if (state.policy) {
         ctx.ui.notify("YOLO mode disabled; pi.json permissions are active.", "info");
@@ -377,6 +473,7 @@ export default function permissions(pi: ExtensionAPI): void {
   pi.registerCommand("permissions", {
     description: "Show permission policy status or clear session approvals",
     handler: async (args, ctx) => {
+      if (lifecycle.signal.aborted || ctx.sessionManager.getSessionId() !== sessionId) return;
       const operation = args.trim();
       if (operation === "clear") {
         sessionGrants.clear();

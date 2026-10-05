@@ -8,7 +8,8 @@ import { ProcessTree, type ProcessEvidence, type ProcessSnapshot } from "./proce
 export interface ExecutionEvidence { boot: string; tree: ProcessEvidence }
 
 /** Reap only proven orphan execution. This never resumes Pi or replays a prompt. */
-export async function recoverTask(scope: Scope, id: string): Promise<{ id: string; recovered: true }> {
+export async function recoverTask(scope: Scope, id: string, signal?: AbortSignal): Promise<{ id: string; recovered: true }> {
+  // Cancellation fences lock admission, never interrupts admitted process cleanup.
   return locked(scope, async () => {
     const job = (await jobs(scope)).find((job) => job.id === id);
     if (!job) throw new Error(`Unknown subagent: ${id}`);
@@ -52,5 +53,5 @@ export async function recoverTask(scope: Scope, id: string): Promise<{ id: strin
     await save(scope, job);
     await completion(scope, job);
     return { id, recovered: true };
-  });
+  }, signal);
 }

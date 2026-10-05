@@ -93,7 +93,7 @@ export async function publishPresentation(directory: string, job: Job, state: "w
 }
 
 /** Explicitly rebind only with live boot/start identity AND current PTY evidence. */
-export async function reattachJob(scope: Scope, id: string, pane?: string): Promise<Job> {
+export async function reattachJob(scope: Scope, id: string, pane?: string, signal?: AbortSignal): Promise<Job> {
   if (!/^[a-f0-9]{12}$/.test(id)) throw new Error("Invalid job ID.");
   return locked(scope, async () => {
     const directory = join(scope.root, id);
@@ -133,7 +133,7 @@ export async function reattachJob(scope: Scope, id: string, pane?: string): Prom
     delete job.endedAt;
     await save(scope, job);
     return job;
-  });
+  }, signal);
 }
 
 /** Cold restore is a read-only report viewer, not a task/session resume. */

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import webAccessToggle, {
-  getWebAccessEnabled,
+  getWebAccessState,
   setWebAccessEnabled,
 } from "../extensions/web-access-toggle/index.ts";
 
@@ -16,24 +16,34 @@ const disabledWithEmptyFilters = {
   themes: [],
 };
 
-test("recognizes enabled and disabled pi-web-access package entries", () => {
-  assert.equal(getWebAccessEnabled(["npm:pi-web-access"]), true);
+test("distinguishes default, disabled, and indeterminate filtered registrations", () => {
+  assert.equal(getWebAccessState(["npm:pi-web-access"]), "on");
+  assert.equal(getWebAccessState([{ source: "npm:pi-web-access", autoload: true }]), "on");
   assert.equal(
-    getWebAccessEnabled([{ source: "npm:pi-web-access", autoload: false }]),
-    false,
+    getWebAccessState([{ source: "npm:pi-web-access", autoload: false }]),
+    "off",
   );
-  assert.equal(getWebAccessEnabled([disabledWithEmptyFilters]), false);
+  assert.equal(getWebAccessState([disabledWithEmptyFilters]), "off");
   assert.equal(
-    getWebAccessEnabled([
-      {
-        source: "npm:pi-web-access",
-        autoload: false,
-        extensions: ["+index.ts"],
-      },
-    ]),
-    true,
+    getWebAccessState([{
+      source: "npm:pi-web-access", autoload: false,
+      extensions: ["!**/*", "-index.ts"],
+    }]),
+    "off",
   );
-  assert.equal(getWebAccessEnabled(["npm:pi-mcp-adapter"]), undefined);
+  for (const filters of [
+    { autoload: false, extensions: ["+index.ts"] },
+    { extensions: ["!**/*"], skills: ["!**/*"], prompts: [], themes: [] },
+    { extensions: ["!**/*", "+index.ts"] },
+    { extensions: ["missing/**/*.ts"] },
+    { extensions: [] },
+  ]) {
+    assert.equal(getWebAccessState([{ source: "npm:pi-web-access", ...filters }]), "filtered");
+  }
+  assert.equal(getWebAccessState([
+    "npm:pi-web-access", { source: "npm:pi-web-access", autoload: false },
+  ]), "filtered");
+  assert.equal(getWebAccessState(["npm:pi-mcp-adapter"]), undefined);
 });
 
 test("changes package loading without removing its registration", () => {

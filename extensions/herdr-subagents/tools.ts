@@ -87,17 +87,17 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
           case "status": data = { root: scope.root, ...await status(scope, params.offset) }; break;
           case "continue": data = { jobs: (await continueTask(scope, params.id, params.message, params.requestId, signal)).map((job) => ({ id: job.id, name: job.task.name, conversationId: job.conversationId })) }; break;
           case "send": data = await sendTask(scope, params.id, params.message, params.kind, params.requestId, signal); break;
-          case "stop": data = await stopTask(scope, params.id); break;
-          case "recover": data = await recoverTask(scope, params.id); break;
+          case "stop": data = await stopTask(scope, params.id, signal); break;
+          case "recover": data = await recoverTask(scope, params.id, signal); break;
           case "reattach": {
-            const job = await reattachJob(scope, params.id, params.pane);
+            const job = await reattachJob(scope, params.id, params.pane, signal);
             data = { id: job.id, pane: job.pane, terminal: job.terminal };
             break;
           }
           case "configure": {
             // Preset validation happens first; independent files make retries safe.
-            const models = params.presets === undefined ? await presets(scope) : await configurePresets(scope, params.presets);
-            data = { ...await (params.concurrency === undefined ? settings(scope) : configure(scope, params.concurrency)), presets: models };
+            const models = params.presets === undefined ? await presets(scope) : await configurePresets(scope, params.presets, signal);
+            data = { ...await (params.concurrency === undefined ? settings(scope) : configure(scope, params.concurrency, signal)), presets: models };
             break;
           }
           case "wait": data = await waitForReports(scope, params.seconds ?? 30, signal, params.details); break;

@@ -394,16 +394,27 @@ test("next validates action-specific inputs, forwards defaults/signals, and boun
   assert.equal(calls, 1);
 });
 
-for (const action of ["close", "cancel-all", "cancel-selected"]) test(`queued native ${action} honors cancellation before admission`, async (t) => {
+for (const action of ["close", "cancel-all", "cancel-selected", "stop", "recover", "reattach", "configure-concurrency", "configure-presets"]) test(`queued native ${action} honors cancellation before admission`, async (t) => {
   const { scope, job } = await fixture(t);
   job.collected = true;
   job.cursor = "Final report".length;
   job.launched = true;
   await core.save(scope, job);
   const before = await core.jobs(scope);
+  const beforeSettings = await scheduler.settings(scope);
+  const beforePresets = await policy.presets(scope);
   const definition = tool({ scopeFor: () => scope });
   const controller = new AbortController();
-  const input = action === "close" ? { action } : { action: "cancel", ids: action === "cancel-all" ? "all" : [job.id] };
+  const input = {
+    close: { action: "close" },
+    "cancel-all": { action: "cancel", ids: "all" },
+    "cancel-selected": { action: "cancel", ids: [job.id] },
+    stop: { action: "stop", id: job.id },
+    recover: { action: "recover", id: job.id },
+    reattach: { action: "reattach", id: job.id, pane: "test-pane" },
+    "configure-concurrency": { action: "configure", concurrency: 2 },
+    "configure-presets": { action: "configure", presets: { review: { model: "fixture/model" } } },
+  }[action];
   let pending;
   await core.locked(scope, async () => {
     pending = execute(definition, input, ctx, controller.signal);
@@ -424,6 +435,9 @@ for (const action of ["close", "cancel-all", "cancel-selected"]) test(`queued na
   await core.locked(scope, async () => {}, AbortSignal.timeout(3000));
   assert.deepEqual(await core.jobs(scope), before, "cancelled contender must not mutate after the lock is released");
   assert.equal(await core.json(join(scope.root, job.id, "cancel.json")), undefined);
+  assert.deepEqual(await scheduler.settings(scope), beforeSettings);
+  assert.deepEqual(await policy.presets(scope), beforePresets);
+  assert.equal(await core.json(join(scope.root, job.id, "recovery.json")), undefined);
 });
 
 test("request inspection forwards cancellation and diagnostic failures preserve bounded metadata", async () => {

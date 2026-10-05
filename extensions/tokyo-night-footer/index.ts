@@ -1,7 +1,9 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { getCurrentSystemMessage, type AssistantMessage } from "@earendil-works/pi-ai";
 import {
   CustomEditor,
+  type BeforeAgentStartEvent,
   type ExtensionAPI,
   type ExtensionContext,
   type KeybindingsManager,
@@ -13,6 +15,8 @@ import {
   type Component,
   type EditorTheme,
   type TUI,
+  type TuiMouseEvent,
+  type TuiMouseEventResult,
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -21,9 +25,10 @@ import {
   generateAgentTitle,
   normalizeAgentTitle,
 } from "./agent-title.ts";
-import { isCodexFastModeEffective } from "./codex-fast-mode.ts";
+import { isCodexFastModeRequested } from "./codex-fast-mode.ts";
 import {
   createGitStatusTracker,
+  disposeGitStatus,
   ensureGitStatus,
   type GitStatusTracker,
   invalidateGitStatus,
@@ -33,8 +38,10 @@ import {
   type ContextTokenEstimate,
   estimateContextWithMessage,
   estimateLoadedContextTokens,
+  estimateProjectedContext,
   estimateRequestContextTokens,
   estimateStreamingContextTokens,
+  estimateSystemContextTokens,
   isCompletedResponse,
   usageInputTokens,
   usageTokenTotal,
@@ -125,6 +132,7 @@ interface StatusLineState {
   latestTps: number | undefined;
   latestTtftMs: number | undefined;
   contextEstimate: ContextTokenEstimate | undefined;
+  responseModel: { provider: string; id: string; name: string; contextWindow: number; thinkingLevel?: string } | undefined;
   requestContextEstimate: ContextTokenEstimate | undefined;
   loadedContextTokens: number | undefined;
   authoritativeLoadedContextTokens: number | undefined;
@@ -330,7 +338,7 @@ function estimateLoadedContext(
 }
 
 function contextSegment(
-  ctx: ExtensionContext,
+  contextWindow: number,
   theme: Theme,
   contextEstimate: ContextTokenEstimate | undefined,
   loadedContextTokens: number | undefined,
@@ -340,7 +348,6 @@ function contextSegment(
 ): string {
   // Rendering must never walk the session tree. Pi's getContextUsage() does;
   // snapshot it only at session/branch boundaries and use event-driven updates.
-  const contextWindow = ctx.model?.contextWindow ?? 0;
   const reportedContextTokens = contextUsageInvalidated ? undefined : contextUsageSnapshot;
   const isLoadedContextEstimate =
     contextEstimate === undefined &&
@@ -369,8 +376,13 @@ function contextSegment(
   return tone(theme, "context", text);
 }
 
-function modelName(ctx: ExtensionContext): string {
-  let name = sanitizeSingleLine(ctx.model?.name ?? ctx.model?.id ?? "no-model");
+function contextWindow(ctx: ExtensionContext, state: StatusLineState): number {
+  return (ctx.model?.api === "pi-virtual" ? state.responseModel?.contextWindow : undefined) ??
+    ctx.model?.contextWindow ?? 0;
+}
+
+function modelName(model: { name?: string; id?: string } | undefined): string {
+  let name = sanitizeSingleLine(model?.name ?? model?.id ?? "no-model");
   if (name.startsWith("Claude ")) name = name.slice("Claude ".length);
   return truncateToWidth(name, 28, "…");
 }
@@ -409,7 +421,7 @@ function buildLeftSegments(
   }
   segments.push({
     id: "model",
-    content: tone(theme, "model", withIcon("◉", modelName(ctx))),
+    content: tone(theme, "model", withIcon("◉", modelName(ctx.model))),
   });
 
   if (ctx.model?.reasoning) {
@@ -420,8 +432,14 @@ function buildLeftSegments(
     }
   }
 
-  if (isCodexFastModeEffective(ctx.model?.provider, ctx.model?.id)) {
-    segments.push({ id: "fast", content: tone(theme, "fast", withIcon("●", "fast")) });
+  const response = ctx.model?.api === "pi-virtual" ? state.responseModel : undefined;
+  if (response) {
+    const thinking = response.thinkingLevel ? ` ● ${response.thinkingLevel}` : "";
+    segments.push({ id: "model", content: tone(theme, "model", `→ ${modelName(response)}${thinking}`) });
+  }
+  const fastModel = response ?? ctx.model;
+  if (isCodexFastModeRequested(fastModel?.provider, fastModel?.id)) {
+    segments.push({ id: "fast", content: tone(theme, "fast", withIcon("●", "fast requested")) });
   }
 
   const pathWidth = Math.max(12, Math.min(40, Math.floor(availableWidth * 0.3)));
@@ -442,7 +460,7 @@ function buildLeftSegments(
     const gitParts = [
       tone(
         theme,
-        isDirty ? "gitDirty" : "gitClean",
+        isDirty || state.gitStatus.status !== "fresh" ? "gitDirty" : "gitClean",
         withIcon(
           nerdIcons ? GIT_BRANCH_ICON_NERD : GIT_BRANCH_ICON_FALLBACK,
           branchText,
@@ -452,6 +470,7 @@ function buildLeftSegments(
     if (unstaged > 0) gitParts.push(theme.fg("warning", `*${unstaged}`));
     if (staged > 0) gitParts.push(theme.fg("success", `+${staged}`));
     if (untracked > 0) gitParts.push(theme.fg("muted", `?${untracked}`));
+    if (state.gitStatus.status !== "fresh") gitParts.push(theme.fg("warning", state.gitStatus.status));
     segments.push({ id: "git", content: gitParts.join(" ") });
   }
 
@@ -459,7 +478,7 @@ function buildLeftSegments(
   segments.push({
     id: "context",
     content: contextSegment(
-      ctx,
+      contextWindow(ctx, state),
       theme,
       state.contextEstimate,
       state.loadedContextTokens,
@@ -649,6 +668,7 @@ class TokyoNightStatusEditor extends CustomEditor {
   #ctx: ExtensionContext;
   #state: StatusLineState;
   #refreshGitStatus: () => void;
+  #removedBorderRow: number | undefined;
 
   constructor(
     tui: TUI,
@@ -668,7 +688,23 @@ class TokyoNightStatusEditor extends CustomEditor {
     onReady(() => tui.requestRender());
   }
 
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    if (this.#removedBorderRow === undefined) return super.handleMouse(event);
+    // Side chrome is not part of the autocomplete list's hit region.
+    if (event.y >= this.#removedBorderRow && (event.x < 3 || event.x >= event.width - 3)) return undefined;
+    // Render adds three columns on each side and removes the base bottom
+    // border. Autocomplete consequently starts one row earlier on screen.
+    return super.handleMouse({
+      ...event,
+      x: Math.max(0, Math.min(event.width - 7, event.x - 3)),
+      y: event.y >= this.#removedBorderRow ? event.y + 1 : event.y,
+      width: event.width - 6,
+      height: event.height + 1,
+    });
+  }
+
   render(width: number): string[] {
+    this.#removedBorderRow = undefined;
     this.#refreshGitStatus();
     const agentTitle = currentAgentTitle(this.#pi);
     this.borderColor = agentTitle
@@ -682,6 +718,7 @@ class TokyoNightStatusEditor extends CustomEditor {
     if (lines.length === 0) return lines;
     const bottomBorderIndex = findBottomBorderIndex(lines);
     if (bottomBorderIndex === -1) return super.render(width);
+    this.#removedBorderRow = bottomBorderIndex;
 
     const scrollIndicators: string[] = [];
     const topScrollIndicator = stripVTControlCharacters(lines[0]).match(/↑\s+\d+\s+more/)?.[0];
@@ -720,6 +757,7 @@ export default function (pi: ExtensionAPI): void {
     latestTps: undefined,
     latestTtftMs: undefined,
     contextEstimate: undefined,
+    responseModel: undefined,
     requestContextEstimate: undefined,
     loadedContextTokens: undefined,
     authoritativeLoadedContextTokens: undefined,
@@ -744,10 +782,60 @@ export default function (pi: ExtensionAPI): void {
   let requestHeadersObserved = false;
   let requestClockLocked = false;
   let requestLoadedContextTokens: number | undefined;
+  let registeredLoadedContextTokens: number | undefined;
+  let runSystemPromptOptions: BeforeAgentStartEvent["systemPromptOptions"] | undefined;
+  let provenUsage: AssistantMessage | undefined;
+  let usageLoadedContextTokens: number | undefined;
+  let requestSystemPromptOverride: string | undefined;
   let contextLeafId: string | null | undefined;
+  let projectionLeafId: string | null | undefined;
   let contextRefreshQueued = false;
+  let contextRevision = 0;
+  let requestContextRevision = 0;
+  const bashRefreshTimers = new Set<ReturnType<typeof setTimeout>>();
+
+  const recordResponseModel = (ctx: ExtensionContext, message: AssistantMessage): void => {
+    if (!isCompletedResponse(message.stopReason) || message.api === "pi-virtual") return;
+    const model = ctx.modelRegistry?.find(message.provider, message.model);
+    state.responseModel = {
+      provider: message.provider, id: message.model, name: model?.name ?? message.model,
+      contextWindow: model?.contextWindow ?? 0, thinkingLevel: message.thinkingLevel,
+    };
+  };
+
+  const contextModel = (ctx: ExtensionContext) =>
+    ctx.model?.api === "pi-virtual" ? state.responseModel : ctx.model;
+
+  const rebuildProjectedContext = (ctx: ExtensionContext): boolean => {
+    // Prime Agent's older transport lacks projection; keep its existing fallback.
+    if (!ctx.sessionManager.buildSessionProjection) return false;
+    const projection = ctx.sessionManager.buildSessionProjection();
+    projectionLeafId = ctx.sessionManager.getLeafId();
+    const branch = ctx.sessionManager.getBranch();
+    state.responseModel = undefined;
+    for (let index = projection.messages.length - 1; index >= 0; index--) {
+      const message = projection.messages[index]!;
+      if (message.role === "assistant" && isCompletedResponse(message.stopReason) && message.api !== "pi-virtual") {
+        recordResponseModel(ctx, message);
+        break;
+      }
+    }
+    const model = contextModel(ctx);
+    const result = estimateProjectedContext(projection, branch, state.loadedContextTokens ?? 0, {
+      provider: model?.provider, id: model?.id,
+    }, state.authoritativeLoadedContextTokens);
+    state.loadedContextTokens = result.loadedContextTokens;
+    provenUsage = result.provenUsage;
+    usageLoadedContextTokens = result.usageLoadedContextTokens;
+    state.contextUsageInvalidated = result.invalidated;
+    state.contextUsageSnapshot = undefined;
+    if (result.invalidated) state.authoritativeLoadedContextTokens = undefined;
+    state.contextEstimate = result.estimate;
+    return true;
+  };
 
   const snapshotContextUsage = (ctx: ExtensionContext): void => {
+    if (rebuildProjectedContext(ctx)) return;
     const tokens = ctx.getContextUsage()?.tokens;
     state.contextUsageSnapshot = tokens;
     if (tokens === null || tokens === undefined || tokens === 0) return;
@@ -770,7 +858,9 @@ export default function (pi: ExtensionAPI): void {
       }
       if (entry.type === "message" && entry.message.role === "assistant" &&
           isCompletedResponse(entry.message.stopReason) && usageInputTokens(entry.message.usage) > 0) {
-        if (!assistantMatchesModel(entry.message, { provider: ctx.model?.provider, id: ctx.model?.id })) {
+        recordResponseModel(ctx, entry.message);
+        const model = contextModel(ctx);
+        if (!assistantMatchesModel(entry.message, { provider: model?.provider, id: model?.id })) {
           state.contextUsageSnapshot = undefined;
         }
         break;
@@ -784,8 +874,8 @@ export default function (pi: ExtensionAPI): void {
 
   const contextRenderKey = (estimate: ContextTokenEstimate | undefined): string => {
     if (!estimate) return "unknown";
-    const contextWindow = state.runtimeContext?.model?.contextWindow ?? 0;
-    const percent = contextWindow > 0 ? (estimate.tokens / contextWindow) * 100 : 0;
+    const window = state.runtimeContext ? contextWindow(state.runtimeContext, state) : 0;
+    const percent = window > 0 ? (estimate.tokens / window) * 100 : 0;
     const level = percent > 90 ? "error" : percent > 70 ? "warning" : "normal";
     return `${estimate.estimated ? "estimated" : "reported"}:${formatTokens(estimate.tokens)}:${level}`;
   };
@@ -794,6 +884,59 @@ export default function (pi: ExtensionAPI): void {
     const previousKey = contextRenderKey(state.contextEstimate);
     state.contextEstimate = estimate;
     if (contextRenderKey(estimate) !== previousKey) requestRender?.();
+  };
+
+  const resetCompactedContext = (): void => {
+    state.latestTps = undefined;
+    state.latestTtftMs = undefined;
+    requestStartedAt = undefined;
+    requestFirstTokenAt = undefined;
+    requestLoadedContextTokens = undefined;
+    state.contextEstimate = undefined;
+    state.requestContextEstimate = undefined;
+    state.authoritativeLoadedContextTokens = undefined;
+    state.streamingContextChars = 0;
+    state.streamingContentChars.clear();
+    state.contextUsageInvalidated = false;
+  };
+
+  const refreshContextEntries = (ctx: ExtensionContext): void => {
+    const leafId = ctx.sessionManager.getLeafId?.();
+    if (leafId === undefined || leafId === contextLeafId) return;
+    let entry = leafId === null ? undefined : ctx.sessionManager.getEntry(leafId);
+    let estimate = state.contextEstimate;
+    if (!estimate && !state.contextUsageInvalidated && state.contextUsageSnapshot !== null) {
+      const tokens = state.contextUsageSnapshot === 0
+        ? state.loadedContextTokens
+        : state.contextUsageSnapshot;
+      if (tokens !== undefined) estimate = { tokens, estimated: true };
+    }
+    let changed = false;
+    let contextEdited = false;
+    let compacted = false;
+    let systemChanged = false;
+    // Inspect only newly appended entries, outside render/streaming. Boundary
+    // compactions emit entry_appended, not the extension's session_compact event.
+    while (entry && entry.id !== contextLeafId) {
+      if (entry.type === "context_edit") contextEdited = true;
+      if (entry.type === "compaction") compacted = true;
+      if (entry.type === "message" && entry.message.role === "system") systemChanged = true;
+      if (estimate && entry.type === "message" && entry.message.role === "bashExecution") {
+        const next = estimateContextWithMessage(estimate, entry.message);
+        changed ||= next !== estimate;
+        estimate = next;
+      }
+      entry = entry.parentId === null ? undefined : ctx.sessionManager.getEntry(entry.parentId);
+    }
+    contextLeafId = leafId;
+    if (contextEdited || compacted) contextRevision++;
+    if (compacted) resetCompactedContext();
+    if (contextEdited || compacted || systemChanged) {
+      if (compacted) snapshotContextUsage(ctx);
+      else rebuildProjectedContext(ctx);
+      if (state.requestContextEstimate) state.requestContextEstimate = state.contextEstimate;
+      requestRender?.();
+    } else if (changed) setContextEstimate(estimate);
   };
 
   const checkContextEntries = (): void => {
@@ -806,29 +949,7 @@ export default function (pi: ExtensionAPI): void {
     queueMicrotask(() => {
       contextRefreshQueued = false;
       if (!state.runtimeActive || generation !== state.runtimeGeneration) return;
-      const leafId = ctx.sessionManager.getLeafId();
-      let entry = leafId === null ? undefined : ctx.sessionManager.getEntry(leafId);
-      let estimate = state.contextEstimate;
-      if (!estimate && !state.contextUsageInvalidated && state.contextUsageSnapshot !== null) {
-        const tokens = state.contextUsageSnapshot === 0
-          ? state.loadedContextTokens
-          : state.contextUsageSnapshot;
-        if (tokens !== undefined) estimate = { tokens, estimated: true };
-      }
-      let changed = false;
-      // recordBashResult() persists idle ! output without message_end. Only
-      // inspect newly appended entries, outside render; normal messages were
-      // already counted by their events. !! results add nothing.
-      while (entry && entry.id !== contextLeafId) {
-        if (estimate && entry.type === "message" && entry.message.role === "bashExecution") {
-          const next = estimateContextWithMessage(estimate, entry.message);
-          changed ||= next !== estimate;
-          estimate = next;
-        }
-        entry = entry.parentId === null ? undefined : ctx.sessionManager.getEntry(entry.parentId);
-      }
-      contextLeafId = leafId;
-      if (changed) setContextEstimate(estimate);
+      refreshContextEntries(ctx);
     });
   };
 
@@ -858,7 +979,19 @@ export default function (pi: ExtensionAPI): void {
     }
   };
 
+  const refreshLoadedContext = (ctx: ExtensionContext): void => {
+    const registered = estimateLoadedContext(pi, ctx);
+    // Registration metadata is a forecast for unsent changes, not a replacement
+    // for canonical prepareLoadout descriptions or a request-local system state.
+    if (registered !== undefined && registeredLoadedContextTokens !== undefined) {
+      updateLoadedContext(Math.max(0, (state.loadedContextTokens ?? registeredLoadedContextTokens) +
+        registered - registeredLoadedContextTokens));
+    } else if (state.loadedContextTokens === undefined) updateLoadedContext(registered);
+    registeredLoadedContextTokens = registered;
+  };
+
   const refreshGitStatus = (force = false) => {
+    if (!state.runtimeActive) return;
     const tracker = state.gitStatus;
     if (force) invalidateGitStatus(tracker);
     ensureGitStatus(pi, tracker, () => {
@@ -914,7 +1047,9 @@ export default function (pi: ExtensionAPI): void {
     const mode = (ctx as { mode?: string }).mode;
     if (mode === undefined ? !ctx.hasUI : mode !== "tui") return;
 
-    invalidateGitStatus(state.gitStatus);
+    disposeGitStatus(state.gitStatus);
+    for (const timer of bashRefreshTimers) clearTimeout(timer);
+    bashRefreshTimers.clear();
     state.latestTps = undefined;
     state.latestTtftMs = undefined;
     state.contextEstimate = undefined;
@@ -923,10 +1058,16 @@ export default function (pi: ExtensionAPI): void {
     state.streamingContextChars = 0;
     state.streamingContentChars.clear();
     state.contextUsageInvalidated = false;
+    state.responseModel = undefined;
+    state.loadedContextTokens = estimateLoadedContext(pi, ctx);
+    registeredLoadedContextTokens = state.loadedContextTokens;
+    runSystemPromptOptions = undefined;
+    provenUsage = undefined;
+    usageLoadedContextTokens = undefined;
+    requestSystemPromptOverride = undefined;
     snapshotContextUsage(ctx);
     contextLeafId = ctx.sessionManager.getLeafId?.();
     state.checkContextEntries = checkContextEntries;
-    state.loadedContextTokens = estimateLoadedContext(pi, ctx);
     state.footerData = undefined;
     state.gitStatus = createGitStatusTracker(ctx.cwd);
     state.runtimeContext = ctx;
@@ -988,11 +1129,15 @@ export default function (pi: ExtensionAPI): void {
   pi.on("resources_discover", (_event, ctx) => {
     if (!state.runtimeActive) return;
     // Resource discovery can change the active tool loadout after startup.
-    updateLoadedContext(estimateLoadedContext(pi, ctx));
+    refreshLoadedContext(ctx);
     requestRender?.();
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    // Pi shares this options object across all before_agent_start handlers.
+    // Retain the reference so later handlers (including returned systemPrompt)
+    // can set or clear an explicit override even when its text is unchanged.
+    if (state.runtimeActive) runSystemPromptOptions = event.systemPromptOptions;
     maybeGenerateAgentTitle(ctx, event.prompt);
   });
 
@@ -1000,12 +1145,16 @@ export default function (pi: ExtensionAPI): void {
     if (!state.runtimeActive) return;
     // This runs after every extension's before_agent_start handler, so both the
     // effective system prompt and active tool schemas match the agent request.
-    updateLoadedContext(estimateLoadedContext(pi, ctx));
+    refreshLoadedContext(ctx);
     requestRender?.();
   });
 
   pi.on("context", (event, ctx) => {
     if (!state.runtimeActive) return;
+    // Request boundaries may walk canonical history; rendering never does.
+    refreshContextEntries(ctx);
+    if (ctx.sessionManager.getLeafId?.() !== projectionLeafId) rebuildProjectedContext(ctx);
+    requestContextRevision = contextRevision;
     // This request already contains every persisted shell result before it.
     contextLeafId = ctx.sessionManager.getLeafId?.();
     // Old runtimes without request/header hooks retain the context fallback.
@@ -1015,17 +1164,48 @@ export default function (pi: ExtensionAPI): void {
     requestClockLocked = false;
     requestLoadedContextTokens = undefined;
     // Tools can be activated by a tool result between calls in the same run.
-    const loadedContextTokens = estimateLoadedContext(pi, ctx);
+    refreshLoadedContext(ctx);
+    const loadedContextTokens = state.loadedContextTokens;
     if (loadedContextTokens === undefined) return;
-    updateLoadedContext(loadedContextTokens);
     requestLoadedContextTokens = loadedContextTokens;
+    // All before_agent_start handlers have finished by this request boundary.
+    // Pi reapplies an explicit forced prompt after context_with_system, even
+    // when that prompt equals the canonical text or is the empty string.
+    requestSystemPromptOverride = runSystemPromptOptions?.forceSystemPrompt;
 
+    const model = contextModel(ctx);
     const estimate = estimateRequestContextTokens(
       event.messages,
       loadedContextTokens,
-      { provider: ctx.model?.provider, id: ctx.model?.id },
-      state.authoritativeLoadedContextTokens,
+      { provider: model?.provider, id: model?.id },
+      state.authoritativeLoadedContextTokens ?? usageLoadedContextTokens,
+      !state.contextUsageInvalidated,
+      provenUsage,
     );
+    state.requestContextEstimate = estimate;
+    setContextEstimate(estimate);
+  });
+
+  pi.on("context_with_system", (event, ctx) => {
+    if (!state.runtimeActive) return;
+    let messages = event.messages;
+    if (requestSystemPromptOverride !== undefined) {
+      const system = getCurrentSystemMessage(messages);
+      messages = [{ role: "system", content: requestSystemPromptOverride,
+        toolsAdded: system?.toolsAdded, timestamp: system?.timestamp ?? 0 },
+      ...messages.filter((message) => message.role !== "system")];
+    }
+    // This public hook sees prepared declarations and earlier request-local
+    // transforms. Pi 1.0.2's hiddenDeclarations projection runs AFTER this hook;
+    // its private hidden set and later handlers are not observable here.
+    const loaded = estimateSystemContextTokens(messages) ?? 0;
+    updateLoadedContext(loaded);
+    requestLoadedContextTokens = loaded;
+    const model = contextModel(ctx);
+    const estimate = estimateRequestContextTokens(messages, loaded,
+      { provider: model?.provider, id: model?.id },
+      state.authoritativeLoadedContextTokens ?? usageLoadedContextTokens,
+      !state.contextUsageInvalidated, provenUsage);
     state.requestContextEstimate = estimate;
     setContextEstimate(estimate);
   });
@@ -1057,7 +1237,8 @@ export default function (pi: ExtensionAPI): void {
     state.streamingContextChars = 0;
     state.streamingContentChars.clear();
     if (state.requestContextEstimate) {
-      setContextEstimate(estimateStreamingContextTokens(state.requestContextEstimate, 0, event.message.usage));
+      setContextEstimate(estimateStreamingContextTokens(state.requestContextEstimate, 0,
+        requestContextRevision === contextRevision ? event.message.usage : undefined));
     }
   });
 
@@ -1111,7 +1292,7 @@ export default function (pi: ExtensionAPI): void {
         estimateStreamingContextTokens(
           state.requestContextEstimate,
           state.streamingContextChars,
-          event.message.usage,
+          requestContextRevision === contextRevision ? event.message.usage : undefined,
         ),
       );
     }
@@ -1129,11 +1310,12 @@ export default function (pi: ExtensionAPI): void {
     const completedAt = performance.now();
     const contextTokens = usageTokenTotal(event.message.usage);
     const completed = isCompletedResponse(event.message.stopReason);
-    const matchesModel = assistantMatchesModel(event.message, {
-      provider: ctx.model?.provider,
-      id: ctx.model?.id,
-    });
-    const hasCurrentModelUsage = completed && matchesModel && usageInputTokens(event.message.usage) > 0;
+    const matchesModel = ctx.model?.api === "pi-virtual"
+      ? event.message.api !== "pi-virtual"
+      : assistantMatchesModel(event.message, { provider: ctx.model?.provider, id: ctx.model?.id });
+    if (completed && matchesModel) recordResponseModel(ctx, event.message);
+    const hasCurrentModelUsage = completed && matchesModel && requestContextRevision === contextRevision &&
+      usageInputTokens(event.message.usage) > 0;
 
     const previousTps = state.latestTps;
     const previousTtftMs = state.latestTtftMs;
@@ -1154,7 +1336,7 @@ export default function (pi: ExtensionAPI): void {
       setContextEstimate(estimateStreamingContextTokens(
         state.requestContextEstimate,
         (fallback.tokens - state.requestContextEstimate.tokens) * 4,
-        completed && matchesModel ? event.message.usage : undefined,
+        completed && matchesModel && requestContextRevision === contextRevision ? event.message.usage : undefined,
       ));
     }
     state.requestContextEstimate = undefined;
@@ -1163,7 +1345,7 @@ export default function (pi: ExtensionAPI): void {
     requestStartedAt = undefined;
     requestFirstTokenAt = undefined;
     // Context/TPS can round to the same display value even when TTFT changes.
-    if (state.latestTps !== previousTps || state.latestTtftMs !== previousTtftMs) requestRender?.();
+    if (ctx.model?.api === "pi-virtual" || state.latestTps !== previousTps || state.latestTtftMs !== previousTtftMs) requestRender?.();
   });
 
   pi.on("tool_result", (event) => {
@@ -1173,11 +1355,14 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("user_bash", () => {
+    if (!state.runtimeActive) return;
     const tracker = state.gitStatus;
     for (const delay of [100, 500, 1_500]) {
-      setTimeout(() => {
-        if (state.gitStatus === tracker) refreshGitStatus(true);
+      const timer = setTimeout(() => {
+        bashRefreshTimers.delete(timer);
+        if (state.runtimeActive && state.gitStatus === tracker) refreshGitStatus(true);
       }, delay);
+      bashRefreshTimers.add(timer);
     }
   });
 
@@ -1185,9 +1370,16 @@ export default function (pi: ExtensionAPI): void {
     requestStartedAt = undefined;
     refreshGitStatus(true);
   });
-  pi.on("agent_settled", (_event, ctx) => maybeGenerateAgentTitle(ctx));
+  pi.on("agent_settled", (_event, ctx) => {
+    // Boundary handlers/recovery can append context edits/compactions after the last turn
+    // notification, including when there will be no further model request.
+    checkContextEntries();
+    maybeGenerateAgentTitle(ctx);
+    requestRender?.();
+  });
   pi.on("session_info_changed", () => requestRender?.());
-  pi.on("model_select", () => {
+  pi.on("model_select", (_event, ctx) => {
+    if (!state.runtimeActive) return;
     state.latestTps = undefined;
     state.latestTtftMs = undefined;
     requestStartedAt = undefined;
@@ -1197,22 +1389,16 @@ export default function (pi: ExtensionAPI): void {
     state.streamingContextChars = 0;
     state.streamingContentChars.clear();
     state.contextUsageInvalidated = true;
+    if (ctx.model?.api === "pi-virtual") snapshotContextUsage(ctx);
     requestRender?.();
   });
   pi.on("thinking_level_select", () => requestRender?.());
   pi.on("session_compact", (_event, ctx) => {
     if (!state.runtimeActive) return;
-    state.latestTps = undefined;
-    state.latestTtftMs = undefined;
-    requestStartedAt = undefined;
-    snapshotContextUsage(ctx);
+    resetCompactedContext();
+    contextRevision++;
     contextLeafId = ctx.sessionManager.getLeafId?.();
-    state.contextEstimate = undefined;
-    state.requestContextEstimate = undefined;
-    state.authoritativeLoadedContextTokens = undefined;
-    state.streamingContextChars = 0;
-    state.streamingContentChars.clear();
-    state.contextUsageInvalidated = false;
+    snapshotContextUsage(ctx);
     requestRender?.();
   });
   pi.on("session_tree", (_event, ctx) => {
@@ -1220,7 +1406,6 @@ export default function (pi: ExtensionAPI): void {
     state.latestTps = undefined;
     state.latestTtftMs = undefined;
     requestStartedAt = undefined;
-    snapshotContextUsage(ctx);
     contextLeafId = ctx.sessionManager.getLeafId?.();
     state.contextEstimate = undefined;
     state.requestContextEstimate = undefined;
@@ -1228,6 +1413,7 @@ export default function (pi: ExtensionAPI): void {
     state.streamingContextChars = 0;
     state.streamingContentChars.clear();
     state.contextUsageInvalidated = false;
+    snapshotContextUsage(ctx);
     requestRender?.();
     maybeGenerateAgentTitle(ctx);
   });
@@ -1239,10 +1425,12 @@ export default function (pi: ExtensionAPI): void {
     requestFirstTokenAt = undefined;
     state.titleGenerationAbortController.abort();
     state.titleGenerationInFlight = false;
+    for (const timer of bashRefreshTimers) clearTimeout(timer);
+    bashRefreshTimers.clear();
     state.primeAgentContext?.ui.setWidget(PRIME_AGENT_WIDGET_KEY, undefined, {
       placement: "belowEditor",
     });
-    invalidateGitStatus(state.gitStatus);
+    disposeGitStatus(state.gitStatus);
     state.gitStatus = createGitStatusTracker(process.cwd());
     requestRender = undefined;
     state.footerData = undefined;
@@ -1254,8 +1442,15 @@ export default function (pi: ExtensionAPI): void {
     state.streamingContentChars.clear();
     state.contextUsageInvalidated = false;
     state.contextUsageSnapshot = undefined;
+    state.responseModel = undefined;
     state.checkContextEntries = undefined;
     contextLeafId = undefined;
+    projectionLeafId = undefined;
+    registeredLoadedContextTokens = undefined;
+    runSystemPromptOptions = undefined;
+    provenUsage = undefined;
+    usageLoadedContextTokens = undefined;
+    requestSystemPromptOverride = undefined;
     state.runtimeContext = undefined;
     state.primeAgentContext = undefined;
     state.primeAgentWidgetText = undefined;

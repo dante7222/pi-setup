@@ -1,8 +1,10 @@
 import {
   type ContextEvent,
+  type SessionProjection,
+  type SessionEntry,
   estimateTokens,
 } from "@earendil-works/pi-coding-agent";
-import type { StopReason, Usage } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, type AssistantMessage, type StopReason, type Usage } from "@earendil-works/pi-ai";
 
 interface ContextTool {
   name: string;
@@ -82,35 +84,42 @@ export function estimateRequestContextTokens(
   loadedContextTokens: number,
   model: ContextModelIdentity,
   authoritativeLoadedContextTokens: number | undefined,
+  allowUsage = true,
+  provenUsage?: AssistantMessage,
 ): ContextTokenEstimate {
+  // Replay patches/removals/checkpoints, rather than counting every historical
+  // declaration or replacing prepared descriptions with tool registrations.
+  loadedContextTokens = estimateSystemContextTokens(messages) ?? loadedContextTokens;
   let usageIndex = -1;
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index]!;
     if (message.role === "compactionSummary") {
       // Retained assistant messages still carry PRE-compaction usage. Their
       // position after the summary does not make that usage a new measurement.
-      if (usageIndex !== -1 && messages[usageIndex]!.timestamp <= message.timestamp) {
-        usageIndex = -1;
-      }
+      const usage = messages[usageIndex];
+      if (provenUsage === undefined && usage && usage.timestamp <= message.timestamp) usageIndex = -1;
       break;
     }
     if (usageIndex === -1 && hasUsableUsage(message)) usageIndex = index;
   }
 
   const usageMessage = usageIndex === -1 ? undefined : messages[usageIndex]!;
+  // A request-local transform may remove/replace the canonical anchor. Do not
+  // apply that anchor's loaded-system baseline to a different response.
+  const matchesProvenUsage = provenUsage === undefined || usageMessage === provenUsage ||
+    JSON.stringify(usageMessage) === JSON.stringify(provenUsage);
   if (
-    usageMessage?.role === "assistant" &&
+    allowUsage && matchesProvenUsage && usageMessage?.role === "assistant" &&
     assistantMatchesModel(usageMessage, model)
   ) {
     let trailingTokens = 0;
     for (let index = usageIndex + 1; index < messages.length; index++) {
-      trailingTokens += estimateMessageTokens(messages[index]!);
+      if (messages[index]!.role !== "system") trailingTokens += estimateMessageTokens(messages[index]!);
     }
 
-    const loadedDelta =
-      authoritativeLoadedContextTokens === undefined
-        ? 0
-        : loadedContextTokens - authoritativeLoadedContextTokens;
+    const baseline = authoritativeLoadedContextTokens ??
+      estimateSystemContextTokens(messages.slice(0, usageIndex + 1));
+    const loadedDelta = baseline === undefined ? 0 : loadedContextTokens - baseline;
     return {
       tokens: Math.max(
         0,
@@ -123,10 +132,68 @@ export function estimateRequestContextTokens(
   }
 
   let messageTokens = 0;
-  for (const message of messages) messageTokens += estimateMessageTokens(message);
+  for (const message of messages) {
+    if (message.role !== "system") messageTokens += estimateMessageTokens(message);
+  }
   return {
     tokens: loadedContextTokens + messageTokens,
     estimated: true,
+  };
+}
+
+/** Complete effective system state, including prepared tool declarations. */
+export function estimateSystemContextTokens(messages: readonly ContextMessage[]): number | undefined {
+  const system = getCurrentSystemMessage(messages);
+  return system ? estimateTokens(system) : undefined;
+}
+
+/** Source entry order, not timestamps, determines whether an edit invalidates usage. */
+export function estimateProjectedContext(
+  projection: SessionProjection,
+  branch: readonly SessionEntry[],
+  loadedContextTokens: number,
+  model: ContextModelIdentity,
+  authoritativeLoadedContextTokens?: number,
+): {
+  estimate: ContextTokenEstimate;
+  invalidated: boolean;
+  loadedContextTokens: number;
+  provenUsage: AssistantMessage | undefined;
+  usageLoadedContextTokens: number | undefined;
+} {
+  const positions = new Map(branch.map((entry, index) => [entry.id, index]));
+  let barrier = -1;
+  for (let index = branch.length - 1; index >= 0; index--) {
+    if (branch[index]!.type === "context_edit" || branch[index]!.type === "compaction") {
+      barrier = index;
+      break;
+    }
+  }
+  let usagePosition = -1;
+  let usage: AssistantMessage | undefined;
+  for (const entry of projection.entries) {
+    for (const message of entry.messages) {
+      if (message.role === "assistant" && hasUsableUsage(message)) {
+        usage = message;
+        usagePosition = positions.get(entry.sourceEntry.id) ?? -1;
+      }
+    }
+  }
+  const invalidated = barrier >= 0 && usagePosition <= barrier;
+  const provenUsage = usagePosition > barrier ? usage : undefined;
+  const usageLoadedContextTokens = usage ? estimateSystemContextTokens(
+    projection.messages.slice(0, projection.messages.indexOf(usage) + 1),
+  ) : undefined;
+  loadedContextTokens = estimateSystemContextTokens(projection.messages) ?? loadedContextTokens;
+  return {
+    estimate: estimateRequestContextTokens(
+      projection.messages, loadedContextTokens, model, authoritativeLoadedContextTokens,
+      !invalidated, provenUsage,
+    ),
+    invalidated,
+    loadedContextTokens,
+    provenUsage,
+    usageLoadedContextTokens,
   };
 }
 

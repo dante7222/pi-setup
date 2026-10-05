@@ -47,13 +47,13 @@ test("parses only concise generated titles instead of displaying the prompt", ()
 test("starts title generation immediately with the active model", async () => {
   const calls = [];
   const registry = {
-    async complete(model, context, options) {
+    streamSimple(model, context, options) {
       calls.push({ model, context, options });
-      return {
+      return { result: async () => ({
         role: "assistant",
         content: [{ type: "text", text: "<title>Add AI-generated footer titles</title>" }],
         stopReason: "stop",
-      };
+      }) };
     },
   };
   const model = {
@@ -74,6 +74,7 @@ test("starts title generation immediately with the active model", async () => {
   assert.match(calls[0].context.systemPrompt, /3-7 word title/);
   assert.match(calls[0].context.messages[0].content[0].text, /<user>/);
   assert.doesNotMatch(calls[0].context.messages[0].content[0].text, /assistantResponse/);
-  assert.equal(calls[0].options.reasoningEffort, "minimal");
-  assert.equal(calls[0].options.textVerbosity, "low");
+  assert.equal(calls[0].options.maxTokens, 256);
+  assert.equal(calls[0].options.cacheRetention, "none");
+  assert.equal(calls[0].options.reasoningEffort, undefined);
 });

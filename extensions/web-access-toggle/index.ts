@@ -19,29 +19,37 @@ function isWebAccessEntry(entry: PackageSource): boolean {
   return source === WEB_ACCESS_SOURCE || source.startsWith(`${WEB_ACCESS_SOURCE}@`);
 }
 
-function entryLoadsResources(entry: PackageSource): boolean {
-  if (typeof entry === "string") return true;
+type WebAccessState = "on" | "off" | "filtered";
+
+function entryState(entry: PackageSource): WebAccessState {
+  if (typeof entry === "string") return "on";
 
   if (entry.autoload === false) {
-    return RESOURCE_TYPES.some((resourceType) =>
+    const hasIncludes = RESOURCE_TYPES.some((resourceType) =>
       entry[resourceType]?.some(
         (pattern) => !pattern.startsWith("!") && !pattern.startsWith("-"),
       ) === true,
     );
+    return hasIncludes ? "filtered" : "off";
   }
 
-  return RESOURCE_TYPES.some((resourceType) => {
-    const patterns = entry[resourceType];
-    return patterns === undefined || patterns.length > 0;
-  });
+  if (RESOURCE_TYPES.every((resourceType) => entry[resourceType] === undefined)) {
+    return "on";
+  }
+  if (RESOURCE_TYPES.every((resourceType) => entry[resourceType]?.length === 0)) {
+    return "off";
+  }
+  // Effective glob matches require resolved package contents. Status must not
+  // install/resolve packages or claim arbitrary nonempty filters load resources.
+  return "filtered";
 }
 
-export function getWebAccessEnabled(
+export function getWebAccessState(
   packages: readonly PackageSource[],
-): boolean | undefined {
-  const entries = packages.filter(isWebAccessEntry);
-  if (entries.length === 0) return undefined;
-  return entries.some(entryLoadsResources);
+): WebAccessState | undefined {
+  const states = packages.filter(isWebAccessEntry).map(entryState);
+  if (states.length === 0) return undefined;
+  return states.every((state) => state === states[0]) ? states[0] : "filtered";
 }
 
 export function setWebAccessEnabled(
@@ -90,8 +98,8 @@ export default function webAccessToggle(pi: ExtensionAPI): void {
       }
 
       const packages = settingsManager.getGlobalSettings().packages ?? [];
-      const currentlyEnabled = getWebAccessEnabled(packages);
-      if (currentlyEnabled === undefined) {
+      const currentState = getWebAccessState(packages);
+      if (currentState === undefined) {
         ctx.ui.notify(
           "pi-web-access is not registered in global Pi settings.",
           "error",
@@ -101,9 +109,9 @@ export default function webAccessToggle(pi: ExtensionAPI): void {
 
       if (operation === "status") {
         ctx.ui.notify(
-          currentlyEnabled
-            ? "Web access is on."
-            : "Web access is off; the package remains installed.",
+          currentState === "filtered"
+            ? "Web access is filtered in global settings; effective loading depends on resource matches. Use /web-access on to restore default loading."
+            : `Web access is ${currentState} in global settings${currentState === "off" ? "; the package remains installed" : ""}.`,
           "info",
         );
         return;
@@ -115,14 +123,14 @@ export default function webAccessToggle(pi: ExtensionAPI): void {
       } else {
         if (!ctx.hasUI) {
           ctx.ui.notify(
-            `Web access is ${currentlyEnabled ? "on" : "off"}. Usage: /web-access <on|off|status>`,
+            `Web access is ${currentState} in global settings. Usage: /web-access <on|off|status>`,
             "info",
           );
           return;
         }
         const choice = await ctx.ui.select(
-          `Web access is currently ${currentlyEnabled ? "on" : "off"}`,
-          currentlyEnabled
+          `Web access is currently ${currentState} in global settings`,
+          currentState === "on"
             ? [DISABLE_CHOICE, ENABLE_CHOICE]
             : [ENABLE_CHOICE, DISABLE_CHOICE],
         );
@@ -130,7 +138,7 @@ export default function webAccessToggle(pi: ExtensionAPI): void {
         enable = choice === ENABLE_CHOICE;
       }
 
-      if (enable === currentlyEnabled) {
+      if (currentState === (enable ? "on" : "off")) {
         ctx.ui.notify(
           enable
             ? "Web access is already on."

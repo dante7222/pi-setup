@@ -1,6 +1,5 @@
 import { stripVTControlCharacters } from "node:util";
-import type { Api, AssistantMessage, Model, UserMessage } from "@earendil-works/pi-ai";
-import { hasApi } from "@earendil-works/pi-ai";
+import type { Api, Model, UserMessage } from "@earendil-works/pi-ai";
 import type { ModelRegistry, SessionEntry } from "@earendil-works/pi-coding-agent";
 
 const TITLE_SYSTEM_PROMPT = `Write a concise 3-7 word title for this coding-agent task.
@@ -123,28 +122,9 @@ export async function generateAgentTitle(
     signal,
   };
 
-  let result: AssistantMessage;
-  if (hasApi(model, "openai-codex-responses")) {
-    result = await registry.complete(model, requestContext, {
-      ...baseOptions,
-      reasoningEffort: "minimal",
-      reasoningSummary: "off",
-      textVerbosity: "low",
-    });
-  } else if (hasApi(model, "openai-responses")) {
-    result = await registry.complete(model, requestContext, {
-      ...baseOptions,
-      reasoningEffort: "minimal",
-      reasoningSummary: null,
-    });
-  } else if (hasApi(model, "anthropic-messages")) {
-    result = await registry.complete(model, requestContext, {
-      ...baseOptions,
-      thinkingEnabled: false,
-    });
-  } else {
-    result = await registry.complete(model, requestContext, baseOptions);
-  }
+  // complete() bypasses virtual routing. The public 1.0.2 registry facade lacks
+  // completeSimple(); streamSimple().result() is its provider-neutral equivalent.
+  const result = await registry.streamSimple(model, requestContext, baseOptions).result();
 
   if (result.stopReason === "error" || result.stopReason === "aborted") return undefined;
   const text = result.content

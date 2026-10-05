@@ -23,12 +23,12 @@ export async function settings(scope: Scope): Promise<Settings> {
   return { concurrency: value === undefined ? 4 : validate(value?.concurrency) };
 }
 
-export async function configure(scope: Scope, concurrency: number): Promise<Settings> {
+export async function configure(scope: Scope, concurrency: number, signal?: AbortSignal): Promise<Settings> {
   const value = { concurrency: validate(concurrency) };
   return locked(scope, async () => {
     await atomic(join(scope.root, "settings.json"), value);
     return value;
-  });
+  }, signal);
 }
 
 async function removeOwned(path: string, token: string): Promise<void> {

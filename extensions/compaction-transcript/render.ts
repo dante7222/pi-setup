@@ -3,6 +3,9 @@ import type {
   SessionHeader,
   SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
+import { Marked } from "@earendil-works/pi-tui";
+
+const markdownParser = new Marked();
 
 export interface TranscriptRenderOptions {
   entries: SessionEntry[];
@@ -14,7 +17,7 @@ export interface TranscriptRenderOptions {
 
 type StoredMessage = SessionMessageEntry["message"];
 type UserContent = Extract<StoredMessage, { role: "user" }>["content"];
-type AssistantContent = Extract<StoredMessage, { role: "assistant" }>["content"];
+type StoredAssistant = Extract<StoredMessage, { role: "assistant" }>;
 
 interface ReadingTurn {
   question: string[];
@@ -56,14 +59,54 @@ export function resolveTranscriptTitle(
   return "Conversation Transcript";
 }
 
-function assistantText(content: AssistantContent): Pick<ReadingTurn, "response" | "thinking"> {
+function markdownBoundary(text: string): string {
+  // Parse the body rather than counting delimiter characters inside code. Root
+  // separators end lists/quotes; root fences and raw HTML blocks need a closer
+  // first or they would consume the status/answer of the following attempt.
+  const last = markdownParser.lexer(text).findLast((token) => token.type !== "space");
+  let close = "";
+  if (last?.type === "code") {
+    const fence = /^ {0,3}(`{3,}|~{3,})/.exec(last.raw)?.[1];
+    if (fence) {
+      const closing = new RegExp(`^ {0,3}${fence[0]}{${fence.length},}[\\t ]*$`);
+      if (!last.raw.split("\n").slice(1).some((line) => closing.test(line))) close = fence;
+    }
+  } else if (last?.type === "html") {
+    const raw = last.raw.trimStart();
+    if (raw.startsWith("<!--") && !raw.includes("-->")) close = "-->";
+    else if (raw.startsWith("<?") && !raw.includes("?>")) close = "?>";
+    else if (raw.startsWith("<![CDATA[") && !raw.includes("]]>")) close = "]]>";
+    else if (/^<![A-Z]/.test(raw) && !raw.includes(">")) close = ">";
+    else {
+      const tag = /^<(script|pre|style|textarea)(?:[\s>]|$)/i.exec(raw)?.[1];
+      if (tag && !new RegExp(`</${tag}\\s*>`, "i").test(raw)) close = `</${tag}>`;
+    }
+  }
+  return `${close ? `${close}\n\n` : ""}<!-- pi-transcript-response-boundary -->`;
+}
+
+function assistantText(message: StoredAssistant): Pick<ReadingTurn, "response" | "thinking"> {
   const response: string[] = [];
   const thinking: string[] = [];
 
-  for (const block of content) {
+  for (const block of message.content) {
     if (block.type === "text") response.push(block.text);
     if (block.type === "thinking") thinking.push(block.thinking);
   }
+
+  const reason = message.stopReason === "aborted"
+    ? "This assistant response was aborted."
+    : message.stopReason === "error"
+      ? "This assistant response ended with an error."
+      : message.stopReason === "length"
+        ? "This assistant response reached the output limit."
+        : undefined;
+  if (reason) {
+    // Annotate this attempt, not the whole user turn: a later retry may finish.
+    // Provider error payloads stay in the lossless sidecar, not the reading view.
+    response.unshift(`> [!warning] Incomplete response\n> ${reason}`);
+  }
+  if (response.length > 0) response.push(markdownBoundary(response.join("\n\n")));
 
   return { response, thinking };
 }
@@ -86,7 +129,7 @@ function readingTurns(entries: SessionEntry[]): ReadingTurn[] {
     }
 
     if (entry.message.role !== "assistant" || currentTurn === undefined) continue;
-    const content = assistantText(entry.message.content);
+    const content = assistantText(entry.message);
     currentTurn.thinking.push(...content.thinking);
     currentTurn.response.push(...content.response);
   }
@@ -95,7 +138,8 @@ function readingTurns(entries: SessionEntry[]): ReadingTurn[] {
 }
 
 function thinkingCallout(blocks: string[]): string {
-  const lines = blocks.join("\n\n").split("\n");
+  const body = blocks.join("\n\n");
+  const lines = `${body}\n\n${markdownBoundary(body)}`.split("\n");
   return [
     "> [!abstract]- Model thinking",
     ...lines.map((line) => line.length === 0 ? ">" : `> ${line}`),
@@ -126,7 +170,8 @@ function renderTurn(turn: ReadingTurn, index: number): string {
   const sections = [`## Question ${index + 1}`];
 
   if (turn.question.length > 0) {
-    sections.push("", turn.question.join("\n\n"));
+    const question = turn.question.join("\n\n");
+    sections.push("", question, "", markdownBoundary(question));
   }
 
   const thinking = turn.thinking.filter((block) => block.length > 0);

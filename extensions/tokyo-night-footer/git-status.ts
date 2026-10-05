@@ -14,6 +14,9 @@ export interface GitStatusTracker {
   fetchedAt: number;
   generation: number;
   pending: Promise<void> | undefined;
+  status: "unknown" | "fresh" | "stale";
+  disposed: boolean;
+  controller: AbortController;
 }
 
 export function createGitStatusTracker(cwd: string): GitStatusTracker {
@@ -23,6 +26,9 @@ export function createGitStatusTracker(cwd: string): GitStatusTracker {
     fetchedAt: 0,
     generation: 0,
     pending: undefined,
+    status: "unknown",
+    disposed: false,
+    controller: new AbortController(),
   };
 }
 
@@ -49,9 +55,15 @@ export function parseGitStatusOutput(output: string): GitStatusCounts {
 }
 
 export function invalidateGitStatus(tracker: GitStatusTracker): void {
+  if (tracker.disposed) return;
   tracker.generation++;
   tracker.fetchedAt = 0;
-  tracker.pending = undefined;
+  if (tracker.status === "fresh") tracker.status = "stale";
+}
+
+export function disposeGitStatus(tracker: GitStatusTracker): void {
+  tracker.disposed = true;
+  tracker.controller.abort();
 }
 
 /** Refresh asynchronously while synchronous editor renders keep using the last snapshot. */
@@ -60,27 +72,38 @@ export function ensureGitStatus(
   tracker: GitStatusTracker,
   onUpdate: () => void,
 ): void {
-  if (tracker.pending || Date.now() - tracker.fetchedAt < GIT_STATUS_TTL_MS) return;
+  if (tracker.disposed || tracker.pending ||
+      (tracker.fetchedAt > 0 && Date.now() - tracker.fetchedAt < GIT_STATUS_TTL_MS)) return;
 
-  const generation = tracker.generation;
-  const refresh = (async () => {
-    let counts: GitStatusCounts = { staged: 0, unstaged: 0, untracked: 0 };
-    try {
-      const result = await pi.exec("git", ["status", "--porcelain"], {
-        cwd: tracker.cwd,
-        timeout: 1_000,
-      });
-      if (result.code === 0) counts = parseGitStatusOutput(result.stdout);
-    } catch {
-      // A missing Git executable, non-repository cwd, or timeout renders as clean/no status.
-    }
-
-    if (generation !== tracker.generation) return;
-    tracker.counts = counts;
-    tracker.fetchedAt = Date.now();
+  // Keep one worker alive through overlapping invalidations. Every burst during
+  // a read requests one follow-up read, never another concurrent Git process.
+  tracker.pending = Promise.resolve().then(async () => {
+    if (tracker.disposed) return;
+    let generation: number;
+    do {
+      generation = tracker.generation;
+      let counts: GitStatusCounts | undefined;
+      try {
+        const result = await pi.exec("git", ["--no-optional-locks", "status", "--porcelain"], {
+          cwd: tracker.cwd,
+          timeout: 1_000,
+          signal: tracker.controller.signal,
+        });
+        if (result.code === 0 && !result.killed) counts = parseGitStatusOutput(result.stdout);
+      } catch {
+        // Keep the last known counts on errors, including spawn failures/timeouts.
+      }
+      if (tracker.disposed) return;
+      if (counts) {
+        tracker.counts = counts;
+        tracker.status = generation === tracker.generation ? "fresh" : "stale";
+      } else if (tracker.status !== "unknown") {
+        tracker.status = "stale";
+      }
+      tracker.fetchedAt = Date.now();
+      onUpdate();
+    } while (!tracker.disposed && generation !== tracker.generation);
+  }).finally(() => {
     tracker.pending = undefined;
-    onUpdate();
-  })();
-
-  tracker.pending = refresh;
+  });
 }
