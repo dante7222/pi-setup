@@ -100,6 +100,7 @@ test("calculates context after dynamic tool loadout and prompt changes", async (
     await handlers.get("before_agent_start")(
       {
         type: "before_agent_start",
+        messageType: "user",
         prompt: "continue",
         systemPrompt: "base system prompt",
         systemPromptOptions: {},

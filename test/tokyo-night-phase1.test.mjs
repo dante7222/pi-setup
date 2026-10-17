@@ -201,7 +201,7 @@ test("title generation dispatches virtual selection through neutral streamSimple
   };
   unnamed.session.appendMessage({ role: "user", content: "Build a title", timestamp: 0 });
   unnamed.start(); assert.equal(calls, 1);
-  unnamed.emit("before_agent_start", { prompt: "second" }); assert.equal(calls, 1);
+  unnamed.emit("before_agent_start", { messageType: "user", prompt: "second" }); assert.equal(calls, 1);
   unnamed.stop(); assert.equal(signal.aborted, true);
   resolve(assistant(0, 0, { content: [{ type: "text", text: "<title>Wrong late title</title>" }] }));
   await flush(); assert.equal(unnamed.title, "");
@@ -212,12 +212,12 @@ test("an explicit name wins an in-flight generated title, and next session can g
   const h = harness(virtual, SessionManager.inMemory("/work"), "");
   let resolve;
   h.ctx.modelRegistry.streamSimple = () => ({ result: () => new Promise((done) => { resolve = done; }) });
-  h.start(); h.emit("before_agent_start", { prompt: "Title this task" });
+  h.start(); h.emit("before_agent_start", { messageType: "user", prompt: "Title this task" });
   h.pi.setSessionName("User chosen name");
   resolve(assistant(0, 0, { content: [{ type: "text", text: "<title>Generated title</title>" }] }));
   await flush(); assert.equal(h.title, "User chosen name");
   h.stop(); h.pi.setSessionName(""); h.start();
-  h.emit("before_agent_start", { prompt: "New task" });
+  h.emit("before_agent_start", { messageType: "user", prompt: "New task" });
   resolve(assistant(0, 0, { content: [{ type: "text", text: "<title>New generated title</title>" }] }));
   await flush(); assert.equal(h.title, "New generated title"); h.stop();
 });
@@ -351,7 +351,7 @@ test("complete request-local system state replaces canonical tools without doubl
   const transform = (messages) => [{ role: "system", content: "y".repeat(8_000), timestamp: 0 },
     ...messages.filter((m) => m.role !== "system")];
   const options = { forceSystemPrompt: "forced" };
-  h.emit("before_agent_start", { prompt: "test", systemPromptOptions: options });
+  h.emit("before_agent_start", { messageType: "user", prompt: "test", systemPromptOptions: options });
   h.emit("agent_start");
   h.ctx.getSystemPrompt = () => "forced";
   h.request(transform); assert.match(h.text, /~3\/100k/); // forced text wins after the local transform
@@ -385,7 +385,7 @@ test("explicit equal-text and empty forced prompts observe later handlers and re
     const transform = (messages) => [{ role: "system", content: "x".repeat(40_000), timestamp: 0 },
       ...messages.filter((message) => message.role !== "system")];
     const options = {};
-    h.emit("before_agent_start", { prompt: "test", systemPromptOptions: options });
+    h.emit("before_agent_start", { messageType: "user", prompt: "test", systemPromptOptions: options });
     // The real runner mutates this same object for handlers registered later,
     // including when such a handler returns { systemPrompt: forced }.
     options.forceSystemPrompt = forced;
@@ -395,7 +395,7 @@ test("explicit equal-text and empty forced prompts observe later handlers and re
     assert.match(h.text, forced ? /~3\/100k/ : /~1\/100k/);
 
     const nextOptions = { forceSystemPrompt: forced };
-    h.emit("before_agent_start", { prompt: "next", systemPromptOptions: nextOptions });
+    h.emit("before_agent_start", { messageType: "user", prompt: "next", systemPromptOptions: nextOptions });
     delete nextOptions.forceSystemPrompt; // a later handler can also remove it
     h.ctx.getSystemPrompt = () => "12345678";
     h.emit("agent_start");

@@ -64,7 +64,11 @@ test("native edit and write headers remain yellow through partial, successful an
             assert.ok(!header.includes(theme.getFgAnsi("toolTitle")), "Completion must not restore blue");
             assert.deepEqual(lines.map(stripVTControlCharacters), nativeCall.render(width).map(stripVTControlCharacters));
             assert.deepEqual(renderedResult.render(width).map(stripVTControlCharacters), nativeResult.render(width).map(stripVTControlCharacters));
-            for (const line of [...lines, ...renderedResult.render(width)]) assert.ok(visibleWidth(line) <= width);
+            // Pi 1.3.0's native header does not truncate hyperlinked paths at narrow widths;
+            // the wrapper only recolours, so it must never be wider than native.
+            const widths = (rendered) => rendered.map((line) => Math.max(visibleWidth(line), width));
+            assert.deepEqual(widths(lines), widths(nativeCall.render(width)));
+            assert.deepEqual(widths(renderedResult.render(width)), widths(nativeResult.render(width)));
           }
           if (isError) assert.ok(renderedResult.render(80).join("\n").includes(theme.getFgAnsi("error")));
         }

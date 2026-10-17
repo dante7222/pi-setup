@@ -1138,7 +1138,8 @@ export default function (pi: ExtensionAPI): void {
     // Retain the reference so later handlers (including returned systemPrompt)
     // can set or clear an explicit override even when its text is unchanged.
     if (state.runtimeActive) runSystemPromptOptions = event.systemPromptOptions;
-    maybeGenerateAgentTitle(ctx, event.prompt);
+    // Since Pi 1.2.0, runs started by sendMessage(triggerTurn) carry a message, not a prompt.
+    maybeGenerateAgentTitle(ctx, event.messageType === "user" ? event.prompt : undefined);
   });
 
   pi.on("agent_start", (_event, ctx) => {
