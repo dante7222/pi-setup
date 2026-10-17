@@ -5,13 +5,13 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { stripVTControlCharacters as strip } from 'node:util';
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const here = dirname(fileURLToPath(import.meta.url));
 const pi = process.env.PI_TEST_PACKAGE || '/Users/ventris/.nvm/versions/node/v24.14.1/lib/node_modules/@earendil-works/pi-coding-agent';
 const load = p => import(pathToFileURL(join(pi, p)));
 const { Markdown, visibleWidth } = await load('node_modules/@earendil-works/pi-tui/dist/index.js');
 const { createMermaidMarkdownTransformer } = await load('dist/modes/interactive/components/mermaid.js');
 const themeModule = await load('dist/modes/interactive/theme/theme.js');
-const original = await readFile(join(root, 'tests/original-skill.txt'), 'utf8');
+const original = await readFile(join(here, 'original-skill.txt'), 'utf8');
 const fixtures = {
   originalSequence: original.match(/```mermaid\n[\s\S]*?```/)[0],
   compactFlow: '```mermaid\nflowchart TD\n  A["Save"] --> B["Validate"]\n  B --> C["Result"]\n```',
@@ -36,7 +36,7 @@ for (const theme of ['light', 'dark']) {
   }
 }
 const escape = value => value.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const artifacts = join(root, 'tests/artifacts');
+const artifacts = join(here, 'artifacts');
 await mkdir(artifacts, { recursive: true });
 await writeFile(join(artifacts, 'mermaid-results.json'), JSON.stringify(results, null, 2));
 const views = results.filter(r => r.mode === 'final' && !r.isStreaming && r.theme === 'dark');

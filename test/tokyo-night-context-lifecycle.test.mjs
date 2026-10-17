@@ -187,7 +187,8 @@ test("calculates context after dynamic tool loadout and prompt changes", async (
       { type: "model_select", model: ctx.model, source: "select" },
       ctx,
     );
-    assert.match(widgets.at(-1), /◫ \?\/100k/);
+    // Rebuilt immediately as an estimate for the new model (never "reported").
+    assert.match(widgets.at(-1), /◫ ~12k\/100k/);
 
     await handlers.get("context")(
       { type: "context", messages: [completedAssistant] },

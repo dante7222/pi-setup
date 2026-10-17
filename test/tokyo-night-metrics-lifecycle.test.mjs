@@ -120,7 +120,8 @@ test("TPS starts at the provider request, excludes tools/previous turns, and cle
   h.ctx.model = { ...h.ctx.model, id: "custom", contextWindow: 100_000 };
   h.emit("model_select");
   assert.doesNotMatch(h.text, / tps/);
-  assert.match(h.text, /\?\/100k/);
+  // C2: the new model shows an estimate immediately, never another model's usage.
+  assert.match(h.text, /~\d+\/100k/);
 });
 
 test("custom providers without the request hook use context time, never message_start time", (t) => {

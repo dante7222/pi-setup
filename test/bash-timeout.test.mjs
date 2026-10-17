@@ -3,7 +3,7 @@ import { once } from "node:events";
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { createBashTool } from "@earendil-works/pi-coding-agent";
+import { createBashTool, createPowerShellToolDefinition } from "@earendil-works/pi-coding-agent";
 import bashTimeout from "../extensions/bash-timeout/index.ts";
 
 function loadHook() {
@@ -25,6 +25,17 @@ test("supplies 120 seconds in place without changing the command or returning co
   const input = { command: "fd .", extra: "preserved" };
   assert.equal(loadHook()(bashEvent(input)), undefined);
   assert.deepEqual(input, { command: "fd .", extra: "preserved", timeout: 120 });
+});
+
+test("supplies the default to the built-in powershell tool, which shares the Bash schema", () => {
+  const hook = loadHook();
+  const input = { command: "Get-ChildItem" };
+  hook({ type: "tool_call", toolName: "powershell", toolCallId: "ps", input });
+  assert.deepEqual(input, { command: "Get-ChildItem", timeout: 120 });
+  const explicit = { command: "Start-Sleep 1", timeout: 5 };
+  hook({ type: "tool_call", toolName: "powershell", toolCallId: "ps", input: explicit });
+  assert.equal(explicit.timeout, 5);
+  assert.ok("timeout" in createPowerShellToolDefinition(process.cwd()).parameters.properties);
 });
 
 test("preserves explicit deadlines, including invalid values for backend validation", () => {

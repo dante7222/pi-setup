@@ -2,7 +2,7 @@
 
 Personal [Pi](https://pi.dev) extensions, skills, prompt templates, and themes, bundled as one Pi package.
 
-Validated against installed Pi **1.3.0**. [PI_1X_UPGRADE_PROGRESS.md](PI_1X_UPGRADE_PROGRESS.md) records the earlier 1.0.x upgrade; [SUBAGENTS-REVAMP.md](SUBAGENTS-REVAMP.md) records the 1.3.0 move and the subagents rewrite.
+Validated against installed Pi **1.3.0**. [docs/history/PI_1X_UPGRADE_PROGRESS.md](docs/history/PI_1X_UPGRADE_PROGRESS.md) records the earlier 1.0.x upgrade; [docs/history/SUBAGENTS-REVAMP.md](docs/history/SUBAGENTS-REVAMP.md) records the 1.3.0 move and the subagents rewrite.
 
 ## Contents
 
@@ -20,15 +20,14 @@ Included now:
 - **Yellow File Headers** extension (`extensions/yellow-file-headers/index.ts`)
 - **Web Access Toggle** extension (`extensions/web-access-toggle/index.ts`)
 - **Subagents** extension (`extensions/subagents/index.ts`)
-- **Permissions** extension (`extensions/permissions/index.ts`) — retained but disabled
 
 ## Bash timeout
 
-Agent `bash` calls that omit `timeout` receive a **120-second wall-clock timeout**, enforced by Pi's existing backend. Explicit timeouts remain unchanged, so intentional long builds can request `timeout: 600` (seconds), for example. Invalid explicit values are left for Pi to reject; zero does not mean unlimited.
+Agent `bash` and built-in `powershell` calls (same input schema) that omit `timeout` receive a **120-second wall-clock timeout**, enforced by Pi's existing backend. Explicit timeouts remain unchanged, so intentional long builds can request `timeout: 600` (seconds), for example. Invalid explicit values are left for Pi to reject; zero does not mean unlimited.
 
 The extension uses Pi's supported mutable `tool_call` input, not a replacement tool or shell wrapper. It preserves shell settings, output streaming/truncation, cancellation, session environment, and rendering. It adds no tools, schema text, system-prompt instructions, messages, polling, or model calls. Only Pi's normal timeout error enters context when a command expires. The default applies in new sessions and after `/reload`, including subagents that load this package.
 
-Scope: agent `bash` calls only, not user `!`/`!!`, direct RPC shell commands, `pi.exec`, or processes hidden inside other tools. Later extensions can change the input; custom Bash backends must honor `timeout` themselves.
+Scope: agent `bash`/`powershell` calls only, not user `!`/`!!`, direct RPC shell commands, `pi.exec`, or processes hidden inside other tools. Later extensions can change the input; custom Bash backends must honor `timeout` themselves.
 
 This fixes omitted deadlines for ordinary stalled commands (`fd`, `sleep`, builds). It is **not a universal hard-deadline watchdog**. The original Pi 0.85 audit found that a daemon escaping the original process group and continuously writing inherited output could hold the backend open. This extension does not add descendant containment or independent pipe-draining deadlines; uninterruptible OS I/O and a blocked Node event loop are also outside its scope. See upstream [default-timeout issue #1335](https://github.com/earendil-works/pi/issues/1335), [PR #5481](https://github.com/earendil-works/pi/pull/5481), and [detached-stdio deadline issue #6787](https://github.com/earendil-works/pi/issues/6787). No installed Pi files are patched, so package updates do not overwrite this extension.
 
@@ -39,11 +38,11 @@ After successful compactions reported through Pi's `session_compact` event, the 
 - `<session-title>--<session-key>.md` — a clean Obsidian-friendly reading view containing a linked table of contents, numbered user questions, model thinking in collapsed callouts, and model text responses. Stored text is never trimmed or summarized.
 - `<session-title>--<session-key>.<sha256>.active-branch.jsonl` — a content-addressed snapshot containing the complete session header and active-branch entries for lossless machine use.
 
-The readable title and filename come from Pi's session name; unnamed sessions fall back to a short version of the first user message. A short stable session hash prevents collisions between equally named sessions. Renaming a Pi session updates the reader filename on the next export and removes the superseded Markdown file, while older raw snapshots remain available. Slugs are budgeted in UTF-8 bytes against the complete 255-byte sidecar filename; short same-directory temporary names keep long CJK and other Unicode titles exportable.
+The readable title and filename come from Pi's session name; unnamed sessions fall back to a short version of the first user message. A short stable session hash prevents collisions between equally named sessions. Renaming a Pi session updates the reader filename on the next export and removes the superseded Markdown file. The newest three raw snapshots per session are kept (including the one the Markdown references); older ones are pruned. Slugs are budgeted in UTF-8 bytes against the complete 255-byte sidecar filename; short same-directory temporary names keep long CJK and other Unicode titles exportable.
 
 The Markdown intentionally excludes tool calls, tool results, shell executions, images, custom extension data, model/settings events, compaction summaries, IDs, timestamps, and raw JSON. Its compact contents section uses Obsidian heading links with short question previews. A hidden HTML comment records the matching sidecar filename without cluttering Obsidian's reading view. Assistant messages from one user turn are collected into one thinking section and one response section, while repeated compactions keep each original question and response only once. Aborted, errored, and output-limited attempts carry individual incomplete-response warnings, so a later successful retry is distinguishable. Reading-only Markdown boundaries close unfinished fences/comments/preformatted blocks and separate attempts; they do not change raw snapshots or act as a general HTML sanitizer.
 
-Each export safely writes its immutable sidecar before atomically refreshing the stable Markdown file; older sidecars remain as branch and compaction snapshots. Alternate branches remain in Pi's original session JSONL, while each transcript snapshot follows the active branch at export time.
+Each export safely writes its immutable sidecar before atomically refreshing the stable Markdown file; the two previous sidecars remain as branch and compaction snapshots. Session data is captured when the export is requested, so an export queued across a session switch or reload still writes the correct snapshot and never throws on a stale context. Alternate branches remain in Pi's original session JSONL, while each transcript snapshot follows the active branch at export time.
 
 Use `/transcript` to refresh the files without compacting. Pi 1.0.2 boundary-appended compactions emit `entry_appended`, not `session_compact`, so they require this manual export; automatic export does not cover that event path. Pi's `--no-session` mode is intentionally not exported because it explicitly disables persistence. Tool output truncated before Pi stores it cannot be recovered. Both reader transcripts and raw snapshots may contain private material; review them before sharing.
 
@@ -77,11 +76,11 @@ Prime Agent 0.7 does not expose Pi's `ctx.mode`, and its normal daemon protocol 
 
 With the **tokyo-night** theme in a truecolor terminal, status foregrounds use the matching Tokyo Night palette directly while inheriting the editor's background without a fill. The software caret uses Tokyo Night ultraviolet (`#bb9af7`). Other themes and reduced-color terminals fall back to Pi's semantic theme colors. Thin Powerline-style separator glyphs are used when a Nerd Font is detected, but the `pi-powerline-footer` package is neither used nor required.
 
-The status border owns Pi's custom editor and custom footer slots, so another extension that replaces either one will conflict with it. The files under `integrations/pi-powerline-footer/` are retained only as legacy integration references and are not part of the active setup.
+The status border owns Pi's custom editor and custom footer slots, so another extension that replaces either one will conflict with it.
 
 ## Yellow file headers
 
-The extension composes Pi's `registerToolRenderer()` resolvers without registering or replacing executable tools. Native `edit` and `write` headers remain yellow through partial, completed, and error results, including headers rebuilt by native renderers. It uses the current theme's semantic warning color: Tokyo Night pale yellow (`#e0af68`) under this theme.
+The extension composes Pi's `registerToolRenderer()` resolvers without registering or replacing executable tools. Native `edit` and `write` headers remain yellow through partial, completed, and error results, including headers rebuilt by native renderers. Only the header is recolored: the `toolTitle` token and the header path's `accent`; other accents in the output keep their color. The wrapper inherits from the theme, so theme methods that call `this.fg()` internally are recolored too. It uses the current theme's semantic warning color: Tokyo Night pale yellow (`#e0af68`) under this theme.
 
 ## Web access toggle
 
@@ -111,55 +110,6 @@ Esc on the parent stops the subagents that the interrupted run started or messag
 Worker sessions and report files under `~/.pi/agent/subagents/` are not deleted automatically; they can contain prompts and project data.
 
 `test/live/subagents-smoke.mjs` exercises run, follow-up, steering and stopping against the installed Pi. `test/live/run-tasks.mjs` runs a JSON task list with the same manager outside a Pi session.
-
-## Permissions (disabled)
-
-The implementation and policy remain tracked for reference and testing, but the package manifest does not currently load this extension.
-
-The approval gate reads the tracked [`pi.json`](pi.json) and applies OpenCode-style `allow`, `ask`, and `deny` rules to every agent tool call. A scalar applies to all resources for an action; object rules match resources in insertion order, with the last matching rule winning:
-
-```json
-{
-  "$schema": "./extensions/permissions/pi.schema.json",
-  "permission": {
-    "*": "ask",
-    "read": {
-      "*": "allow",
-      "*.env": "ask",
-      "*.env.example": "allow"
-    },
-    "edit": "deny",
-    "todowrite": "allow",
-    "bash": {
-      "*": "ask",
-      "git status *": "allow",
-      "./gradlew *": "allow"
-    },
-    "skill": {
-      "*": "allow"
-    },
-    "external_directory": {
-      "*": "ask",
-      "~/projects/**": "allow",
-      "~/.agents/**": "allow"
-    }
-  }
-}
-```
-
-Patterns use the same simple matching as OpenCode: `*` matches any number of characters, `?` matches one, and all other characters are literal. A trailing ` *` is optional, so `git status *` matches both `git status` and `git status --short`. `~` and `$HOME` expand at the start of granular patterns.
-
-Pi tools map to OpenCode permission names: `write` joins `edit`; `rg` joins `grep`; `find` becomes `glob`; and `ls` becomes `list`. Unknown extension tools use their exact tool name and `*` as the resource. Known path-bearing file and search tools that target paths outside the session working directory also require `external_directory` approval. Paths resolving inside the working directory do not need that extra approval; an allowed external-directory pattern removes only the extra path-boundary prompt and does not override a separate action rule such as `edit: "deny"`. File URLs are decoded consistently with Pi, so encoded `.env` names and external targets cannot evade these checks. Native read's existence-selected AM/PM-space, Unicode-normalization, and curly-quote fallbacks are checked using the selected target, not its input alias; malformed file URLs fail closed.
-
-An `ask` prompt offers deny, allow once, or allow for the current Pi session. Session grants are exact action/resource pairs stored as hashes in session state, and configured denies always override them. Use `/permissions` to inspect status and `/permissions clear` to revoke session grants. Configuration is snapshotted at session start; run `/reload` after editing `pi.json`. A missing or invalid file blocks all agent tool calls. Set `PI_PERMISSION_CONFIG` to use another absolute or working-directory-relative JSON file.
-
-Concurrent asks share one approval queue and recheck policy/session grants before opening a dialog. Exposed run cancellation and session shutdown/reload cancel waiters, reject late approvals, and guard asynchronous configuration/path reads. An uncooperative UI retains its dialog slot until settling rather than allowing overlapping prompts.
-
-**Pi 1.0.2 limitation:** permission hooks receive the agent/run signal, not a nested `executeTool()` call's separate signal. Cancelling only that nested call cannot dismiss its pending approval or prevent a late “Allow for this session” grant. Stop the whole run or deny the prompt; full per-call cancellation requires an upstream Pi API fix. No private runtime patch or tool-functionality removal is used.
-
-Use `/yolo` to toggle the bypass for the current session; the choice persists across `/reload`. Start Pi with `pi --yolo` to force YOLO from startup—`/yolo` cannot disable it until Pi is restarted without the flag. YOLO bypasses every permission check, including configured denies, prompts, config loading, and known-tool input classification. Disabling it is persisted before asynchronous policy loading, so reload cannot resurrect a previous bypass. The footer stays silent during normal permission enforcement and shows a colored `YOLO mode` warning only while the bypass is active; `/permissions` reports full status.
-
-This extension is an approval gate, not a security sandbox. It does not mediate user `!`/`!!` commands, direct RPC bash commands, extension filesystem/process access, native skill/template expansion, or operations hidden inside a custom tool. A `skill` rule gates a registered tool named `skill`, not Pi's native `/skill:name` expansion. Bash checks split unquoted `&&`, `||`, pipes, semicolons, background operators, and newlines so every command in a chain must resolve; dynamic substitutions and grouping require approval. This is conservative classification, not a complete shell parser. Path checks are lexical rather than symlink-safe; read-target existence checks also do not eliminate filesystem time-of-check/time-of-use races. A disabled gate provides no protection, and later-loaded extensions can mutate already approved tool input. Use a container or OS sandbox when enforcement against untrusted code is required.
 
 ## Local development
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run: node tests/render.mjs. No package installation or terminal session needed.
+// Run: node test/show-me/render.mjs. No package installation or terminal session needed.
 import assert from 'node:assert/strict';
 import { readFile, readdir, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve, join } from 'node:path';
@@ -7,7 +7,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { stripVTControlCharacters as stripANSI } from 'node:util';
 import { createHash } from 'node:crypto';
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const here = dirname(fileURLToPath(import.meta.url));
+const skill = resolve(here, '../../skills/show-me');
+// Document ids: SKILL.md lives in the skill; fixtures (`tests/...`) live beside this script.
+const sourcePath = file => file.startsWith('tests/') ? join(here, file.slice('tests/'.length)) : join(skill, file);
 const pi = process.env.PI_TEST_PACKAGE || '/Users/ventris/.nvm/versions/node/v24.14.1/lib/node_modules/@earendil-works/pi-coding-agent';
 const tui = join(pi, 'node_modules/@earendil-works/pi-tui');
 const themeDir = join(pi, 'dist/modes/interactive/theme');
@@ -15,7 +18,7 @@ const { Markdown, visibleWidth } = await import(pathToFileURL(join(tui, 'dist/in
 const { getMarkdownTheme, loadThemeFromPath, setThemeInstance } = await import(pathToFileURL(join(themeDir, 'theme.js')));
 const widths = [40, 60, 80, 120];
 const themes = ['light', 'dark'];
-const artifacts = join(root, 'tests/artifacts');
+const artifacts = join(here, 'artifacts');
 await mkdir(artifacts, { recursive: true });
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
 const displayWidth = text => visibleWidth(text.replace(/\t/g, '   '));
@@ -63,11 +66,11 @@ function diagnostic(fence) {
     } : null,
   };
 }
-const files = ['SKILL.md', 'tests/original-skill.txt', ...(await readdir(join(root, 'tests'))).filter(n => n.endsWith('-candidate.md') || n === 'mini-original.md').sort().map(n => `tests/${n}`)];
+const files = ['SKILL.md', 'tests/original-skill.txt', ...(await readdir(here)).filter(n => n.endsWith('-candidate.md') || n === 'mini-original.md').sort().map(n => `tests/${n}`)];
 const documents = [];
 const samples = [];
 for (const file of files) {
-  const source = await readFile(join(root, file), 'utf8');
+  const source = await readFile(sourcePath(file), 'utf8');
   const blocks = fences(source);
   documents.push({ file, sha256: createHash('sha256').update(source).digest('hex'), fences: blocks.map(diagnostic) });
   samples.push({ id: file, kind: 'document', source });
@@ -140,7 +143,7 @@ const limitations = [
   'Gallery uses ANSI-stripped neutral snapshots; both actual themes are rendered, but syntax colors are intentionally not reproduced.',
   'Browser font/CJK glyph metrics may differ from terminal cells. No browser screenshot verification performed.',
 ];
-const stats = { invocation: 'node tests/render.mjs', node: process.version,
+const stats = { invocation: 'node test/show-me/render.mjs', node: process.version,
   renderer: { pi, version: (await json(join(pi, 'package.json'))).version, tui, tuiVersion: (await json(join(tui, 'package.json'))).version },
   widths, themes, paddingX: 1, paddingY: 0, summary, limitations, documents, renders };
 await writeFile(join(artifacts, 'render-stats.json'), JSON.stringify(stats, null, 2) + '\n');

@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { isCodexFastModeRequested } from "../extensions/tokyo-night-footer/codex-fast-mode.ts";
+import { isCodexFastModeRequested, resetCodexFastModeCache } from "../extensions/tokyo-night-footer/codex-fast-mode.ts";
 
 const supportedModelIds = [
   "gpt-5.5",
@@ -30,6 +30,7 @@ test("shows Codex Fast Mode as requested, only for supported active models", () 
   const stateFile = join(directory, "state.json");
 
   try {
+    resetCodexFastModeCache();
     writeFileSync(stateFile, '{"enabled":true}\n');
 
     for (const modelId of supportedModelIds) {
@@ -40,12 +41,15 @@ test("shows Codex Fast Mode as requested, only for supported active models", () 
     assert.equal(isCodexFastModeRequested("openai-codex", "gpt-5.3-codex", stateFile), false);
 
     writeFileSync(stateFile, '{"enabled":false}\n');
+    resetCodexFastModeCache();
     assert.equal(isCodexFastModeRequested("openai-codex", "gpt-5.6-sol", stateFile), false);
 
     writeFileSync(stateFile, "not json\n");
+    resetCodexFastModeCache();
     assert.equal(isCodexFastModeRequested("openai-codex", "gpt-5.6-sol", stateFile), false);
 
     rmSync(stateFile);
+    resetCodexFastModeCache();
     assert.equal(isCodexFastModeRequested("openai-codex", "gpt-5.6-sol", stateFile), false);
   } finally {
     rmSync(directory, { recursive: true, force: true });

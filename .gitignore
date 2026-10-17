@@ -6,3 +6,6 @@ node_modules/
 .env
 .env.*
 !.env.example
+
+# Generated show-me evaluation output
+test/show-me/artifacts/

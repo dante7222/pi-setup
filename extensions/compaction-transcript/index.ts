@@ -13,6 +13,8 @@ import {
 
 interface TranscriptPaths {
   directory: string;
+  /** Matches every snapshot sidecar that belongs to this session. */
+  rawPattern: RegExp;
   legacyMarkdown: string;
   markdown: string;
   markdownSuffix: string;
@@ -20,6 +22,8 @@ interface TranscriptPaths {
 }
 
 const MAX_FILENAME_BYTES = 255;
+/** Sidecars kept per session, including the one the current Markdown references. */
+export const RETAINED_SNAPSHOTS = 3;
 let exportQueue: Promise<void> = Promise.resolve();
 
 function filenameSlug(value: string, maxBytes: number): string {
@@ -66,6 +70,7 @@ function transcriptPaths(
     legacyMarkdown: path.join(directory, `${legacyStem}.md`),
     markdown: path.join(directory, `${readableStem}.md`),
     markdownSuffix: `--${sessionKey}.md`,
+    rawPattern: new RegExp(`--${sessionKey}\\.[a-f0-9]{64}\\.active-branch\\.jsonl$`),
     raw: path.join(directory, `${readableStem}${snapshotSuffix}`),
   };
 }
@@ -99,17 +104,58 @@ async function removeSupersededMarkdown(paths: TranscriptPaths): Promise<void> {
   );
 }
 
-async function writeTranscript(ctx: ExtensionContext): Promise<TranscriptPaths> {
+/**
+ * Keep the newest RETAINED_SNAPSHOTS sidecars of this session. The current one
+ * is always kept because the published Markdown points at it.
+ */
+async function pruneSnapshots(paths: TranscriptPaths): Promise<void> {
+  const currentName = path.basename(paths.raw);
+  const names = await fs.promises.readdir(paths.directory);
+  const older = names.filter((name) => name !== currentName && paths.rawPattern.test(name));
+  if (older.length < RETAINED_SNAPSHOTS) return;
+  const dated = await Promise.all(older.map(async (name) => {
+    try {
+      return { name, mtime: (await fs.promises.stat(path.join(paths.directory, name))).mtimeMs };
+    } catch {
+      return { name, mtime: -1 };
+    }
+  }));
+  // Name breaks mtime ties on coarse-timestamp filesystems so pruning stays deterministic.
+  dated.sort((a, b) => b.mtime - a.mtime || b.name.localeCompare(a.name));
+  await Promise.all(dated.slice(RETAINED_SNAPSHOTS - 1).map(({ name }) =>
+    fs.promises.rm(path.join(paths.directory, name), { force: true })));
+}
+
+interface TranscriptSnapshot {
+  entries: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>;
+  raw: string;
+  sessionFile: string;
+  sessionId: string;
+  title: string;
+}
+
+/**
+ * Read everything from ctx synchronously, before queueing. A queued export may
+ * run after a session switch or reload, when the captured ctx is stale and
+ * every getter throws.
+ */
+function captureSnapshot(ctx: ExtensionContext): TranscriptSnapshot {
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (sessionFile === undefined) {
     throw new Error("Cannot persist a transcript for an in-memory --no-session conversation");
   }
-
   const entries = ctx.sessionManager.getBranch();
-  const header = ctx.sessionManager.getHeader();
-  const raw = serializeActiveBranch(header, entries);
-  const sessionId = ctx.sessionManager.getSessionId();
-  const title = resolveTranscriptTitle(entries, ctx.sessionManager.getSessionName());
+  return {
+    entries,
+    raw: serializeActiveBranch(ctx.sessionManager.getHeader(), entries),
+    sessionFile,
+    sessionId: ctx.sessionManager.getSessionId(),
+    title: resolveTranscriptTitle(entries, ctx.sessionManager.getSessionName()),
+  };
+}
+
+async function writeTranscript(snapshot: TranscriptSnapshot): Promise<TranscriptPaths> {
+  const { entries, raw, sessionFile, sessionId, title } = snapshot;
   const paths = transcriptPaths(sessionFile, raw, sessionId, title);
   const markdown = renderTranscript({
     entries,
@@ -127,26 +173,37 @@ async function writeTranscript(ctx: ExtensionContext): Promise<TranscriptPaths> 
   await atomicWrite(paths.raw, raw);
   await atomicWrite(paths.markdown, markdown);
   await removeSupersededMarkdown(paths);
+  // Pruning is best-effort: the export already succeeded at this point.
+  await pruneSnapshots(paths).catch(() => undefined);
 
   return paths;
 }
 
-async function exportAndNotify(ctx: ExtensionContext): Promise<void> {
-  const queuedExport = exportQueue.then(
-    () => writeTranscript(ctx),
-    () => writeTranscript(ctx),
-  );
-  exportQueue = queuedExport.then(
-    () => undefined,
-    () => undefined,
-  );
-
+/** Notification is best effort: a stale ctx throws on access, so never rethrow. */
+function notify(ctx: ExtensionContext, message: string, type: "info" | "error"): void {
   try {
+    if (ctx.hasUI) ctx.ui.notify(message, type);
+  } catch {
+    // The session was replaced or reloaded; there is no UI to report to.
+  }
+}
+
+async function exportAndNotify(ctx: ExtensionContext): Promise<void> {
+  try {
+    const snapshot = captureSnapshot(ctx);
+    const queuedExport = exportQueue.then(
+      () => writeTranscript(snapshot),
+      () => writeTranscript(snapshot),
+    );
+    exportQueue = queuedExport.then(
+      () => undefined,
+      () => undefined,
+    );
     const paths = await queuedExport;
-    if (ctx.hasUI) ctx.ui.notify(`Transcript updated: ${paths.markdown}`, "info");
+    notify(ctx, `Transcript updated: ${paths.markdown}`, "info");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (ctx.hasUI) ctx.ui.notify(`Transcript export failed: ${message}`, "error");
+    notify(ctx, `Transcript export failed: ${message}`, "error");
   }
 }
 

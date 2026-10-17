@@ -87,9 +87,57 @@ test("theme.style headers preserve attributes and background and use the supplie
   }));
   for (const path of [themePath, fileURLToPath(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/light.json", import.meta.url))]) {
     const theme = loadThemeFromPath(path, "truecolor");
-    const text = wrapped.renderCall({}, theme, context({})).render(80).join("\n");
+    const args = { path: "file.txt" };
+    const text = wrapped.renderCall(args, theme, context(args)).render(80).join("\n");
     assert.ok(text.includes(theme.style("edit", { fg: "warning", bg: "toolPendingBg", bold: true })));
     assert.ok(text.includes(theme.fg("warning", "file.txt")));
     assert.ok(text.includes(theme.fg("error", "error")));
   }
+});
+
+test("internal this.fg calls are recolored and only the header path accent turns yellow", () => {
+  const resolve = resolver();
+  const wrapped = resolve("edit", () => ({
+    renderCall(args, theme) {
+      const border = theme.getThinkingBorderColor("off");
+      return new Text([
+        theme.fg("accent", args.path), theme.fg("accent", "other accent"),
+        border("x"), theme.style(args.path, { fg: "accent" }),
+      ].join("|"), 0, 0);
+    },
+  }));
+  const theme = loadThemeFromPath(themePath, "truecolor");
+  const args = { path: "src/file.ts" };
+  const text = wrapped.renderCall(args, theme, context(args)).render(200).join("\n");
+  assert.ok(text.includes(theme.fg("warning", "src/file.ts")), "Header path is yellow");
+  assert.ok(text.includes(theme.fg("accent", "other accent")), "Unrelated accent keeps its color");
+  assert.ok(text.includes(theme.style("src/file.ts", { fg: "warning" })));
+  assert.equal(theme.fg("accent", "src/file.ts"), loadThemeFromPath(themePath, "truecolor").fg("accent", "src/file.ts"),
+    "Original theme is not mutated");
+});
+
+test("theme methods that call this.fg internally see the recolor", () => {
+  const resolve = resolver();
+  let seen;
+  const wrapped = resolve("write", () => ({
+    renderCall(_args, theme) {
+      // Simulate a Theme helper implemented with this.fg("toolTitle", ...).
+      const helper = function (text) { return this.fg("toolTitle", text); };
+      seen = helper.call(theme, "write");
+      return new Text(seen, 0, 0);
+    },
+  }));
+  const theme = loadThemeFromPath(themePath, "truecolor");
+  Object.defineProperty(Object.getPrototypeOf(theme), "__headerProbe", { configurable: true,
+    value() { return this.fg("toolTitle", "probe"); } });
+  try {
+    const probeWrapped = resolve("edit", () => ({ renderCall: (_a, t) => new Text(t.__headerProbe(), 0, 0) }));
+    const probe = probeWrapped.renderCall({}, theme, context({})).render(40).join("");
+    assert.ok(probe.includes(theme.getFgAnsi("warning")), "Prototype method's this.fg is recolored");
+    assert.ok(!probe.includes(theme.getFgAnsi("toolTitle")));
+  } finally {
+    delete Object.getPrototypeOf(theme).__headerProbe;
+  }
+  wrapped.renderCall({}, theme, context({}));
+  assert.equal(seen, theme.fg("warning", "write"));
 });

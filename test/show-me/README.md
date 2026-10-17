@@ -2,19 +2,19 @@
 
 ## Run locally
 
-From the skill directory:
+From the repository root:
 
 ```sh
-node tests/render.mjs
-node tests/mermaid.mjs
-node tests/browser.mjs
-node tests/review.mjs
-open tests/artifacts/show-me-review.html
+node test/show-me/render.mjs
+node test/show-me/mermaid.mjs
+node test/show-me/browser.mjs
+node test/show-me/review.mjs
+open test/show-me/artifacts/show-me-review.html
 ```
 
 These scripts do not call models or install packages. Render scripts default to the Pi 0.85.0 installation used for this evaluation; set `PI_TEST_PACKAGE` to another installed `@earendil-works/pi-coding-agent` directory. Browser tests use the local Playwright installation and Chrome; override `PLAYWRIGHT_PATH` and `CHROME_PATH` if needed. `CHROME_PATH=bundled` uses Playwright's installed Chromium. Browser tests target the supplied template's structure, not arbitrary HTML.
 
-No test tools or dependencies are required to use the skill normally. `original-skill.txt` preserves the original instructions.
+The harness lives outside `skills/show-me/` so Pi does not load it with the skill; `artifacts/` is generated and git-ignored. No test tools or dependencies are required to use the skill normally. `original-skill.txt` preserves the original instructions.
 
 ## Executed checks
 

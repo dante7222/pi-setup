@@ -79,6 +79,63 @@ export function assistantMatchesModel(
   );
 }
 
+type AssistantBlock = AssistantMessage["content"][number];
+
+// Only canonical anchors (provenUsage, from the session projection) are cached.
+// Request messages are clones that Pi shares across context and
+// context_with_system handlers, which may mutate them in place: always
+// recompute their shapes.
+const anchorShapes = new WeakMap<AssistantMessage, readonly string[]>();
+
+function argumentsLength(block: Extract<AssistantBlock, { type: "toolCall" }>): number {
+  try {
+    return JSON.stringify(block.arguments)?.length ?? 0;
+  } catch {
+    return -1;
+  }
+}
+
+function blockShape(block: AssistantBlock): string {
+  return block.type === "text"
+    ? `text:${block.text.length}`
+    : block.type === "thinking"
+      ? `thinking:${block.thinking.length}:${block.redacted === true}`
+      : `toolCall:${block.id}:${block.name}:${argumentsLength(block)}`;
+}
+
+function anchorShape(anchor: AssistantMessage): readonly string[] {
+  let shape = anchorShapes.get(anchor);
+  if (!shape) {
+    shape = anchor.content.map(blockShape);
+    anchorShapes.set(anchor, shape);
+  }
+  return shape;
+}
+
+/**
+ * Request messages are structured clones of canonical history, so identity
+ * fails. Compare response identity fields plus a cheap content shape (block
+ * types, text/thinking lengths, tool-call ids/names/argument sizes) rather than
+ * serializing whole messages every request. The shape check rejects
+ * request-local transforms that keep the metadata but replace the content,
+ * whose usage would no longer describe this request.
+ */
+function sameAssistantResponse(message: ContextMessage, anchor: AssistantMessage): boolean {
+  if (message.role !== "assistant") return false;
+  if (!(message.timestamp === anchor.timestamp &&
+    message.responseId === anchor.responseId &&
+    message.provider === anchor.provider &&
+    message.model === anchor.model &&
+    message.stopReason === anchor.stopReason &&
+    usageTokenTotal(message.usage) === usageTokenTotal(anchor.usage) &&
+    message.content.length === anchor.content.length)) return false;
+  const expected = anchorShape(anchor);
+  for (let index = 0; index < expected.length; index++) {
+    if (blockShape(message.content[index]!) !== expected[index]) return false;
+  }
+  return true;
+}
+
 export function estimateRequestContextTokens(
   messages: readonly ContextMessage[],
   loadedContextTokens: number,
@@ -107,7 +164,7 @@ export function estimateRequestContextTokens(
   // A request-local transform may remove/replace the canonical anchor. Do not
   // apply that anchor's loaded-system baseline to a different response.
   const matchesProvenUsage = provenUsage === undefined || usageMessage === provenUsage ||
-    JSON.stringify(usageMessage) === JSON.stringify(provenUsage);
+    (usageMessage !== undefined && sameAssistantResponse(usageMessage, provenUsage));
   if (
     allowUsage && matchesProvenUsage && usageMessage?.role === "assistant" &&
     assistantMatchesModel(usageMessage, model)
@@ -171,18 +228,24 @@ export function estimateProjectedContext(
   }
   let usagePosition = -1;
   let usage: AssistantMessage | undefined;
+  // Index into projection.messages, tracked directly: projection.messages is
+  // the flattened entry messages, but do not rely on shared references.
+  let usageMessageIndex = -1;
+  let messageIndex = 0;
   for (const entry of projection.entries) {
     for (const message of entry.messages) {
       if (message.role === "assistant" && hasUsableUsage(message)) {
         usage = message;
         usagePosition = positions.get(entry.sourceEntry.id) ?? -1;
+        usageMessageIndex = messageIndex;
       }
+      messageIndex++;
     }
   }
   const invalidated = barrier >= 0 && usagePosition <= barrier;
   const provenUsage = usagePosition > barrier ? usage : undefined;
   const usageLoadedContextTokens = usage ? estimateSystemContextTokens(
-    projection.messages.slice(0, projection.messages.indexOf(usage) + 1),
+    projection.messages.slice(0, usageMessageIndex + 1),
   ) : undefined;
   loadedContextTokens = estimateSystemContextTokens(projection.messages) ?? loadedContextTokens;
   return {

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Marked } from "@earendil-works/pi-tui";
-import compactionTranscript from "../extensions/compaction-transcript/index.ts";
+import compactionTranscript, { RETAINED_SNAPSHOTS } from "../extensions/compaction-transcript/index.ts";
 import { renderTranscript, serializeActiveBranch } from "../extensions/compaction-transcript/render.ts";
 
 const header = { type: "session", version: 3, id: "unicode-session", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/fixture" };
@@ -57,7 +57,7 @@ test("long Unicode titles publish byte-safe snapshots and short atomic temporary
       assert.equal((await stat(join(directory, "transcripts", sidecar))).mode & 0o777, 0o600);
     }
   }
-  assert.equal((await readdir(join(directory, "transcripts"))).filter((name) => name.endsWith(".jsonl")).length, 4);
+  assert.equal((await readdir(join(directory, "transcripts"))).filter((name) => name.endsWith(".jsonl")).length, RETAINED_SNAPSHOTS);
 });
 
 test("annotates each incomplete attempt without changing text or labeling a successful retry", () => {
@@ -122,4 +122,65 @@ test("empty failed responses still have a readable status and raw sidecars retai
   assert.match(markdown, /### Response\n\n> \[!warning\] Incomplete response/);
   assert.doesNotMatch(markdown, /private checkpoint|private\.txt/);
   assert.deepEqual(serializeActiveBranch(header, entries).trimEnd().split("\n").map(JSON.parse), [header, ...entries]);
+});
+
+function transcriptCommand() {
+  let command;
+  compactionTranscript({ on() {}, registerCommand(name, definition) {
+    if (name === "transcript") command = definition.handler;
+  } });
+  return command;
+}
+
+test("prunes old snapshots of the same session and keeps the referenced one", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-transcript-prune-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const command = transcriptCommand();
+  const entries = [user];
+  const notifications = [];
+  const ctx = { hasUI: true, ui: { notify: (message, type) => notifications.push({ message, type }) },
+    sessionManager: { getSessionFile: () => join(directory, "session.jsonl"), getBranch: () => entries,
+      getHeader: () => header, getSessionId: () => header.id, getSessionName: () => "Prune" } };
+  const transcripts = join(directory, "transcripts");
+  // A different session's sidecar in the same directory is never touched.
+  await command("", { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "other" } });
+  const foreign = (await readdir(transcripts)).filter((name) => name.endsWith(".jsonl"));
+  for (let index = 0; index < RETAINED_SNAPSHOTS + 3; index += 1) {
+    entries.push(response(`stop${index}`));
+    await command("", ctx);
+    assert.equal(notifications.at(-1).type, "info", notifications.at(-1).message);
+  }
+  const names = await readdir(transcripts);
+  const sidecars = names.filter((name) => name.endsWith(".jsonl") && !foreign.includes(name));
+  assert.equal(sidecars.length, RETAINED_SNAPSHOTS);
+  assert.ok(foreign.every((name) => names.includes(name)));
+  const markdown = await readFile(join(transcripts, "prune--" + createHash("sha256").update(header.id).digest("hex").slice(0, 12) + ".md"), "utf8");
+  const referenced = /lossless-sidecar: (.+)/.exec(markdown)[1];
+  assert.ok(sidecars.includes(referenced));
+  assert.equal(await readFile(join(transcripts, referenced), "utf8"), serializeActiveBranch(header, entries));
+});
+
+test("queued exports use data captured before a session switch and a stale ctx never throws", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-transcript-stale-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const command = transcriptCommand();
+  let stale = false;
+  const guard = (value) => () => { if (stale) throw new Error("stale ctx"); return value; };
+  const ctx = {
+    get hasUI() { return guard(true)(); },
+    get ui() { return guard({ notify() { throw new Error("UI gone"); } })(); },
+    get sessionManager() {
+      return guard({ getSessionFile: () => join(directory, "session.jsonl"), getBranch: () => [user],
+        getHeader: () => header, getSessionId: () => header.id, getSessionName: () => "Stale" })();
+    },
+  };
+  // Both exports capture before awaiting; the session is replaced while they are queued.
+  const first = command("", ctx);
+  const second = command("", ctx);
+  stale = true;
+  await assert.doesNotReject(Promise.all([first, second]));
+  const names = await readdir(join(directory, "transcripts"));
+  assert.ok(names.some((name) => name.startsWith("stale--") && name.endsWith(".md")));
+  // A ctx that is already stale fails capture; the error path must not rethrow either.
+  await assert.doesNotReject(command("", ctx));
 });

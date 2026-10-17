@@ -83,19 +83,24 @@ test("overlapping invalidations coalesce into one follow-up without concurrent p
   assert.deepEqual(tracker.counts, { staged: 1, unstaged: 0, untracked: 0 });
 });
 
-test("errors keep last dirty counts stale; first failure stays unknown; successful retry recovers", async () => {
+test("errors keep last dirty counts stale; first failure stays unknown; successful retry recovers", async (t) => {
+  // Failures back off; advance the clock past it before each retry.
+  let now = 1_000_000;
+  t.mock.method(Date, "now", () => now);
   for (const failure of [() => { throw Error("spawn"); }, () => ({ code: 1, stdout: "" }), () => ({ code: 0, stdout: "", killed: true })]) {
     const tracker = createGitStatusTracker("/repo");
     const pi = { exec: failure };
     ensureGitStatus(pi, tracker, () => {}); await tracker.pending;
     assert.equal(tracker.status, "unknown");
     pi.exec = () => ({ code: 0, stdout: " M dirty\n?? new\n" });
+    now += 120_000;
     invalidateGitStatus(tracker); ensureGitStatus(pi, tracker, () => {}); await tracker.pending;
     pi.exec = failure;
     invalidateGitStatus(tracker); ensureGitStatus(pi, tracker, () => {}); await tracker.pending;
     assert.equal(tracker.status, "stale");
     assert.deepEqual(tracker.counts, { staged: 0, unstaged: 1, untracked: 1 });
     pi.exec = () => ({ code: 0, stdout: "" });
+    now += 120_000;
     invalidateGitStatus(tracker); ensureGitStatus(pi, tracker, () => {}); await tracker.pending;
     assert.equal(tracker.status, "fresh"); assert.equal(tracker.counts.unstaged, 0);
   }

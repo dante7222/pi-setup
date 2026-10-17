@@ -171,7 +171,7 @@ test("virtual selection retains physical limits/usage and distinguishes routed t
   h.request(); assert.match(h.text, /~1\.1k\/100k/);
   h.finish(assistant(200, 10, { model: "small", thinkingLevel: "off" }));
   assert.match(h.text, /→ Small ● off.*210\/10k/);
-  h.ctx.model = physical; h.emit("model_select"); assert.match(h.text, /\?\/100k/); assert.doesNotMatch(h.text, /→/);
+  h.ctx.model = physical; h.emit("model_select"); assert.match(h.text, /~\d+\/100k/); assert.doesNotMatch(h.text, /→|210\/100k/);
   h.ctx.model = virtual; h.emit("model_select"); assert.match(h.text, /→ Small.*~210\/10k/);
   h.emit("session_start"); assert.match(h.text, /→ Small.*~210\/10k/);
   h.request(); h.finish(assistant(99_000, 1_000, { api: "pi-virtual", model: "auto", stopReason: "error" }));
@@ -417,10 +417,14 @@ test("system changes after historical usage use replayed deltas once, including 
   assert.equal(estimateProjectedContext(projection, session.getBranch(), 19, physical).estimate.tokens, 19_101);
 });
 
-test("Git UI labels unknown and stale without presenting failed reads as clean", async () => {
+test("Git UI labels unknown and stale without presenting failed reads as clean", async (t) => {
+  let now = 1_000_000; t.mock.method(Date, "now", () => now);
   const h = harness(); h.pi.exec = async () => ({ code: 1, stdout: "" }); h.start();
   h.render(); await flush(); assert.match(h.text, /main unknown/);
   h.pi.exec = async () => ({ code: 0, stdout: " M dirty\n?? new\n" });
+  h.emit("tool_result", { toolName: "edit" }); await flush();
+  assert.match(h.text, /main unknown/); // failure backoff also covers routine events
+  now += 120_000;
   h.emit("tool_result", { toolName: "edit" }); await flush();
   assert.match(h.text, /main \*1 \?1/); assert.doesNotMatch(h.text, /stale|unknown/);
   h.pi.exec = async () => { throw Error("Git failed"); };

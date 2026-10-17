@@ -2,7 +2,9 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { isCompletedResponse } from "./context-usage.ts";
 
 /**
- * Observed request throughput, not server-side decode speed. The common Pi API
+ * Observed request throughput ("tps" in the footer), not server-side decode
+ * speed: output tokens / (request start -> completion), so short tool-call
+ * turns dominated by TTFT show low values by design. The common Pi API
  * exposes no generation clock. Include TTFT/prefill/hidden reasoning so reasoning
  * tokens are never divided by only the visible-text interval. Tool execution,
  * prior turns and work before the request hook are outside this interval.

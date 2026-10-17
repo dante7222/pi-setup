@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run: node tests/browser.mjs [path/to/visual.html]
+// Run: node test/show-me/browser.mjs [path/to/visual.html]
 // Optional: PLAYWRIGHT_PATH, CHROME_PATH (set to "bundled" for Playwright Chromium).
 import { createRequire } from 'node:module';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_PATH || '/Users/ventris/.hermes/hermes-agent/node_modules/playwright');
 const here = dirname(fileURLToPath(import.meta.url));
-const target = resolve(process.argv[2] || resolve(here, '../assets/visual.html'));
+const target = resolve(process.argv[2] || resolve(here, '../../skills/show-me/assets/visual.html'));
 const output = resolve(here, 'artifacts');
 await mkdir(output, { recursive: true });
 const chrome = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
