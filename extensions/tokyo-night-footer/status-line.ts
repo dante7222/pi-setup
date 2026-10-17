@@ -11,7 +11,6 @@ import { formatFirstTokenLatency } from "./throughput.ts";
 // Visual layout adapted from oh-my-pi's MIT-licensed editor status line.
 export const LEGACY_SESSION_NAME_STATUS_KEY = "ventris-session-name";
 export const LEGACY_TPS_STATUS_KEY = "ventris-tps";
-const PERMISSION_STATUS_KEY = "pi-permission-system";
 export const PRIME_AGENT_WIDGET_KEY = "tokyo-night-footer";
 const TPS_ICON_NERD = "󰓅";
 const TPS_ICON_FALLBACK = "⚡";
@@ -128,7 +127,6 @@ function withIcon(icon: string, text: string): string {
 }
 
 function statusSegmentPriority(id: string): number {
-  if (id === `status:${PERMISSION_STATUS_KEY}`) return 100;
   if (id === "scroll") return 95;
   if (id === "model") return 90;
   if (id === "fast") return 85;
@@ -263,15 +261,8 @@ function buildLeftSegments(
       const content = truncateToWidth(sanitizeStatusText(status), 28, "…");
       return content ? [{ id: `status:${key}`, content: `${content}${RESET_ALL}` }] : [];
     });
-  const criticalStatuses = statusSegments.filter(
-    (segment) => segment.id === `status:${PERMISSION_STATUS_KEY}`,
-  );
-  const otherStatuses = statusSegments.filter(
-    (segment) => segment.id !== `status:${PERMISSION_STATUS_KEY}`,
-  );
   const segments: StatusSegment[] = [
     { id: "pi", content: tone(theme, "pi", theme.bold("π")) },
-    ...criticalStatuses,
   ];
   if (scrollIndicator) {
     segments.push({ id: "scroll", content: theme.fg("warning", scrollIndicator) });
@@ -331,7 +322,7 @@ function buildLeftSegments(
     segments.push({ id: "git", content: gitParts.join(" ") });
   }
 
-  segments.push(...otherStatuses);
+  segments.push(...statusSegments);
   segments.push({
     id: "context",
     content: contextSegment(

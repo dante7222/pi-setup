@@ -202,7 +202,7 @@ test("F6: title generation stops after a bounded number of attempts per session"
 });
 
 test("F7: top border fits exactly at every width with wide statuses and dropped segments", () => {
-  const statuses = new Map([["pi-permission-system", "read-only"], ["wide", "日本語日本語日本語"], ["more", "status"]]);
+  const statuses = new Map([["example-status", "read-only"], ["wide", "日本語日本語日本語"], ["more", "status"]]);
   const h = harness({ statuses, title: "Some long title 日本語" });
   h.emit("session_start");
   const previous = process.env.POWERLINE_NERD_FONTS;

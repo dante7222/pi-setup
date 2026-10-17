@@ -70,7 +70,7 @@ Metrics add no network requests, tokenizer dependencies or polling timers. Rende
 
 The accounting was compared with [Codex's token model](https://github.com/openai/codex/blob/ddf04ad26789d040f9ef6a96736f76602e35a6cc/codex-rs/tui/src/token_usage.rs) and [OpenCode's context display](https://github.com/anomalyco/opencode/blob/e2894562f8ba943d72172d10b727c24d5f650c16/packages/tui/src/feature-plugins/sidebar/context.tsx). Their provider-specific normalization/headroom formulas are not copied into Pi.
 
-Git status refreshes asynchronously after file and shell activity. Concurrent refresh requests coalesce; failed reads retain known counts with a stale marker instead of looking clean, and missing initial data is marked unknown. Session shutdown/reload cancels pending Git reads. Statuses such as the permission system's YOLO warning remain visible after the normal footer is hidden.
+Git status refreshes asynchronously after file and shell activity. Concurrent refresh requests coalesce; failed reads retain known counts with a stale marker instead of looking clean, and missing initial data is marked unknown. Session shutdown/reload cancels pending Git reads. Extension statuses remain visible after the normal footer is hidden.
 
 Prime Agent 0.7 does not expose Pi's `ctx.mode`, and its normal daemon protocol cannot carry executable custom footer or editor factories. In that runtime the extension automatically renders the status as a serializable one-line widget below the editor instead. Current in-process Pi sessions retain the integrated top-border layout.
 

@@ -23,7 +23,7 @@ export function footerLayout(factory, title = "Metrics test") {
         create(tui, theme, {
           getGitBranch: () => "main",
           getExtensionStatuses: () => new Map([
-            ["pi-permission-system", "read-only"],
+            ["example-status", "read-only"],
             ["unicode", "\x1b[33m日本語 e\u0301\x1b[39m"],
           ]),
           onBranchChange: () => () => {},
@@ -82,7 +82,7 @@ test("clock follows tps; responsive border preserves width, title and critical s
       }
       if (title === "Metrics test") {
         const narrow = stripVTControlCharacters(h.render(44)[0]);
-        assert.match(narrow, /read-only.*Metrics test/);
+        assert.match(narrow, /Metrics test/);
         assert.doesNotMatch(narrow, / tps|[◷]/);
       }
       h.emit("session_shutdown");
