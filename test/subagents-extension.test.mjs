@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import subagents, { formatReport } from "../extensions/subagents/index.ts";
+import subagents, { formatReport, formatStarted } from "../extensions/subagents/index.ts";
 import { SubagentManager } from "../extensions/subagents/manager.ts";
 
 // Tests may themselves run inside a subagent, which sets this for its own process.
@@ -127,7 +127,7 @@ test("reports are delivered only while the parent is idle, batched, and never du
 test("Esc stops only subagents the aborted run started or messaged", async (t) => {
   const stops = [];
   const workers = new Map([["old", {}], ["new", {}]]);
-  const fake = { outbox: [], take: () => [], isReady: () => true, stop: (names) => { stops.push(names); return names; }, workers, setHooks() {}, dispose: async () => {}, send: async () => "steered", spawn: () => [] };
+  const fake = { outbox: [], take: () => [], isReady: () => true, stop: (names) => { stops.push(names); return names; }, workers, setHooks() {}, dispose: async () => {}, send: async () => "steered", spawn: () => [], get: (name) => workers.get(name) };
   globalThis[Symbol.for("ventris.pi-subagents.managers")].set("scoped", { manager: fake, interrupted: false, runOwned: new Set() });
   const { pi, registered } = fakePi();
   subagents(pi);
@@ -227,6 +227,20 @@ test("reload keeps the session's manager; other session changes dispose it", asy
   assert.throws(() => kept.spawn([]), /shut down/);
 });
 
+test("a manager stashed for /reload that nobody adopts is disposed", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { tool, ctx, registered } = loaded({ sessionId: "orphaned" });
+  await managerOf(tool, ctx);
+  const key = Symbol.for("ventris.pi-subagents.managers");
+  await registered.handlers.session_shutdown({ type: "session_shutdown", reason: "reload" });
+  const kept = globalThis[key].get("orphaned").manager;
+  t.mock.timers.tick(59_000);
+  assert.ok(globalThis[key].has("orphaned"));
+  t.mock.timers.tick(1_000);
+  assert.equal(globalThis[key].has("orphaned"), false);
+  assert.throws(() => kept.spawn([]), /shut down/);
+});
+
 test("formatReport is compact and truncates long reports with a path", () => {
   assert.equal(formatReport(report("r", { seconds: 12, tokens: 15400, cost: 0.123, text: "all good" })), "[subagent r done 12s 15k tok]\nall good");
   const long = formatReport(report("r", { text: "x".repeat(5000) }));
@@ -234,6 +248,21 @@ test("formatReport is compact and truncates long reports with a path", () => {
   assert.match(long, /\[truncated; full report: \/r\/r-1\.md\]$/);
   assert.match(formatReport(report("r", { state: "failed", text: "", error: "boom" })), /failed.*\nerror: boom$/);
   assert.ok(formatReport(report("r", { state: "failed", text: "", error: "e".repeat(100_000) })).length < 600);
+});
+
+test("formatReport truncates at a nearby line boundary", () => {
+  const text = `${"a".repeat(2900)}\n${"b".repeat(500)}`;
+  const body = formatReport(report("r", { text })).split("\n");
+  assert.equal(body[1], "a".repeat(2900));
+  assert.match(body[2], /^\[truncated/);
+});
+
+test("formatStarted groups names by state and shows resolved models compactly", () => {
+  const worker = (name, state, model, thinking) => ({ state, task: { name, model, thinking } });
+  assert.equal(
+    formatStarted([worker("a", "running", "openai-codex/gpt-6-astra", "xhigh"), worker("b", "running"), worker("c", "queued", "p/m")]),
+    "started: a (openai-codex/gpt-6-astra:xhigh), b; queued: c (p/m)",
+  );
 });
 
 test("is included in the package manifest", async () => {

@@ -7,7 +7,10 @@ export interface WidgetRow {
   /** Short model name without provider, e.g. "Opus 5.5" or "GPT-6 Astra". */
   model?: string;
   thinking?: string;
-  state: "running" | "queued" | "stopping";
+  /** Finished states linger briefly after a run ends. */
+  state: "running" | "queued" | "stopping" | "done" | "failed" | "cancelled";
+  /** Tool the subagent is executing right now. */
+  tool?: string;
   /** Tokens in the subagent's current context (latest response), not cumulative usage. */
   contextTokens?: number;
   contextWindow?: number;
@@ -17,6 +20,8 @@ const BAR_CELLS = 10;
 const NAME_MAX = 24;
 /** Narrower than this, the model column is dropped; name and context stay. */
 const MODEL_MIN_WIDTH = 44;
+/** Rows beyond this collapse into a "+N more" line. */
+export const MAX_ROWS = 8;
 
 export function formatTokens(count: number): string {
   if (count < 1000) return String(count);
@@ -31,6 +36,13 @@ export function formatTokens(count: number): string {
 function clip(text: string, width: number): string {
   if (visibleWidth(text) <= width) return text;
   return `${stripVTControlCharacters(truncateToWidth(text, Math.max(0, width - 1), ""))}…`;
+}
+
+/** Active counts, e.g. "2 running · 1 queued"; also the footer status text. Empty when nothing is active. */
+export function widgetCounts(rows: readonly WidgetRow[]): string {
+  const queued = rows.filter((row) => row.state === "queued").length;
+  const running = rows.filter((row) => row.state === "running" || row.state === "stopping").length;
+  return [running ? `${running} running` : "", queued ? `${queued} queued` : ""].filter(Boolean).join(" · ");
 }
 
 /** Thinking-level colours shared with Pi's editor border and the footer. */
@@ -49,8 +61,12 @@ function contextColor(percent: number): ThemeColor {
   return percent > 90 ? "error" : percent > 70 ? "warning" : "success";
 }
 
+const FINISHED: Partial<Record<WidgetRow["state"], ThemeColor>> = { done: "success", failed: "error", cancelled: "warning" };
+
 function contextCell(row: WidgetRow, theme: Theme): string {
   if (row.state === "queued") return theme.fg("dim", "queued");
+  const finished = FINISHED[row.state];
+  if (finished) return theme.fg(finished, row.state);
   const tokens = row.contextTokens ?? 0;
   if (!tokens) return theme.fg("dim", "starting");
   if (!row.contextWindow) return theme.fg("dim", formatTokens(tokens));
@@ -64,22 +80,27 @@ function contextCell(row: WidgetRow, theme: Theme): string {
 function marker(row: WidgetRow, theme: Theme): string {
   if (row.state === "queued") return theme.fg("dim", "○");
   if (row.state === "stopping") return theme.fg("warning", "●");
+  if (row.state === "done") return theme.fg("success", "✓");
+  if (row.state === "failed") return theme.fg("error", "✗");
+  if (row.state === "cancelled") return theme.fg("warning", "■");
   return theme.fg("borderAccent", "●");
 }
 
 /**
- * A header and one line per active subagent, each truncated to `width`:
+ * A header and one line per subagent (active, or finished moments ago), each
+ * truncated to `width`; the current tool follows the context cell:
  *
  *   Subagents  2 running · 1 queued
- *    ● review-auth   GPT-6 Astra xhigh   ━━━━━━━━━━  34%
+ *    ● review-auth   GPT-6 Astra xhigh   ━━━━━━━━━━  34%  bash
  *    ○ tester        Opus 5.5 high                  queued
+ *    ✓ scout         Opus 5.5 low                     done
  */
-export function renderWidget(rows: readonly WidgetRow[], theme: Theme, width: number): string[] {
-  if (!rows.length || width <= 0) return [];
-  const queued = rows.filter((row) => row.state === "queued").length;
-  const running = rows.length - queued;
-  const counts = [running ? `${running} running` : "", queued ? `${queued} queued` : ""].filter(Boolean).join(" · ");
-  const lines = [`${theme.fg("accent", theme.bold("Subagents"))}  ${theme.fg("dim", counts)}`];
+export function renderWidget(allRows: readonly WidgetRow[], theme: Theme, width: number): string[] {
+  if (!allRows.length || width <= 0) return [];
+  const lines = [`${theme.fg("accent", theme.bold("Subagents"))}  ${theme.fg("dim", widgetCounts(allRows))}`];
+  // Active rows first, so the cap hides finished ones before running ones.
+  const ordered = [...allRows.filter((row) => !FINISHED[row.state]), ...allRows.filter((row) => FINISHED[row.state])];
+  const rows = ordered.length > MAX_ROWS ? ordered.slice(0, MAX_ROWS - 1) : ordered;
   const nameWidth = Math.min(NAME_MAX, Math.max(...rows.map((row) => row.name.length)));
   const cells = rows.map((row) => contextCell(row, theme));
   const modelWidth = Math.max(0, ...rows.map((row) => visibleWidth([row.model, row.thinking].filter(Boolean).join(" "))));
@@ -102,7 +123,9 @@ export function renderWidget(rows: readonly WidgetRow[], theme: Theme, width: nu
       middle = parts.join(" ");
       middle = `  ${middle}${" ".repeat(Math.max(0, room - visibleWidth(middle)))}`;
     }
-    lines.push(`${left}${middle}  ${right}`);
+    const tool = row.tool && (row.state === "running" || row.state === "stopping") ? `  ${theme.fg("dim", row.tool)}` : "";
+    lines.push(`${left}${middle}  ${right}${tool}`);
   });
+  if (rows.length < ordered.length) lines.push(theme.fg("dim", ` +${ordered.length - rows.length} more`));
   return lines.map((line) => truncateToWidth(line, width, "…"));
 }

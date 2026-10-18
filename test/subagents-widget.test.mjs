@@ -3,7 +3,7 @@ import test from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { loadThemeFromPath } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
-import { formatTokens, renderWidget, shortModelName } from "../extensions/subagents/widget.ts";
+import { formatTokens, MAX_ROWS, renderWidget, shortModelName, widgetCounts } from "../extensions/subagents/widget.ts";
 
 const theme = loadThemeFromPath(new URL("../themes/tokyo-night.json", import.meta.url).pathname, "truecolor");
 const rows = [
@@ -61,4 +61,31 @@ test("nothing to show renders nothing", () => {
   assert.equal(formatTokens(950), "950");
   assert.equal(formatTokens(92_400), "92k");
   assert.equal(formatTokens(1_250_000), "1.3M");
+});
+
+test("finished rows show their outcome; running rows show the current tool", () => {
+  const lines = renderWidget([
+    { ...rows[0], tool: "bash" },
+    { name: "ok", model: "Opus 5.5", state: "done", contextTokens: 5000, contextWindow: 272_000 },
+    { name: "bad", model: "Opus 5.5", state: "failed" },
+    { name: "halt", model: "Opus 5.5", state: "cancelled" },
+  ], theme, 160).map(stripVTControlCharacters);
+  assert.equal(lines[0], "Subagents  1 running");
+  assert.match(lines[1], /34%  bash$/);
+  assert.match(lines[2], /^ ✓ ok\s+Opus 5\.5\s+done$/);
+  assert.match(lines[3], /^ ✗ bad\s+Opus 5\.5\s+failed$/);
+  assert.match(lines[4], /^ ■ halt\s+Opus 5\.5\s+cancelled$/);
+  assert.equal(widgetCounts([{ name: "x", state: "done" }]), "");
+});
+
+test("rows beyond the cap collapse into a +N more line, hiding finished rows first", () => {
+  const many = [
+    ...Array.from({ length: 4 }, (_, index) => ({ name: `done${index}`, state: "done" })),
+    ...Array.from({ length: MAX_ROWS }, (_, index) => ({ name: `run${index}`, state: "running" })),
+  ];
+  const lines = renderWidget(many, theme, 100).map(stripVTControlCharacters);
+  assert.equal(lines.length, 1 + MAX_ROWS);
+  assert.equal(lines.at(-1), ` +${many.length - (MAX_ROWS - 1)} more`);
+  assert.ok(lines.slice(1, -1).every((line) => line.includes("run")));
+  assert.equal(renderWidget(many.slice(0, MAX_ROWS), theme, 100).length, 1 + MAX_ROWS);
 });

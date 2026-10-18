@@ -71,9 +71,9 @@ export function systemPrompt(task: Task): string {
   return [
     `You are ${task.role === "explorer" ? "an" : "a"} ${task.role} subagent named ${task.name}. ${ROLES[task.role]}`,
     "You have no access to the parent conversation; the task message is self-contained.",
-    "Do not commit. Follow AGENTS.md. You cannot ask questions: state assumptions or report blockers.",
+    "Do not commit. You cannot ask questions: state assumptions or report blockers.",
     "You may receive follow-up messages later; answer each one with a fresh concise report.",
-    "End with a concise final report (aim under 1500 characters, include critical evidence such as file:line). No preamble.",
+    "Only your final message is delivered: end with a concise, complete report (aim under 1500 characters, include critical evidence such as file:line). No preamble.",
   ].join("\n");
 }
 

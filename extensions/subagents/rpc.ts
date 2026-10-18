@@ -9,6 +9,9 @@ export interface ExitInfo { code: number | null; signal: NodeJS.Signals | null; 
 
 export interface Invocation { command: string; prefix: string[] }
 
+/** The child did not answer in time; unlike an error response, it may still act on the request. */
+export class RpcTimeoutError extends Error {}
+
 const STDERR_LIMIT = 4096;
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
 
@@ -123,7 +126,7 @@ export class RpcProcess {
     if (!this.alive) return Promise.reject(new Error("Worker process is not running."));
     const id = `r${++this.sequence}`;
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`RPC ${command.type} timed out.`)); }, timeoutMs);
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new RpcTimeoutError(`RPC ${command.type} timed out.`)); }, timeoutMs);
       this.pending.set(id, { resolve: resolve as (data: unknown) => void, reject, timer });
       this.write({ ...command, id });
     });

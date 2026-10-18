@@ -84,7 +84,8 @@ test("runs workers in parallel, reports usage, writes per-run report files and s
   manager.spawn(tasks("one first", "two second"));
   const all = await collect(manager, 2);
   assert.deepEqual(all.map((r) => r.name).sort(), ["one", "two"]);
-  assert.ok(all.every((r) => r.state === "done" && r.tokens === 1500 && r.text.startsWith("reply to:")));
+  // input + output + cacheWrite (10 + 5 + 3); cacheRead and totalTokens re-count cached context.
+  assert.ok(all.every((r) => r.state === "done" && r.tokens === 18 && r.text.startsWith("reply to:")));
   assert.equal(reports.length, 2);
   const one = all.find((r) => r.name === "one");
   assert.match(one.path, /sub-one-[a-z0-9]+-1\.md$/);
@@ -315,6 +316,131 @@ test("concurrency limit queues extra workers in FIFO order", async (t) => {
   assert.equal(manager.get("a").state, "running");
   assert.equal(manager.get("b").state, "queued");
   assert.deepEqual((await collect(manager, 2)).map((r) => r.name), ["a", "b"]);
+});
+
+test("a fresh queued worker that was stopped keeps its task for a later send", async (t) => {
+  const { manager } = await setup(t, { maxRunning: 1 });
+  manager.spawn(tasks("a slow:300 x", "b original"));
+  manager.stop(["b"]);
+  await manager.send("b", "extra");
+  const { reports } = await manager.wait(["b"], 10, undefined, true);
+  assert.match(reports.at(-1).text, /reply to: original\n\nextra/);
+});
+
+test("stop validates every name before stopping any", async (t) => {
+  const { manager } = await setup(t, { maxRunning: 1 });
+  manager.spawn(tasks("a slow:300 x", "b queued"));
+  assert.throws(() => manager.stop(["b", "nope"]), /No subagent named "nope"/);
+  assert.equal(manager.get("b").state, "queued");
+});
+
+test("finished names can be reused; busy names cannot", async (t) => {
+  const { manager } = await setup(t);
+  manager.spawn(tasks("w slow:400 first"));
+  assert.throws(() => manager.spawn(tasks("w again")), /already in use/);
+  await manager.wait(["w"], 10);
+  const old = manager.get("w");
+  const [fresh] = manager.spawn(tasks("w again"));
+  assert.notEqual(fresh, old);
+  assert.notEqual(fresh.sessionId, old.sessionId);
+  assert.equal(old.rpc, undefined);
+  const { reports } = await manager.wait(["w"], 10);
+  assert.match(reports[0].text, /reply to: again \| history: again \|/);
+});
+
+test("a named wait ignores reports of a replaced same-name worker", async (t) => {
+  const { manager } = await setup(t);
+  manager.spawn(tasks("w first"));
+  // Finish without consuming the report, as when the parent is busy.
+  const deadline = Date.now() + 5000;
+  while (!manager.outbox.length && Date.now() < deadline) await delay(20);
+  manager.spawn(tasks("w slow:400 second"));
+  const { reports } = await manager.wait(["w"], 10);
+  assert.equal(reports.length, 1);
+  assert.match(reports[0].text, /reply to: slow:400 second/);
+  assert.equal(manager.outbox.length, 1, "old report stays for automatic delivery");
+});
+
+test("send stops waiting for a slow steer reply on abort and still tracks the run", async (t) => {
+  const { manager } = await setup(t);
+  manager.spawn(tasks("w first"));
+  await manager.wait(["w"], 10);
+  const worker = manager.get("w");
+  // The parent missed settlement, so this steer starts a run behind a long preflight.
+  worker.state = "running";
+  worker.runActive = true;
+  const controller = new AbortController();
+  const sending = manager.send("w", "preflight:1500 later", controller.signal);
+  await delay(100);
+  worker.state = "idle";
+  worker.runActive = false;
+  const started = Date.now();
+  controller.abort();
+  assert.equal(await sending, "sent");
+  assert.ok(Date.now() - started < 500);
+  const { reports } = await manager.wait(["w"], 10, undefined, true);
+  assert.match(reports[0]?.text ?? "", /reply to: preflight:1500 later/);
+});
+
+test("a send while a steer reply is outstanding runs after it instead of colliding", async (t) => {
+  const { manager } = await setup(t, { steerReplyMs: 50 });
+  manager.spawn(tasks("w first"));
+  await manager.wait(["w"], 10);
+  const worker = manager.get("w");
+  worker.state = "running";
+  worker.runActive = true;
+  assert.equal(await manager.send("w", "preflight:800 steered"), "sent");
+  worker.state = "idle";
+  worker.runActive = false;
+  assert.equal(await manager.send("w", "afterwards"), "queued");
+  const all = await collect(manager, 2);
+  assert.deepEqual(all.map((r) => r.state), ["done", "done"]);
+  assert.match(all[0].text, /reply to: preflight:800 steered/);
+  assert.match(all[1].text, /reply to: afterwards/);
+});
+
+test("an unanswered steer closes the child so a stopped run cannot start unseen", async (t) => {
+  const { manager } = await setup(t, { steerReplyMs: 25, runTimeoutMs: 400 });
+  manager.spawn(tasks("w first"));
+  await manager.wait(["w"], 10);
+  const worker = manager.get("w");
+  const rpc = worker.rpc;
+  worker.state = "running";
+  worker.runActive = true;
+  assert.equal(await manager.send("w", "preflight:900 late"), "sent");
+  worker.state = "idle";
+  worker.runActive = false;
+  assert.deepEqual(manager.stop(["w"]), ["w"]);
+  await manager.wait(["w"], 5, undefined, true);
+  assert.equal(worker.rpc, undefined);
+  await delay(1200);
+  assert.equal(rpc.alive, false);
+  assert.deepEqual(manager.take(), [], "the prompt never ran");
+});
+
+test("a steer refused with an error response keeps the worker and its run", async (t) => {
+  const { manager } = await setup(t);
+  manager.spawn(tasks("w slow:600 first"));
+  await delay(200);
+  const rpc = manager.get("w").rpc;
+  await assert.rejects(manager.send("w", "reject now"), /compaction is in progress/);
+  assert.equal(manager.get("w").rpc, rpc);
+  const { reports } = await manager.wait(["w"], 10, undefined, true);
+  assert.equal(reports[0].state, "done");
+  assert.equal(manager.get("w").state, "idle");
+});
+
+test("a queued continuation drops the previous run's finish time", async (t) => {
+  const { manager } = await setup(t, { maxRunning: 1 });
+  manager.spawn(tasks("w first"));
+  await manager.wait(["w"], 10);
+  assert.ok(manager.get("w").finishedAt);
+  manager.spawn(tasks("busy slow:2000 x"));
+  await delay(100);
+  assert.equal(await manager.send("w", "again"), "queued");
+  manager.stop(["w"]);
+  assert.equal(manager.get("w").state, "stopped");
+  assert.equal(manager.get("w").finishedAt, undefined);
 });
 
 test("stopping a queued worker ends a wait for it immediately", async (t) => {

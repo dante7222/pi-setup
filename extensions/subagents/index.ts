@@ -6,13 +6,18 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { SubagentManager, type Report, type Worker } from "./manager.ts";
 import { ROLES, THINKING_LEVELS, validateTasks, type Defaults, type Thinking } from "./tasks.ts";
-import { renderWidget, shortModelName, type WidgetRow } from "./widget.ts";
+import { renderCallLine, renderReports, renderResultText, reportDetails, type ReportDetails, type ReportView } from "./render.ts";
+import { renderWidget, shortModelName, widgetCounts, type WidgetRow } from "./widget.ts";
 
 const REPORT_TYPE = "subagent-report";
 const REPORT_CHARS = 3000;
 const ERROR_CHARS = 500;
 const DELIVERY_DEBOUNCE_MS = 1500;
 const DELIVERY_RETRY_MS = 2000;
+/** A manager stashed for /reload that no reloaded instance adopted by then is disposed. */
+const ADOPT_DEADLINE_MS = 60_000;
+/** Finished subagents stay in the widget this long. */
+const LINGER_MS = 5000;
 const promptExtension = fileURLToPath(new URL("./worker-prompt.ts", import.meta.url));
 
 // Managers outlive an extension reload: /reload must not kill running subagents.
@@ -36,23 +41,32 @@ const parameters = Type.Object({
   tasks: Type.Optional(Type.Array(Type.Object({
     name: Type.String({ description: "Unique lowercase slug, e.g. review-auth" }),
     task: Type.String({ description: "Self-contained instructions; the subagent has no parent history" }),
-    role: Type.Optional(StringEnum(Object.keys(ROLES) as (keyof typeof ROLES)[])),
+    role: Type.Optional(StringEnum(Object.keys(ROLES) as (keyof typeof ROLES)[], { description: "reviewer/explorer: read-only" })),
     model: Type.Optional(Type.String({ description: "provider/id, unique id, optional :thinking; omit to inherit" })),
     thinking: Type.Optional(StringEnum(THINKING_LEVELS)),
     cwd: Type.Optional(Type.String()),
   }), { minItems: 1, maxItems: 16 })),
   name: Type.Optional(Type.String({ description: "send: target subagent" })),
-  message: Type.Optional(Type.String({ description: "send: steers if running, else continues with its history" })),
+  message: Type.Optional(Type.String({ description: "send: message text" })),
   names: Type.Optional(Type.Array(Type.String(), { description: "wait/stop: targets; omit for all" })),
-  all: Type.Optional(Type.Boolean({ description: "wait: until every target finished, not the first report" })),
+  all: Type.Optional(Type.Boolean({ description: "wait: until all targets finish" })),
   seconds: Type.Optional(Type.Number({ minimum: 0, maximum: 1800, description: "wait: max seconds (default 120)" })),
 });
 
-export function formatReport(report: Report): string {
+/** The parts of a report as the model sees them; the TUI renders the same parts from `details`. */
+function reportView(report: Report): ReportView {
   const header = `[subagent ${report.name} ${report.state} ${report.seconds}s ${Math.round(report.tokens / 1000)}k tok]`;
-  const body = report.text.length > REPORT_CHARS ? `${report.text.slice(0, REPORT_CHARS)}\n[truncated; full report: ${report.path}]` : report.text;
+  // Cut at a line boundary when one is reasonably close, so the last line is not mangled.
+  const cut = report.text.lastIndexOf("\n", REPORT_CHARS);
+  const head = report.text.slice(0, cut > REPORT_CHARS * 0.8 ? cut : REPORT_CHARS);
+  const body = report.text.length > REPORT_CHARS ? `${head}\n[truncated; full report: ${report.path}]` : report.text;
   const error = report.error && report.error.length > ERROR_CHARS ? `${report.error.slice(0, ERROR_CHARS)}...` : report.error;
-  return [header, error ? `error: ${error}` : "", body].filter(Boolean).join("\n");
+  return { header, state: report.state, ...(error ? { error } : {}), body };
+}
+
+export function formatReport(report: Report): string {
+  const view = reportView(report);
+  return [view.header, view.error ? `error: ${view.error}` : "", view.body].filter(Boolean).join("\n");
 }
 
 function describe(worker: Worker): string {
@@ -61,8 +75,19 @@ function describe(worker: Worker): string {
   return `${worker.task.name} ${worker.task.role}${model} ${worker.state}${tool} ${Math.round(worker.total.tokens / 1000)}k`;
 }
 
-function text(value: string, isError = false) {
-  return { content: [{ type: "text" as const, text: value }], details: undefined, ...(isError ? { isError: true } : {}) };
+/** Run result: names grouped by state, with the model each resolved to (the caller may have given a fuzzy pattern). */
+export function formatStarted(workers: readonly Worker[]): string {
+  const label = (worker: Worker) => {
+    // Full provider/id: a fuzzy pattern may match the same id under several providers.
+    const model = worker.task.model;
+    return model ? `${worker.task.name} (${model}${worker.task.thinking ? `:${worker.task.thinking}` : ""})` : worker.task.name;
+  };
+  const group = (state: string) => workers.filter((worker) => worker.state === state).map(label).join(", ");
+  return [["started", group("running")], ["queued", group("queued")]].filter(([, names]) => names).map(([state, names]) => `${state}: ${names}`).join("; ");
+}
+
+function text(value: string, isError = false, details?: ReportDetails) {
+  return { content: [{ type: "text" as const, text: value }], details, ...(isError ? { isError: true } : {}) };
 }
 
 function modelResolver(ctx: ExtensionContext): (pattern: string) => string {
@@ -115,7 +140,7 @@ export default function subagents(pi: ExtensionAPI): void {
     if (!reports.length) return;
     // One message per batch: simultaneous completions wake the parent once.
     pi.sendMessage(
-      { customType: REPORT_TYPE, content: reports.map(formatReport).join("\n\n"), display: true, details: { names: reports.map((report) => report.name) } },
+      { customType: REPORT_TYPE, content: reports.map(formatReport).join("\n\n"), display: true, details: { reports: reports.map(reportView) } satisfies ReportDetails },
       { triggerTurn: wake },
     );
   };
@@ -123,8 +148,12 @@ export default function subagents(pi: ExtensionAPI): void {
   // Rendered from live manager state on each frame, so updates only need a re-render.
   let requestRender: (() => void) | undefined;
   let widgetShown = false;
-  const rows = (): WidgetRow[] => [...(manager?.workers.values() ?? [])]
-    .filter((worker) => worker.state === "running" || worker.state === "queued")
+  let lingerTimer: NodeJS.Timeout | undefined;
+  // Pi re-renders on every setStatus; skip unchanged text (render runs on each worker event).
+  let statusText: string | undefined;
+  const recent = (worker: Worker, now: number) => worker.report !== undefined && worker.finishedAt !== undefined && now - worker.finishedAt < LINGER_MS;
+  const rows = (now = Date.now()): WidgetRow[] => [...(manager?.workers.values() ?? [])]
+    .filter((worker) => worker.state === "running" || worker.state === "queued" || recent(worker, now))
     .map((worker) => {
       const [provider, ...id] = (worker.task.model ?? "").split("/");
       const model = provider && id.length ? ctx?.modelRegistry.find(provider, id.join("/")) : undefined;
@@ -132,7 +161,8 @@ export default function subagents(pi: ExtensionAPI): void {
         name: worker.task.name,
         model: model ? shortModelName(model.name || model.id) : id.join("/") || undefined,
         thinking: worker.task.thinking,
-        state: worker.state === "queued" ? "queued" : worker.endReason ? "stopping" : "running",
+        state: worker.state === "queued" ? "queued" : worker.state !== "running" ? worker.report!.state : worker.endReason ? "stopping" : "running",
+        tool: worker.tool,
         contextTokens: worker.contextTokens,
         contextWindow: model?.contextWindow,
       };
@@ -142,8 +172,17 @@ export default function subagents(pi: ExtensionAPI): void {
     // stdout handlers, where an escaping exception would crash the parent.
     try {
       if (!ctx?.hasUI || ctx.mode !== "tui") return;
-      const active = manager ? rows().length > 0 : false;
-      if (!active) {
+      const now = Date.now();
+      const current = manager ? rows(now) : [];
+      // The footer keeps the counts visible when the widget scrolls away.
+      const status = widgetCounts(current) || undefined;
+      if (status !== statusText) { ctx.ui.setStatus("subagents", status); statusText = status; }
+      // Re-render once the oldest finished row expires.
+      const finished = [...(manager?.workers.values() ?? [])].filter((worker) => recent(worker, now)).map((worker) => worker.finishedAt! + LINGER_MS - now);
+      clearTimeout(lingerTimer);
+      lingerTimer = finished.length ? setTimeout(render, Math.max(50, Math.min(...finished))) : undefined;
+      lingerTimer?.unref();
+      if (!current.length) {
         if (widgetShown) ctx.ui.setWidget("subagents", undefined);
         widgetShown = false;
         requestRender = undefined;
@@ -184,7 +223,8 @@ export default function subagents(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async (event) => {
     clearTimeout(flushTimer);
-    flushTimer = undefined;
+    clearTimeout(lingerTimer);
+    flushTimer = lingerTimer = undefined;
     const current = manager;
     manager = undefined;
     if (!current) return;
@@ -193,10 +233,18 @@ export default function subagents(pi: ExtensionAPI): void {
       // detach so worker events in between touch nothing stale.
       current.setHooks({ changed() {}, report() {} });
       ctx = undefined;
-      detached.set(sessionId, { manager: current, interrupted, runOwned });
+      const state = { manager: current, interrupted, runOwned };
+      detached.set(sessionId, state);
+      // The reloaded extension may fail to load or be removed; its workers must not run on unseen.
+      const id = sessionId;
+      setTimeout(() => {
+        if (detached.get(id) !== state) return;
+        detached.delete(id);
+        void current.dispose();
+      }, ADOPT_DEADLINE_MS).unref();
       return;
     }
-    try { if (ctx?.hasUI && ctx.mode === "tui") ctx.ui.setWidget("subagents", undefined); } catch { /* stale ctx */ }
+    try { if (ctx?.hasUI && ctx.mode === "tui") { ctx.ui.setWidget("subagents", undefined); ctx.ui.setStatus("subagents", undefined); statusText = undefined; } } catch { /* stale ctx */ }
     await current.dispose();
   });
 
@@ -219,23 +267,30 @@ export default function subagents(pi: ExtensionAPI): void {
   });
 
   pi.registerMessageRenderer(REPORT_TYPE, (message, { expanded }, theme) => {
-    const content = typeof message.content === "string" ? message.content : "";
-    const lines = content.split("\n");
-    const shown = expanded ? lines : lines.filter((line) => line.startsWith("[subagent ") || line.startsWith("error: "));
-    return new Text(shown.map((line) => line.startsWith("[subagent ") ? theme.fg("accent", line) : line).join("\n"), 0, 0);
+    const details = reportDetails(message.details);
+    // Messages from before this renderer existed carry no report details.
+    if (details) return new Text(renderReports(details, expanded, theme), 0, 0);
+    const lines = (typeof message.content === "string" ? message.content : "").split("\n");
+    return new Text((expanded ? lines : lines.filter((line) => line.startsWith("[subagent ") || line.startsWith("error: "))).join("\n"), 0, 0);
   });
 
   pi.registerTool({
     name: "subagents",
     label: "Subagents",
-    description: "Run isolated Pi subagents in the background. run starts tasks; send steers a running subagent or continues an idle one with its history; wait blocks for reports; stop aborts.",
+    description: "Background Pi subagents. send steers a running subagent or continues a finished one with its history; stop aborts.",
     promptSnippet: "Delegate independent tasks to background Pi subagents",
     promptGuidelines: [
-      "Use subagents for independent parallel work; give each a self-contained task with paths and acceptance criteria. Avoid overlapping file edits.",
-      "After subagents run, continue other work or end your turn; each run call's reports arrive together as one message. Use wait only when blocked on a result.",
+      "Use the subagents tool for independent work; give each task paths and acceptance criteria. Avoid overlapping file edits.",
+      "Reports from one subagents run arrive together as one message; meanwhile continue or end your turn. Use wait only when blocked.",
     ],
     parameters,
     executionMode: "parallel",
+    // Renderers draw only in the TUI; nothing here reaches the model.
+    renderCall: (args, theme) => new Text(renderCallLine(args as Record<string, unknown>, theme), 0, 0),
+    renderResult: (result, options, theme, context) => {
+      const first = result.content[0];
+      return new Text(renderResultText(first?.type === "text" ? first.text : "", result.details, { ...options, isError: context.isError }, theme), 0, 0);
+    },
     async execute(_id, params, signal, _onUpdate, current) {
       ctx = current;
       try {
@@ -249,19 +304,22 @@ export default function subagents(pi: ExtensionAPI): void {
               thinking: pi.getThinkingLevel() as Thinking,
               resolveModel: modelResolver(current),
             };
-            const created = workers.spawn(validateTasks(params.tasks, defaults, new Set(workers.workers.keys())));
+            const created = workers.spawn(validateTasks(params.tasks, defaults, workers.busyNames()));
             for (const worker of created) runOwned.add(worker.task.name);
-            return text(`started: ${created.map(describe).join("; ")}`);
+            return text(formatStarted(created));
           }
           case "send": {
             if (!params.name || !params.message?.trim()) throw new Error("send requires name and message.");
-            const outcome = await workers.send(params.name, params.message);
+            workers.get(params.name);
+            // Owned before awaiting: Esc during a slow steer reply must still stop it.
             runOwned.add(params.name);
+            const outcome = await workers.send(params.name, params.message, signal);
             return text(`${params.name}: ${outcome}`);
           }
           case "wait": {
             const { reports, pending } = await workers.wait(params.names ?? [], params.seconds ?? 120, signal, params.all === true);
-            return text([reports.map(formatReport).join("\n\n") || "No new reports.", pending.length ? `pending: ${pending.join(", ")}` : ""].filter(Boolean).join("\n\n"));
+            const content = [reports.map(formatReport).join("\n\n") || "No new reports.", pending.length ? `pending: ${pending.join(", ")}` : ""].filter(Boolean).join("\n\n");
+            return text(content, false, { reports: reports.map(reportView), pending });
           }
           case "stop": {
             const stopped = workers.stop(params.names ?? [...workers.workers.keys()]);

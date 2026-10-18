@@ -10,6 +10,7 @@
 //   "dialog ..."         send a confirm dialog first and wait for its cancellation
 //   "crash ..."          exit with code 3 mid-run, after writing to stderr
 //   "ignoreterm ..."     ignore SIGTERM (cleanup escalation)
+//   "reject ..."         refuse the prompt with an error response
 //   "...slowclear..."    delay the clear_queue reply by 600ms (abort/settle race)
 //   "orphan ..."         spawn a same-group child ignoring SIGTERM, then exit 1
 // Replies echo the prompt, steering, history and argv for assertions.
@@ -30,7 +31,7 @@ let dialogResolve;
 let lastPrompt = "";
 const history = [];
 
-const usage = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 1500, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 } };
+const usage = { input: 10, output: 5, cacheRead: 900, cacheWrite: 3, totalTokens: 1500, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 } };
 const assistant = (text, stopReason = "stop", errorMessage) => ({ role: "assistant", content: text ? [{ type: "text", text }] : [], stopReason, usage, ...(errorMessage ? { errorMessage } : {}) });
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -76,15 +77,19 @@ async function run(message) {
   finished();
 }
 
+let preflighting = false;
 async function prompt(command, reply) {
-  if (running) {
+  // Like Pi while compacting: refuse any prompt with an error response.
+  if (command.message.startsWith("reject")) { out({ id: command.id, type: "response", command: "prompt", success: false, error: "Cannot submit a prompt while compaction is in progress." }); return; }
+  // Pi is already busy during preflight: a bare prompt is rejected, a steer is queued.
+  if (running || preflighting) {
     if (!command.streamingBehavior) { out({ id: command.id, type: "response", command: "prompt", success: false, error: "Agent is already processing." }); return; }
     steering.push(command.message);
     reply({ disposition: "queued" });
     return;
   }
   const preflight = /^preflight:(\d+)/.exec(command.message);
-  if (preflight) await delay(Number(preflight[1]));
+  if (preflight) { preflighting = true; await delay(Number(preflight[1])); preflighting = false; }
   reply({ disposition: "started" });
   void run(command.message);
 }
