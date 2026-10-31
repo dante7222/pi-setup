@@ -67,7 +67,7 @@ function supportsNerdIcons(): boolean {
   if (process.env.GHOSTTY_RESOURCES_DIR) return true;
 
   const terminal = (process.env.TERM_PROGRAM ?? "").toLowerCase();
-  return ["iterm", "wezterm", "kitty", "ghostty", "alacritty"].some((name) =>
+  return ["iterm", "wezterm", "kitty", "ghostty", "alacritty", "rex"].some((name) =>
     terminal.includes(name),
   );
 }
