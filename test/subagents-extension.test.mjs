@@ -297,8 +297,8 @@ test("reports show edited files relative to the parent cwd, overlaps, and partia
 test("formatStarted groups names by state and shows resolved models compactly", () => {
   const worker = (name, state, model, thinking) => ({ state, task: { name, model, thinking } });
   assert.equal(
-    formatStarted([worker("a", "running", "openai-codex/gpt-6-astra", "xhigh"), worker("b", "running"), worker("c", "queued", "p/m")]),
-    "started: a (openai-codex/gpt-6-astra:xhigh), b; queued: c (p/m)",
+    formatStarted([worker("a", "running", "openai-codex/gpt-6-astra", "xhigh"), worker("b", "running"), worker("c", "queued", "p/m"), worker("d", "failed")]),
+    "started: a (openai-codex/gpt-6-astra:xhigh), b; queued: c (p/m); failed: d",
   );
 });
 

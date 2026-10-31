@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -157,6 +157,43 @@ test("a run near its deadline is steered to report, marked partial, and its queu
   await manager.send("w", "quick");
   const { reports: [next] } = await manager.wait(["w"], 10);
   assert.equal(next.partial, undefined);
+});
+
+test("a launch that fails synchronously fails the run at once and keeps the queue moving", async (t) => {
+  const base = await mkdtemp(join(tmpdir(), "subagents-"));
+  const blocker = join(base, "file");
+  await writeFile(blocker, "");
+  const reports = [];
+  // The session dir sits under a regular file, so creating it throws inside launch.
+  const manager = new SubagentManager({
+    dir: join(blocker, "sessions"), env: process.env, promptExtension: "/p.ts",
+    invocation: { command: process.execPath, prefix: [fake] },
+    hooks: { changed() {}, report(report) { reports.push(report); } },
+    limits: { maxRunning: 1 },
+  });
+  t.after(async () => { await manager.dispose(); await rm(base, { recursive: true, force: true }); });
+  const created = manager.spawn(tasks("a first", "b second"));
+  assert.deepEqual(created.map((worker) => worker.state), ["failed", "failed"]);
+  assert.deepEqual(manager.outbox.map((report) => [report.name, report.state]), [["a", "failed"], ["b", "failed"]]);
+  assert.equal(reports.length, 2);
+  assert.match(manager.outbox[0].error, /^Could not start worker: ENOTDIR/);
+  assert.deepEqual([...manager.busyNames()], []);
+  assert.equal(manager.running, 0);
+  // The undelivered task stays for a retry by send.
+  assert.equal(manager.get("a").pendingPrompt, "first");
+});
+
+test("stopping a run that has no process ends it instead of leaving it running", async (t) => {
+  const { manager } = await setup(t);
+  manager.spawn(tasks("w first"));
+  await manager.wait(["w"], 10);
+  const worker = manager.get("w");
+  await worker.rpc.close();
+  assert.equal(worker.rpc, undefined);
+  worker.state = "running";
+  assert.deepEqual(manager.stop(["w"]), ["w"]);
+  assert.equal(worker.state, "stopped");
+  assert.equal(manager.take()[0]?.state, "cancelled");
 });
 
 test("send steers a running worker", async (t) => {

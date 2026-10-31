@@ -58,7 +58,7 @@ function describe(worker: Worker): string {
   return `${worker.task.name} ${worker.task.role}${model} ${worker.state}${tool} ${Math.round(worker.total.tokens / 1000)}k`;
 }
 
-/** Run result: names grouped by state, with the model each resolved to (the caller may have given a fuzzy pattern). */
+/** Run result: names grouped by state, with the model each resolved to (the caller may have given a fuzzy pattern). A worker that could not launch is already failed. */
 export function formatStarted(workers: readonly Worker[]): string {
   const label = (worker: Worker) => {
     // Full provider/id: a fuzzy pattern may match the same id under several providers.
@@ -66,7 +66,7 @@ export function formatStarted(workers: readonly Worker[]): string {
     return model ? `${worker.task.name} (${model}${worker.task.thinking ? `:${worker.task.thinking}` : ""})` : worker.task.name;
   };
   const group = (state: string) => workers.filter((worker) => worker.state === state).map(label).join(", ");
-  return [["started", group("running")], ["queued", group("queued")]].filter(([, names]) => names).map(([state, names]) => `${state}: ${names}`).join("; ");
+  return [["started", group("running")], ["queued", group("queued")], ["failed", group("failed")]].filter(([, names]) => names).map(([state, names]) => `${state}: ${names}`).join("; ");
 }
 
 function text(value: string, isError = false, details?: ReportDetails) {

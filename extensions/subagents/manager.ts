@@ -490,7 +490,17 @@ export class SubagentManager {
     worker.runActive = false;
     const message = worker.pendingPrompt;
     worker.pendingPrompt = "";
-    if (!worker.rpc?.alive) worker.rpc = this.launch(worker);
+    if (!worker.rpc?.alive) {
+      try { worker.rpc = this.launch(worker); }
+      catch (error) {
+        // A synchronous failure (e.g. the session dir cannot be created) has no exit event
+        // to end the run, and must not escape schedule(), which runs from event handlers.
+        this.finish(worker, { state: "failed", error: `Could not start worker: ${error instanceof Error ? error.message : String(error)}` });
+        // Restored after finish(), which would otherwise retry it at once; a later send retries it.
+        worker.pendingPrompt = message;
+        return;
+      }
+    }
     const rpc = worker.rpc;
     // Pi replies after preflight, which includes extension loading on a fresh process and
     // may compact a revived session; the run timeout already bounds the whole run.
@@ -520,7 +530,8 @@ export class SubagentManager {
     if (worker.state !== "running" || worker.endReason) return;
     worker.endReason = reason;
     const rpc = worker.rpc;
-    if (!rpc) return;
+    // Without a process nothing can settle the run; end it here.
+    if (!rpc) { this.finish(worker, reason); return; }
     if (!worker.runActive) { void rpc.close(500); return; }
     clearTimeout(worker.escalation);
     // Cleared in finish(): only settlement proves the run ended.
