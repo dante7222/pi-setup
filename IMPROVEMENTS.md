@@ -46,7 +46,6 @@ Status: `[ ]` todo, `[~]` implemented/in review, `[x]` reviewed and done.
 
 ## Batch H: repo hygiene
 - [x] H1 Remove dead scripts/link-powerline-theme.sh + README reference
-- [x] H2 Untrack show-me test artifacts; move harness out of skill dir
 - [x] H3 Move finished progress logs to docs/history/
 - [x] H4 Re-verify README Pi 1.0.2 limitation note against 1.3.0
 
