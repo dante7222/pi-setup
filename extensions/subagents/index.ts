@@ -141,6 +141,7 @@ export default function subagents(pi: ExtensionAPI): void {
       const model = provider && id.length ? ctx?.modelRegistry.find(provider, id.join("/")) : undefined;
       return {
         name: worker.task.name,
+        role: worker.task.role,
         model: model ? shortModelName(model.name || model.id) : id.join("/") || undefined,
         thinking: worker.task.thinking,
         state: worker.state === "queued" ? "queued" : worker.state !== "running" ? worker.report!.state : worker.endReason ? "stopping" : "running",

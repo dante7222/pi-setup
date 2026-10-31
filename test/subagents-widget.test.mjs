@@ -7,23 +7,23 @@ import { formatTokens, MAX_ROWS, renderWidget, shortModelName, widgetCounts } fr
 
 const theme = loadThemeFromPath(new URL("../themes/tokyo-night.json", import.meta.url).pathname, "truecolor");
 const rows = [
-  { name: "review-auth", model: "GPT-6 Astra", thinking: "xhigh", state: "running", contextTokens: 92_000, contextWindow: 272_000 },
-  { name: "fixer", model: "Opus 5.5", thinking: "high", state: "stopping", contextTokens: 250_000, contextWindow: 272_000 },
-  { name: "tester", model: "Sonnet 5.5", state: "queued" },
-  { name: "scout", model: "GPT-6 Astra", thinking: "low", state: "running" },
+  { name: "review-auth", role: "reviewer", model: "GPT-6 Astra", thinking: "xhigh", state: "running", contextTokens: 92_000, contextWindow: 272_000 },
+  { name: "fixer", role: "worker", model: "Opus 5.5", thinking: "high", state: "stopping", contextTokens: 250_000, contextWindow: 272_000 },
+  { name: "tester", role: "tester", model: "Sonnet 5.5", state: "queued" },
+  { name: "scout", role: "explorer", model: "GPT-6 Astra", thinking: "low", state: "running" },
 ];
 
-test("one header and one line per subagent with short model, effort and context, no cost", () => {
+test("one header and one line per subagent with role first, short model, effort and context, no cost", () => {
   const lines = renderWidget(rows, theme, 160).map(stripVTControlCharacters);
   assert.deepEqual(lines, [
     "Subagents  3 running · 1 queued",
-    " ● review-auth  GPT-6 Astra xhigh  ━━━━━━━━━━  34%",
-    " ● fixer        Opus 5.5 high      ━━━━━━━━━━  92%",
-    " ○ tester       Sonnet 5.5                  queued",
-    " ● scout        GPT-6 Astra low           starting",
+    " ● reviewer  review-auth  GPT-6 Astra xhigh  ━━━━━━━━━━  34%",
+    " ● worker    fixer        Opus 5.5 high      ━━━━━━━━━━  92%",
+    " ○ tester    tester       Sonnet 5.5                  queued",
+    " ● explorer  scout        GPT-6 Astra low           starting",
   ]);
   // Compact columns: wide panes do not stretch rows to the right edge.
-  assert.ok(lines.every((line) => line.length < 60));
+  assert.ok(lines.every((line) => line.length < 70));
   // Effort keeps its thinking-level colour.
   assert.ok(renderWidget(rows, theme, 160)[1].includes(theme.getFgAnsi("thinkingXhigh")));
 });
@@ -43,7 +43,7 @@ test("context uses the footer's thresholds and colours", () => {
 });
 
 test("every line fits the width and clipping never inserts a colour reset", () => {
-  for (const width of [24, 36, 49, 50, 60, 100, 200]) {
+  for (const width of [1, 12, 24, 36, 49, 50, 60, 100, 200]) {
     for (const line of renderWidget(rows, theme, width)) {
       assert.ok(visibleWidth(line) <= width, `width ${width}: ${visibleWidth(line)}`);
     }
@@ -52,8 +52,8 @@ test("every line fits the width and clipping never inserts a colour reset", () =
   for (const line of renderWidget(long, theme, 52).slice(1)) assert.ok(!line.includes("\x1b[0m"), JSON.stringify(line));
   // The model is clipped before the effort, which stays visible.
   assert.match(stripVTControlCharacters(renderWidget(long, theme, 52)[1]), /…\s?xhigh\s+━/);
-  // Narrow panes drop the model column but keep name and context.
-  assert.match(stripVTControlCharacters(renderWidget(rows, theme, 36)[1]), /^ ● review-auth\s+━+\s+34%$/);
+  // Narrow panes drop the model and clip the name, keeping the role and context.
+  assert.match(stripVTControlCharacters(renderWidget(rows, theme, 36)[1]), /^ ● reviewer  revie…\s+━+\s+34%$/);
 });
 
 test("nothing to show renders nothing", () => {
@@ -66,22 +66,22 @@ test("nothing to show renders nothing", () => {
 test("finished rows show their outcome; running rows show the current tool", () => {
   const lines = renderWidget([
     { ...rows[0], tool: "bash" },
-    { name: "ok", model: "Opus 5.5", state: "done", contextTokens: 5000, contextWindow: 272_000 },
-    { name: "bad", model: "Opus 5.5", state: "failed" },
-    { name: "halt", model: "Opus 5.5", state: "cancelled" },
+    { name: "ok", role: "worker", model: "Opus 5.5", state: "done", contextTokens: 5000, contextWindow: 272_000 },
+    { name: "bad", role: "tester", model: "Opus 5.5", state: "failed" },
+    { name: "halt", role: "explorer", model: "Opus 5.5", state: "cancelled" },
   ], theme, 160).map(stripVTControlCharacters);
   assert.equal(lines[0], "Subagents  1 running");
   assert.match(lines[1], /34%  bash$/);
-  assert.match(lines[2], /^ ✓ ok\s+Opus 5\.5\s+done$/);
-  assert.match(lines[3], /^ ✗ bad\s+Opus 5\.5\s+failed$/);
-  assert.match(lines[4], /^ ■ halt\s+Opus 5\.5\s+cancelled$/);
-  assert.equal(widgetCounts([{ name: "x", state: "done" }]), "");
+  assert.match(lines[2], /^ ✓ worker\s+ok\s+Opus 5\.5\s+done$/);
+  assert.match(lines[3], /^ ✗ tester\s+bad\s+Opus 5\.5\s+failed$/);
+  assert.match(lines[4], /^ ■ explorer\s+halt\s+Opus 5\.5\s+cancelled$/);
+  assert.equal(widgetCounts([{ name: "x", role: "worker", state: "done" }]), "");
 });
 
 test("rows beyond the cap collapse into a +N more line, hiding finished rows first", () => {
   const many = [
-    ...Array.from({ length: 4 }, (_, index) => ({ name: `done${index}`, state: "done" })),
-    ...Array.from({ length: MAX_ROWS }, (_, index) => ({ name: `run${index}`, state: "running" })),
+    ...Array.from({ length: 4 }, (_, index) => ({ name: `done${index}`, role: "worker", state: "done" })),
+    ...Array.from({ length: MAX_ROWS }, (_, index) => ({ name: `run${index}`, role: "worker", state: "running" })),
   ];
   const lines = renderWidget(many, theme, 100).map(stripVTControlCharacters);
   assert.equal(lines.length, 1 + MAX_ROWS);
