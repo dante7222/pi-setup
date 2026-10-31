@@ -1,0 +1,25 @@
+/* Allow the reading-view layout to use the whole pane. */
+.markdown-preview-view.is-readable-line-width
+.markdown-preview-sizer {
+  max-width: none !important;
+}
+
+/* Keep ordinary content at the normal readable width. */
+.markdown-preview-view.is-readable-line-width
+.markdown-preview-sizer > div {
+  max-width: var(--file-line-width);
+  margin-inline: auto;
+}
+
+/* Give Mermaid blocks the available pane width. */
+.markdown-preview-view.is-readable-line-width
+.markdown-preview-sizer > div:has(.mermaid) {
+  max-width: none !important;
+}
+
+/* Scale the diagram to fit its wider container. */
+.markdown-preview-view .mermaid svg {
+  width: 100% !important;
+  max-width: 100% !important;
+  height: auto !important;
+}

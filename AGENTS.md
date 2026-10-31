@@ -11,6 +11,7 @@ This repository is the source of truth for Ventris's personal Pi setup. It is a 
 - `prompts/` — Markdown prompt templates.
 - `themes/` — Pi theme JSON files.
 - `hunk/` — Hunk diff viewer config (`config.toml`) using the Pi Tokyo Night palette. Not a Pi resource; keep it out of the `pi` manifest.
+- `obsidian-setup/` — Obsidian vault config snapshot (`.obsidian/`: plugins, themes, snippets, settings) with install notes in its `README.md`. Not a Pi resource; keep it out of the `pi` manifest. Plugin and theme files are vendored third-party code; do not edit them.
 - `package.json` — Pi package manifest. Keep resource paths current when the layout changes.
 
 ## Working rules

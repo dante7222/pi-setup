@@ -1,0 +1,13 @@
+{
+  "accentColor": "#cc30cf",
+  "cssTheme": "Minimal",
+  "monospaceFontFamily": "Monaspace Neon Frozen",
+  "translucency": true,
+  "baseFontSize": 18,
+  "enabledCssSnippets": [
+    "code-block"
+  ],
+  "theme": "obsidian",
+  "textFontFamily": "Lora",
+  "interfaceFontFamily": ""
+}

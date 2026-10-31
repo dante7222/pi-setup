@@ -11,6 +11,7 @@ Validated against installed Pi **1.4.0**. [docs/history/PI_1X_UPGRADE_PROGRESS.m
 - `prompts/` — prompt templates
 - `themes/` — TUI themes
 - `hunk/` — [Hunk](https://hunk.dev) diff viewer config (not loaded by Pi)
+- `obsidian-setup/` — [Obsidian](https://obsidian.md) vault config: plugins, themes, snippets, and settings (not loaded by Pi; see [obsidian-setup/README.md](obsidian-setup/README.md))
 
 Included now:
 
