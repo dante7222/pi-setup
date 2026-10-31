@@ -10,6 +10,7 @@ This repository is the source of truth for Ventris's personal Pi setup. It is a 
 - `skills/` — Agent Skills, normally one directory per skill containing `SKILL.md`.
 - `prompts/` — Markdown prompt templates.
 - `themes/` — Pi theme JSON files.
+- `hunk/` — Hunk diff viewer config (`config.toml`) using the Pi Tokyo Night palette. Not a Pi resource; keep it out of the `pi` manifest.
 - `package.json` — Pi package manifest. Keep resource paths current when the layout changes.
 
 ## Working rules

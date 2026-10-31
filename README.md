@@ -10,6 +10,7 @@ Validated against installed Pi **1.4.0**. [docs/history/PI_1X_UPGRADE_PROGRESS.m
 - `skills/` — Agent Skills
 - `prompts/` — prompt templates
 - `themes/` — TUI themes
+- `hunk/` — [Hunk](https://hunk.dev) diff viewer config (not loaded by Pi)
 
 Included now:
 
@@ -55,6 +56,10 @@ In Rex (`TERM_PROGRAM=rex`), titles show only the session name: the extension re
 ## Tokyo Night theme
 
 Thinking text, syntax comments, diff context, and link URLs use a brighter secondary blue-violet while decorative borders retain the subdued Tokyo Night palette. Explicit scrollbar colors improve fullscreen navigation. Regression checks cover Pi's theme schema, truecolor/256-color rendering, reading-text contrast, and thumb/track contrast.
+
+## Hunk theme
+
+`hunk/config.toml` is a global Hunk config with a `pi-tokyo-night` custom theme: the Pi Tokyo Night palette mapped onto Hunk's surfaces, diff rows, file-status badges, agent notes, and syntax scopes, on top of Hunk's built-in `tokyo-night`. It also enables agent notes by default. Install it with `cp hunk/config.toml ~/.config/hunk/config.toml` and relaunch Hunk. Validated against Hunk 0.24.1.
 
 ## Tokyo Night status border
 

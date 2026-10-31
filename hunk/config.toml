@@ -1,0 +1,64 @@
+theme = "pi-tokyo-night"   # built-in alternative: "tokyo-night"
+agent_notes = true
+
+# Pi's tokyo-night palette (pi-setup/themes/tokyo-night.json) mapped onto Hunk.
+# Base "tokyo-night" supplies the syntax grammar colors; everything below overrides it.
+# Diff backgrounds were derived with Hunk's own tint/contrast rules from Pi's green/red/blue.
+[themes.pi-tokyo-night]
+label = "Pi Tokyo Night"
+base = "tokyo-night"
+
+# Surfaces
+background = "#1a1b26"          # bg
+panel = "#16161e"               # bgDark
+panelAlt = "#1f2335"            # toolPendingBg
+border = "#565f89"              # borderMuted
+accent = "#7aa2f7"              # accent (blue)
+accentMuted = "#33467c"         # selectedBg
+text = "#c0caf5"                # text (fg)
+muted = "#a9b1d6"               # muted (fgDark)
+contextBg = "#1a1b26"
+contextContentBg = "#1a1b26"
+lineNumberBg = "#1a1b26"
+lineNumberFg = "#565f89"        # dim; use "#8d98c6" for brighter line numbers
+
+# Diff rows
+addedSignColor = "#9ece6a"      # toolDiffAdded
+removedSignColor = "#f7768e"    # toolDiffRemoved
+addedBg = "#343f34"
+addedContentBg = "#3f4d39"
+removedBg = "#462d3b"
+removedContentBg = "#583443"
+movedAddedBg = "#2d3650"
+movedRemovedBg = "#2d3650"
+selectedHunk = "#323d5a"
+
+# Badges and file status (same roles as the Pi footer's git status)
+badgeAdded = "#9ece6a"          # success
+badgeRemoved = "#f7768e"        # error
+badgeNeutral = "#a9b1d6"        # muted
+fileNew = "#9ece6a"             # success
+fileDeleted = "#f7768e"         # error
+fileModified = "#e0af68"        # warning (footer: unstaged)
+fileRenamed = "#bb9af7"         # purple
+fileUntracked = "#a9b1d6"       # muted (footer: untracked)
+
+# Agent notes styled like Pi custom messages
+noteBorder = "#bb9af7"          # customMessageLabel
+noteBackground = "#292e42"      # customMessageBg
+noteTitleBackground = "#292e42"
+noteTitleText = "#bb9af7"       # customMessageLabel
+
+# Pi syntax roles where they differ from the base Tokyo Night grammar colors
+[themes.pi-tokyo-night.syntax_scopes]
+source = "#c0caf5"                          # syntaxVariable / text
+comment = "#8d98c6"                         # syntaxComment
+"punctuation.definition.comment" = "#8d98c6"
+"support.function" = "#7aa2f7"              # syntaxFunction
+"variable.function" = "#7aa2f7"
+"entity.name.type" = "#7dcfff"              # syntaxType
+"entity.name.class" = "#7dcfff"
+"support.type" = "#7dcfff"
+"support.class" = "#7dcfff"
+"keyword.operator" = "#2ac3de"              # syntaxOperator
+punctuation = "#a9b1d6"                     # syntaxPunctuation
