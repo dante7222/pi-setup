@@ -16,9 +16,9 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.3.0",
-    "@earendil-works/pi-coding-agent": "1.3.0",
-    "@earendil-works/pi-tui": "1.3.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
     "@types/node": "25.5.0",
     "typebox": "1.3.27",
     "typescript": "6.0.2"
@@ -36,6 +36,7 @@
       "./extensions/subagents/index.ts",
       "./extensions/tokyo-night-footer/index.ts",
       "./extensions/web-access-toggle/index.ts",
+      "./extensions/visual-explainer-toggle/index.ts",
       "./extensions/yellow-file-headers/index.ts"
     ],
     "skills": [

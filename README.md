@@ -2,7 +2,7 @@
 
 Personal [Pi](https://pi.dev) extensions, skills, prompt templates, and themes, bundled as one Pi package.
 
-Validated against installed Pi **1.3.0**. [docs/history/PI_1X_UPGRADE_PROGRESS.md](docs/history/PI_1X_UPGRADE_PROGRESS.md) records the earlier 1.0.x upgrade; [docs/history/SUBAGENTS-REVAMP.md](docs/history/SUBAGENTS-REVAMP.md) records the 1.3.0 move and the subagents rewrite.
+Validated against installed Pi **1.4.0**. [docs/history/PI_1X_UPGRADE_PROGRESS.md](docs/history/PI_1X_UPGRADE_PROGRESS.md) records the earlier 1.0.x upgrade; [docs/history/SUBAGENTS-REVAMP.md](docs/history/SUBAGENTS-REVAMP.md) records the 1.3.0 move and the subagents rewrite.
 
 ## Contents
 
@@ -19,6 +19,7 @@ Included now:
 - **Tokyo Night Status Border** extension (`extensions/tokyo-night-footer/index.ts`)
 - **Yellow File Headers** extension (`extensions/yellow-file-headers/index.ts`)
 - **Web Access Toggle** extension (`extensions/web-access-toggle/index.ts`)
+- **Visual Explainer Toggle** extension (`extensions/visual-explainer-toggle/index.ts`)
 - **Subagents** extension (`extensions/subagents/index.ts`)
 
 ## Bash timeout
@@ -89,6 +90,14 @@ The always-loaded `/web-access` command controls the globally registered `npm:pi
 Off mode retains the package entry using `autoload: false`, so Pi continues to track the installation while loading none of its extensions or skills. The toggle remains available because it belongs to this setup package rather than `pi-web-access` itself.
 
 Custom resource filters, including exclusion-only configurations, show as **filtered** instead of being guessed on. Explicit on/off replaces those filters with default loading or fully disabled loading while preserving version pins and unrelated settings. Status describes global configuration—not resolved glob matches, project overrides, or proof that tools are loaded—and does not install or resolve packages.
+
+## Visual Explainer toggle
+
+The always-loaded `/visual-explainer` command controls the globally installed `git:github.com/nicobailon/visual-explainer` package. No arguments opens the same On/Off selector as `/web-access`; `/visual-explainer on`, `/visual-explainer off`, and `/visual-explainer status` are also available. Changes persist in global Pi settings and reload Pi automatically. No Visual Explainer MCP server is configured or started.
+
+Off retains the installation with `autoload: false` and loads none of its extensions, tools, skill descriptions, skill instructions, prompt templates, or themes. The controller registers only a UI slash command: no agent tools, prompt snippets, guidelines, hooks, or model-facing messages. Fresh sessions therefore receive no Visual Explainer package context while off. On restores all native package resources; version pins and unrelated settings are preserved. Custom resource filters report **filtered**, as with the web toggle.
+
+This is a package-loading preference, not a filesystem sandbox. Status describes global settings; explicit project/CLI resources can override them. Disabling cannot erase instructions, tool results, or old declarations already in a conversation. Use `/new` after switching off for a clean context; resuming an older session can bring its history back. Generated pages remain on disk.
 
 ## Subagents
 
