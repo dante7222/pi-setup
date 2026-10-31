@@ -15,6 +15,7 @@ Included now:
 
 - **Bash Timeout** extension (`extensions/bash-timeout/index.ts`)
 - **Compaction Transcript** extension (`extensions/compaction-transcript/index.ts`)
+- **Rex Terminal Title** extension (`extensions/rex-terminal-title/index.ts`)
 - **Tokyo Night** theme (`themes/tokyo-night.json`)
 - **Tokyo Night Status Border** extension (`extensions/tokyo-night-footer/index.ts`)
 - **Yellow File Headers** extension (`extensions/yellow-file-headers/index.ts`)
@@ -47,6 +48,10 @@ Each export safely writes its immutable sidecar before atomically refreshing the
 
 Use `/transcript` to refresh the files without compacting. Pi 1.0.2 boundary-appended compactions emit `entry_appended`, not `session_compact`, so they require this manual export; automatic export does not cover that event path. Pi's `--no-session` mode is intentionally not exported because it explicitly disables persistence. Tool output truncated before Pi stores it cannot be recovered. Both reader transcripts and raw snapshots may contain private material; review them before sharing.
 
+## Rex terminal titles
+
+In Rex (`TERM_PROGRAM=rex`), titles show only the session name: the extension removes Pi's redundant `π - ` prefix and working-directory suffix. Unnamed sessions show the folder until a name is available, then only the session name. Automatic name generation, `/name`, program-status reporting, and other terminals are unchanged. The title filter is restored on reload, session replacement, and shutdown; it adds no visible widget content or polling.
+
 ## Tokyo Night theme
 
 Thinking text, syntax comments, diff context, and link URLs use a brighter secondary blue-violet while decorative borders retain the subdued Tokyo Night palette. Explicit scrollbar colors improve fullscreen navigation. Regression checks cover Pi's theme schema, truecolor/256-color rendering, reading-text contrast, and thumb/track contrast.
@@ -57,7 +62,7 @@ The extension replaces Pi's normal footer with a single status line embedded in 
 
 Codex Fast Mode appears as `● fast requested` only while the installed `@ryan_nookpi/pi-extension-codex-fast-mode` setting is enabled and the response/selected physical OpenAI Codex model supports it. Supported IDs are aligned with the installed integration at validation time; the badge means requested service, not verified provider acceptance. Disabled or unsupported Fast Mode has no segment. Git indicators use `*N` for unstaged files, `+N` for staged files, and `?N` for untracked files.
 
-The current agent title is right-aligned and shares a stable Tokyo Night accent with the editor border and the horizontal gap between groups. Explicit Pi session names, including subagent names, take precedence. Otherwise, title generation starts immediately from the submitted prompt and runs concurrently with the main response. Pi's public model-registry streaming API routes this request through the selected model, including virtual routers, to produce a concise 3–7 word title. The extension persists it as the Pi session name as soon as it is ready. The title has highest responsive priority, so it remains visible in narrow panes while lower-priority status details return as the pane expands. Use `/name` to override it.
+Session names are not displayed in the status line. Automatic title generation still starts immediately from the submitted prompt and runs concurrently with the main response. Pi's public model-registry streaming API routes this request through the selected model, including virtual routers, to produce a concise 3–7 word title, which is persisted as the Pi session name as soon as it is ready. Explicit Pi session names, including subagent names, take precedence; use `/name` to override a generated name. The session name still determines the editor border's stable Tokyo Night accent.
 
 Throughput is displayed as `󰓅 42.3 tps` (or `⚡` without Nerd Fonts): final provider-reported output tokens divided by monotonic elapsed time from the first `before_provider_request` hook to the completed assistant message. Custom providers without that hook use `before_provider_headers` (after auth resolution), then `context` on runtimes without either hook. Repeated or late hooks cannot restart the clock. This is **request-average throughput**, including latency, prompt processing, hidden reasoning and provider-internal retry/backoff—not server-side decode speed. Pi's output count already includes reasoning. Tool execution and previous turns are excluded; characters/chunks are never treated as output tokens, and TTFT is not subtracted from the denominator. Even responses under 100 ms are measured.
 

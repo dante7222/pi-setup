@@ -33,6 +33,7 @@
     "extensions": [
       "./extensions/bash-timeout/index.ts",
       "./extensions/compaction-transcript/index.ts",
+      "./extensions/rex-terminal-title/index.ts",
       "./extensions/subagents/index.ts",
       "./extensions/tokyo-night-footer/index.ts",
       "./extensions/web-access-toggle/index.ts",

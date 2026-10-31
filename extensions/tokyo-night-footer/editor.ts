@@ -161,7 +161,6 @@ export class TokyoNightStatusEditor extends CustomEditor {
         this.#ctx,
         this.#state,
         scrollIndicators.length > 0 ? scrollIndicators.join(" · ") : undefined,
-        agentTitle,
         this.borderColor,
         width,
       ),

@@ -216,10 +216,15 @@ test("an explicit name wins an in-flight generated title, and next session can g
   h.pi.setSessionName("User chosen name");
   resolve(assistant(0, 0, { content: [{ type: "text", text: "<title>Generated title</title>" }] }));
   await flush(); assert.equal(h.title, "User chosen name");
+  assert.doesNotMatch(h.text, /User chosen name|Generated title/);
   h.stop(); h.pi.setSessionName(""); h.start();
   h.emit("before_agent_start", { messageType: "user", prompt: "New task" });
   resolve(assistant(0, 0, { content: [{ type: "text", text: "<title>New generated title</title>" }] }));
-  await flush(); assert.equal(h.title, "New generated title"); h.stop();
+  await flush(); assert.equal(h.title, "New generated title");
+  for (const width of [44, 220]) {
+    assert.doesNotMatch(stripVTControlCharacters(h.render(width)[0]), /New generated/);
+  }
+  h.stop();
 });
 
 test("request boundaries see edits even before a paint; streaming grows without projection walks", async () => {

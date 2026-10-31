@@ -55,7 +55,7 @@ export function finishLayoutResponse(h) {
   return () => h.emit("message_end", { message });
 }
 
-test("clock follows tps; responsive border preserves width, title and critical status", (t) => {
+test("clock follows tps; responsive border preserves width and critical status without session names", (t) => {
   let now = 0;
   t.mock.method(performance, "now", () => now);
   const previousIcons = process.env.POWERLINE_NERD_FONTS;
@@ -75,14 +75,16 @@ test("clock follows tps; responsive border preserves width, title and critical s
       finish();
       const wide = stripVTControlCharacters(h.render(220)[0]);
       assert.match(wide, /100\.0 tps.*[◷] 250ms/);
+      assert.doesNotMatch(wide, /Metrics|A long/);
       for (let width = 10; width <= 240; width++) {
         const lines = h.render(width);
         assert.equal(visibleWidth(lines[0]), width, `top border at ${width} cols, icons=${icons}`);
+        assert.doesNotMatch(stripVTControlCharacters(lines[0]), /Metrics|A long/);
         for (const line of lines) assert.ok(visibleWidth(line) <= width);
       }
       if (title === "Metrics test") {
         const narrow = stripVTControlCharacters(h.render(44)[0]);
-        assert.match(narrow, /Metrics test/);
+        assert.doesNotMatch(narrow, /Metrics/);
         assert.doesNotMatch(narrow, / tps|[◷]/);
       }
       h.emit("session_shutdown");

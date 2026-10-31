@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionContext, Theme, ThemeColor } from "@earendi
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { normalizeAgentTitle } from "./agent-title.ts";
 import { isCodexFastModeRequested } from "./codex-fast-mode.ts";
-import { RESET_ALL, sessionAccent, tone } from "./colors.ts";
+import { RESET_ALL, tone } from "./colors.ts";
 import type { ContextTokenEstimate } from "./context-usage.ts";
 import type { StatusLineState } from "./state.ts";
 import { formatFirstTokenLatency } from "./throughput.ts";
@@ -162,19 +162,12 @@ function leastImportantSegmentIndex(segments: readonly StatusSegment[]): number 
 
 function renderStatusGroup(
   segments: readonly StatusSegment[],
-  direction: "left" | "right",
   theme: Theme,
   nerdIcons: boolean,
 ): string {
   if (segments.length === 0) return "";
 
-  const separatorGlyph = nerdIcons
-    ? direction === "left"
-      ? ""
-      : ""
-    : direction === "left"
-      ? "›"
-      : "‹";
+  const separatorGlyph = nerdIcons ? "" : "›";
   const separator = tone(theme, "separator", separatorGlyph);
   return ` ${segments.map((segment) => segment.content).join(` ${separator} `)} `;
 }
@@ -370,19 +363,11 @@ export function currentAgentTitle(pi: ExtensionAPI): string | undefined {
   return sessionName === undefined ? undefined : normalizeAgentTitle(sessionName);
 }
 
-export function truncateSessionTitle(
-  agentTitle: string | undefined,
-  width: number,
-): string {
-  return width <= 0 ? "" : truncateToWidth(agentTitle ?? "", width, "…");
-}
-
 export function renderTopBorder(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   state: StatusLineState,
   scrollIndicator: string | undefined,
-  agentTitle: string | undefined,
   border: (text: string) => string,
   width: number,
 ): string {
@@ -404,65 +389,34 @@ export function renderTopBorder(
     availableWidth,
     scrollIndicator,
   );
-  const maxTitleWidth = Math.max(1, Math.min(60, availableWidth - 2));
-  const rightSegments: StatusSegment[] = agentTitle
-    ? [
-        {
-          id: "title",
-          content: sessionAccent(
-            theme,
-            agentTitle,
-            theme.bold(truncateSessionTitle(agentTitle, maxTitleWidth)),
-          ),
-        },
-      ]
-    : [];
+  let left = renderStatusGroup(leftSegments, theme, nerdIcons);
 
-  let left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
-  const right = renderStatusGroup(rightSegments, "right", theme, nerdIcons);
-
-  // Keep the title visible while dropping lower-priority details. Subtract the
-  // removed segment/separator widths instead of rebuilding and measuring the
-  // entire styled line after every removal (especially costly in narrow panes),
-  // then re-measure once: separator glyphs may be wider than the assumed column.
+  // Drop lower-priority details first. Subtract removed segment/separator widths
+  // instead of measuring the entire styled line after every removal, then
+  // re-measure once: separator glyphs may be wider than the assumed column.
   let leftWidth = visibleWidth(left);
-  const rightWidth = visibleWidth(right);
-  while (leftWidth + rightWidth > availableWidth && leftSegments.length > 1) {
-    while (leftWidth + rightWidth > availableWidth && leftSegments.length > 1) {
+  while (leftWidth > availableWidth && leftSegments.length > 1) {
+    while (leftWidth > availableWidth && leftSegments.length > 1) {
       const index = leastImportantSegmentIndex(leftSegments);
       // Both powerline and fallback separators occupy one column plus two spaces.
       leftWidth -= visibleWidth(leftSegments[index]!.content) + 3;
       leftSegments.splice(index, 1);
     }
-    left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
+    left = renderStatusGroup(leftSegments, theme, nerdIcons);
     leftWidth = visibleWidth(left);
   }
-  if (leftWidth + rightWidth > availableWidth && leftSegments.length === 1) {
+  if (leftWidth > availableWidth) {
     const groupChromeWidth = 2;
-    const leftBudget = Math.max(0, availableWidth - rightWidth);
-    if (leftBudget > groupChromeWidth) {
-      leftSegments[0] = {
-        ...leftSegments[0]!,
-        content: truncateToWidth(
-          leftSegments[0]!.content,
-          leftBudget - groupChromeWidth,
-          "…",
-        ),
-      };
-      left = renderStatusGroup(leftSegments, "left", theme, nerdIcons);
-      leftWidth = visibleWidth(left);
-    } else {
-      left = "";
-      leftWidth = 0;
-    }
-  }
-  if (leftWidth + rightWidth > availableWidth) {
-    left = "";
-    leftWidth = 0;
+    leftSegments[0] = {
+      ...leftSegments[0]!,
+      content: truncateToWidth(leftSegments[0]!.content, availableWidth - groupChromeWidth, "…"),
+    };
+    left = renderStatusGroup(leftSegments, theme, nerdIcons);
+    leftWidth = visibleWidth(left);
   }
 
-  const gapWidth = Math.max(0, availableWidth - leftWidth - rightWidth);
-  return `${border("╭──")}${left}${border("─".repeat(gapWidth))}${right}${border("──╮")}`;
+  const gapWidth = Math.max(0, availableWidth - leftWidth);
+  return `${border("╭──")}${left}${border("─".repeat(gapWidth))}${border("──╮")}`;
 }
 
 export function updatePrimeAgentWidget(pi: ExtensionAPI, state: StatusLineState): void {
@@ -471,21 +425,10 @@ export function updatePrimeAgentWidget(pi: ExtensionAPI, state: StatusLineState)
 
   const nerdIcons = supportsNerdIcons();
   const segments = buildLeftSegments(pi, ctx, ctx.ui.theme, state, nerdIcons, 160, undefined);
-  const agentTitle = currentAgentTitle(pi);
-  if (agentTitle) {
-    segments.push({
-      id: "title",
-      content: sessionAccent(
-        ctx.ui.theme,
-        agentTitle,
-        ctx.ui.theme.bold(agentTitle),
-      ),
-    });
-  }
   // Prime Agent widgets are plain strings without a render width. Pi's Text
   // wrapper would wrap (not clip) them; clip to the terminal when it is known.
   const columns = process.stdout.isTTY ? process.stdout.columns : undefined;
-  const fullText = renderStatusGroup(segments, "left", ctx.ui.theme, nerdIcons);
+  const fullText = renderStatusGroup(segments, ctx.ui.theme, nerdIcons);
   const text = columns && columns > 2 ? truncateToWidth(fullText, columns - 2, "…") : fullText;
   if (text === state.primeAgentWidgetText) return;
 

@@ -47,7 +47,6 @@ export {
   formatTokens,
   sanitizeStatusText,
   truncatePath,
-  truncateSessionTitle,
 } from "./status-line.ts";
 
 const TITLE_GENERATION_TIMEOUT_MS = 20_000;
