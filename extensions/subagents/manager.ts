@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { RpcProcess, RpcTimeoutError, type Invocation, type RpcEvent } from "./rpc.ts";
 import { rpcArgs, systemPrompt, type Task } from "./tasks.ts";
 
@@ -19,6 +20,12 @@ export interface Report {
   seconds: number;
   tokens: number;
   cost: number;
+  /** Absolute paths the run changed through edit/write. Absent in reports of a manager that predates it, adopted across /reload. */
+  files?: readonly string[];
+  /** Edited paths that subagents running at the same time also edited, with their names. */
+  overlaps?: Record<string, string[]>;
+  /** The run was asked to wrap up before its deadline. */
+  partial?: boolean;
 }
 
 export interface Limits {
@@ -26,6 +33,8 @@ export interface Limits {
   maxRunning: number;
   /** Per-run deadline. */
   runTimeoutMs: number;
+  /** This long before the deadline, a running worker is steered to stop and report; 0 disables. */
+  wrapUpMs: number;
   /** Idle worker processes exit after this; `send` restarts them from their session. */
   idleMs: number;
   /** After abort, a run that has not settled within this is ended by closing the process. */
@@ -34,7 +43,7 @@ export interface Limits {
   steerReplyMs: number;
 }
 
-export const DEFAULT_LIMITS: Limits = { maxRunning: 6, runTimeoutMs: 30 * 60_000, idleMs: 10 * 60_000, abortGraceMs: 10_000, steerReplyMs: 15_000 };
+export const DEFAULT_LIMITS: Limits = { maxRunning: 6, runTimeoutMs: 30 * 60_000, wrapUpMs: 5 * 60_000, idleMs: 10 * 60_000, abortGraceMs: 10_000, steerReplyMs: 15_000 };
 
 interface Usage { tokens: number; cost: number }
 
@@ -63,6 +72,12 @@ export class Worker {
   lastAssistant: Record<string, unknown> | undefined;
   /** Latest non-empty assistant text of the run, kept when a run is aborted. */
   lastText = "";
+  /** Files the current or latest run changed through edit/write (absolute paths). */
+  readonly edited = new Set<string>();
+  /** edit/write calls in flight by tool call id; a path counts once its call succeeded. */
+  readonly pendingEdits = new Map<string, string>();
+  /** The current run was steered to wrap up before its deadline. */
+  wrappedUp = false;
   report: Report | undefined;
   /** When the latest run ended; the widget shows finished workers briefly. */
   finishedAt: number | undefined;
@@ -70,6 +85,7 @@ export class Worker {
   endReason: { state: "cancelled" | "failed"; error: string } | undefined;
   timer: NodeJS.Timeout | undefined;
   escalation: NodeJS.Timeout | undefined;
+  wrapTimer: NodeJS.Timeout | undefined;
 
   constructor(task: Task, sessionId: string) {
     this.task = task;
@@ -93,7 +109,18 @@ function timer(callback: () => void, ms: number): NodeJS.Timeout {
 function clearTimers(worker: Worker): void {
   clearTimeout(worker.timer);
   clearTimeout(worker.escalation);
-  worker.timer = worker.escalation = undefined;
+  clearTimeout(worker.wrapTimer);
+  worker.timer = worker.escalation = worker.wrapTimer = undefined;
+}
+
+const WRAP_UP_MESSAGE = "Your time limit is almost reached. Stop starting new work and reply now with your final report: what is done, what remains, and any risks.";
+/** `{report:name}` in a task or message; the name follows NAME_PATTERN. */
+const REPORT_REF = /\{report:([a-z][a-z0-9-]{0,31})\}/g;
+
+/** Pi's edit/write path resolution: an optional leading @, ~ for home, otherwise relative to cwd. */
+function editedPath(path: string, cwd: string): string {
+  const bare = path.startsWith("@") ? path.slice(1) : path;
+  return resolve(cwd, bare === "~" ? homedir() : bare.startsWith("~/") ? join(homedir(), bare.slice(2)) : bare);
 }
 
 function assistantText(message: Record<string, unknown> | undefined): string {
@@ -163,7 +190,9 @@ export class SubagentManager {
     const busy = this.busyNames();
     const clash = tasks.find((task) => busy.has(task.name));
     if (clash) throw new Error(`Name "${clash.name}" is already in use.`);
-    for (const task of tasks) {
+    // Before same-name workers are replaced: a task may cite the report of the worker it replaces.
+    const expanded = tasks.map((task) => ({ ...task, task: this.expand(task.task) }));
+    for (const task of expanded) {
       const old = this.workers.get(task.name);
       if (!old) continue;
       clearTimers(old);
@@ -172,7 +201,7 @@ export class SubagentManager {
       if (rpc) void rpc.close();
     }
     const batch = ++this.batches;
-    const created = tasks.map((task) => {
+    const created = expanded.map((task) => {
       const worker = new Worker(task, `sub-${task.name}-${Date.now().toString(36)}`);
       worker.batch = batch;
       this.workers.set(task.name, worker);
@@ -182,6 +211,18 @@ export class SubagentManager {
     this.schedule();
     this.hooks.changed();
     return created;
+  }
+
+  /**
+   * Replace each `{report:name}` with that subagent's latest full report, so results pass
+   * between subagents without the parent reading and restating them.
+   */
+  expand(text: string): string {
+    return text.replace(REPORT_REF, (_match, name: string) => {
+      const report = this.workers.get(name)?.report;
+      if (!report) throw new Error(`{report:${name}}: "${name}" has no finished report.`);
+      return `<report from="${name}">\n${report.text}\n</report>`;
+    });
   }
 
   get(name: string): Worker {
@@ -199,7 +240,8 @@ export class SubagentManager {
   async send(name: string, message: string, signal?: AbortSignal): Promise<"steered" | "queued" | "started" | "sent"> {
     if (this.disposed) throw new Error("Subagents are shut down for this session.");
     const worker = this.get(name);
-    const append = () => { worker.pendingPrompt = [worker.pendingPrompt, message].filter(Boolean).join("\n\n"); };
+    const text = this.expand(message);
+    const append = () => { worker.pendingPrompt = [worker.pendingPrompt, text].filter(Boolean).join("\n\n"); };
     // A queued worker, a run still starting (a second prompt could start a parallel
     // run inside Pi's preflight), or a run being stopped takes the message next.
     if (worker.state === "queued" || (worker.state === "running" && (!worker.runActive || worker.endReason || !worker.rpc?.alive))) {
@@ -226,7 +268,7 @@ export class SubagentManager {
         // its preflight, which may compact first; a short deadline would misreport that.
         let data: { disposition?: string } | undefined;
         try {
-          data = await rpc.request<{ disposition?: string }>({ type: "prompt", message, streamingBehavior: "steer" }, this.limits.runTimeoutMs);
+          data = await rpc.request<{ disposition?: string }>({ type: "prompt", message: text, streamingBehavior: "steer" }, this.limits.runTimeoutMs);
         } catch (error) {
           // An error response (e.g. compaction in progress) means nothing started. A child that
           // did not answer may still start the run, unseen and past any stop: discard it, and
@@ -426,7 +468,21 @@ export class SubagentManager {
     worker.lastText = "";
     worker.tool = undefined;
     worker.report = undefined;
+    worker.edited.clear();
+    worker.pendingEdits.clear();
+    worker.wrappedUp = false;
     worker.timer = timer(() => this.end(worker, { state: "failed", error: `Timed out after ${Math.round(this.limits.runTimeoutMs / 1000)}s.` }), this.limits.runTimeoutMs);
+    const wrapAt = this.limits.runTimeoutMs - this.limits.wrapUpMs;
+    if (this.limits.wrapUpMs > 0 && wrapAt > 0) worker.wrapTimer = timer(() => this.wrapUp(worker), wrapAt);
+  }
+
+  /** Ask a run nearing its deadline for its report, so the timeout does not discard the work. */
+  private wrapUp(worker: Worker): void {
+    const rpc = worker.rpc;
+    // Only a started run takes a steer; a run that is ending needs none.
+    if (worker.state !== "running" || !worker.runActive || worker.endReason || !rpc?.alive) return;
+    worker.wrappedUp = true;
+    void rpc.request({ type: "steer", message: WRAP_UP_MESSAGE }, 5000).catch(() => {});
   }
 
   private startRun(worker: Worker): void {
@@ -480,7 +536,7 @@ export class SubagentManager {
 
   private launch(worker: Worker): RpcProcess {
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    const env: NodeJS.ProcessEnv = { ...this.env, PI_SUBAGENT: "1", PI_SUBAGENT_PROMPT: systemPrompt(worker.task), PI_SKIP_VERSION_CHECK: "1" };
+    const env: NodeJS.ProcessEnv = { ...this.env, PI_SUBAGENT: "1", PI_SUBAGENT_PROMPT: systemPrompt(worker.task.role), PI_SKIP_VERSION_CHECK: "1" };
     // These describe the parent session to its shell tools; a worker has its own.
     for (const key of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) delete env[key];
     const args = rpcArgs(worker.task, { id: worker.sessionId, dir: this.dir }, this.promptExtension);
@@ -544,8 +600,23 @@ export class SubagentManager {
         if (typeof after === "number" && after > 0) worker.contextTokens = after;
         break;
       }
-      case "tool_execution_start": worker.tool = typeof event.toolName === "string" ? event.toolName : "tool"; break;
-      case "tool_execution_end": worker.tool = undefined; break;
+      case "tool_execution_start": {
+        worker.tool = typeof event.toolName === "string" ? event.toolName : "tool";
+        // Changes made through bash are not seen here.
+        const path = (event.args as { path?: unknown } | undefined)?.path;
+        if ((event.toolName === "edit" || event.toolName === "write") && typeof path === "string") {
+          worker.pendingEdits.set(String(event.toolCallId), editedPath(path, worker.task.cwd));
+        }
+        break;
+      }
+      case "tool_execution_end": {
+        worker.tool = undefined;
+        const id = String(event.toolCallId);
+        const path = worker.pendingEdits.get(id);
+        worker.pendingEdits.delete(id);
+        if (path && event.isError !== true) worker.edited.add(path);
+        break;
+      }
       case "agent_settled":
         worker.runActive = false;
         if (worker.state === "running") this.finish(worker, classify(worker.lastAssistant, event.aborted === true));
@@ -563,10 +634,22 @@ export class SubagentManager {
     worker.endReason = undefined;
     // The session id keeps names reused by a later manager of this session distinct.
     const path = join(this.dir, `${worker.sessionId}-${worker.runs}.md`);
+    const files = [...worker.edited];
+    const overlaps: Record<string, string[]> = {};
+    for (const other of this.workers.values()) {
+      // Another subagent whose run overlapped this one in time and edited the same file.
+      const concurrent = other.state === "running" || (other.finishedAt ?? 0) > worker.runStarted;
+      if (other === worker || !concurrent) continue;
+      for (const file of files) if (other.edited.has(file)) (overlaps[file] ??= []).push(other.task.name);
+    }
     const report: Report = {
       name: worker.task.name, state, text: assistantText(worker.lastAssistant) || worker.lastText, ...(error && state !== "done" ? { error } : {}),
       path, sessionId: worker.sessionId, batch: worker.batch, seconds: Math.round((Date.now() - worker.runStarted) / 1000), tokens: worker.run.tokens, cost: worker.run.cost,
+      files, ...(Object.keys(overlaps).length ? { overlaps } : {}), ...(worker.wrappedUp ? { partial: true } : {}),
     };
+    // A wrap-up steer that reached the child after it settled would open its next run.
+    // Sent before any follow-up prompt below, and the child handles stdin in order.
+    if (worker.wrappedUp && worker.rpc?.alive) void worker.rpc.request({ type: "clear_queue" }, 2000).catch(() => {});
     worker.report = report;
     worker.finishedAt = Date.now();
     worker.tool = undefined;

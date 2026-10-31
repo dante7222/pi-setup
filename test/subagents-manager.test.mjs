@@ -6,7 +6,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { classify, SubagentManager } from "../extensions/subagents/manager.ts";
-import { rpcArgs, validateTasks } from "../extensions/subagents/tasks.ts";
+import { rpcArgs, systemPrompt, validateTasks } from "../extensions/subagents/tasks.ts";
 
 const fake = fileURLToPath(new URL("./fixtures/fake-pi-rpc.mjs", import.meta.url));
 
@@ -61,12 +61,24 @@ test("validateTasks inherits parent model/thinking and drops thinking for explic
   assert.throws(() => validateTasks([{ name: "a", task: "x" }], defaults, new Set(["a"])), /already in use/);
 });
 
-test("rpcArgs excludes editing tools for read-only roles and always excludes subagents", () => {
+test("rpcArgs gives read-only roles a small read-only loadout and keeps workers from orchestrating", () => {
   const [reviewer, worker] = validateTasks([{ name: "r", task: "x", role: "reviewer" }, { name: "w", task: "x" }], defaults, new Set());
   const args = rpcArgs(reviewer, { id: "s1", dir: "/d" }, "/p.ts");
-  assert.deepEqual(args.slice(args.indexOf("--exclude-tools"), args.indexOf("--exclude-tools") + 2), ["--exclude-tools", "subagents,edit,write"]);
-  assert.ok(rpcArgs(worker, { id: "s1", dir: "/d" }, "/p.ts").includes("subagents"));
+  assert.deepEqual(args.slice(args.indexOf("--tools"), args.indexOf("--tools") + 2), ["--tools", "read,grep,find,ls,bash"]);
+  assert.ok(args.includes("--no-skills") && args.includes("--no-mcp"));
+  // Extensions still load (e.g. bash timeouts); the prompt extension is always explicit.
+  assert.ok(!args.includes("--no-extensions") && args.at(-1) === "/p.ts");
+  const workerArgs = rpcArgs(worker, { id: "s1", dir: "/d" }, "/p.ts");
+  assert.deepEqual(workerArgs.slice(workerArgs.indexOf("--exclude-tools"), workerArgs.indexOf("--exclude-tools") + 2), ["--exclude-tools", "subagents"]);
+  assert.ok(!workerArgs.includes("--tools") && !workerArgs.includes("--no-skills"));
   assert.ok(args.includes("--session-id") && args.includes("--thinking"));
+});
+
+test("the worker system prompt depends on the role only", () => {
+  const [a, b] = validateTasks([{ name: "a", task: "x" }, { name: "b", task: "y" }], defaults, new Set());
+  assert.equal(systemPrompt(a.role), systemPrompt(b.role));
+  assert.doesNotMatch(systemPrompt("explorer"), /named/);
+  assert.match(systemPrompt("explorer"), /^You are an explorer subagent\./);
 });
 
 test("classify treats errors, aborts, tool-call endings and empty text as failures", () => {
@@ -94,6 +106,57 @@ test("runs workers in parallel, reports usage, writes per-run report files and s
   assert.equal(spawned.length, 2);
   assert.ok(spawned.every((line) => line.env.PI_SUBAGENT === "1" && line.env.PI_SESSION_ID === undefined && line.env.PI_OFFLINE === undefined && line.env.prompt.startsWith("You are a worker subagent")));
   assert.equal(manager.get("one").state, "idle");
+});
+
+test("reports list files changed by successful edits and flag files concurrent subagents also edited", async (t) => {
+  const { manager } = await setup(t);
+  manager.spawn(tasks("a edit:src/x.ts edit:/abs/y.ts editfail:src/bad.ts slow:900 work", "b edit:src/x.ts edit:src/z.ts slow:200 quick"));
+  const all = await collect(manager, 2);
+  const byName = Object.fromEntries(all.map((report) => [report.name, report]));
+  assert.deepEqual(byName.a.files, ["/tmp/src/x.ts", "/abs/y.ts"], "failed edits do not count");
+  assert.deepEqual(byName.b.files, ["/tmp/src/x.ts", "/tmp/src/z.ts"]);
+  // b finished while a was running; a finished after b's run had started: both see it.
+  assert.deepEqual(byName.b.overlaps, { "/tmp/src/x.ts": ["a"] });
+  assert.deepEqual(byName.a.overlaps, { "/tmp/src/x.ts": ["b"] });
+  // A later run that overlaps nothing reports no overlap, and starts with an empty file list.
+  await manager.send("b", "quick");
+  const { reports: [again] } = await manager.wait(["b"], 10, undefined, true);
+  assert.deepEqual(again.files, []);
+  assert.equal(again.overlaps, undefined);
+});
+
+test("{report:name} inserts a finished subagent's full report into tasks and messages", async (t) => {
+  const { manager } = await setup(t);
+  manager.spawn(tasks("a first"));
+  await manager.wait(["a"], 10);
+  assert.throws(() => manager.spawn(tasks("b see {report:nope}")), /"nope" has no finished report/);
+  assert.equal(manager.workers.has("b"), false, "nothing starts when a reference fails");
+  manager.spawn(tasks("b use {report:a}"));
+  const { reports: [b] } = await manager.wait(["b"], 10);
+  assert.match(b.text, /^reply to: use <report from="a">\nreply to: first \|/);
+  // A task may cite the report of the same-name worker it replaces.
+  manager.spawn(tasks("a redo {report:a}"));
+  const { reports: [a] } = await manager.wait(["a"], 10);
+  assert.match(a.text, /^reply to: redo <report from="a">\nreply to: first/);
+  assert.equal(await manager.send("b", "compare {report:a}"), "started");
+  const { reports: [sent] } = await manager.wait(["b"], 10);
+  assert.match(sent.text, /reply to: compare <report from="a">\nreply to: redo/);
+  await assert.rejects(manager.send("b", "{report:ghost}"), /"ghost" has no finished report/);
+});
+
+test("a run near its deadline is steered to report, marked partial, and its queue cleared", async (t) => {
+  const { manager, lines } = await setup(t, { runTimeoutMs: 4000, wrapUpMs: 3000 });
+  manager.spawn(tasks("w slow:2000 work"));
+  const { reports: [report] } = await manager.wait(["w"], 10);
+  assert.equal(report.state, "done");
+  assert.equal(report.partial, true);
+  assert.match(report.text, /history: slow:2000 work \/ Your time limit is almost reached/);
+  const commands = (await lines()).filter((line) => line.command).map((line) => line.command.type);
+  assert.ok(commands.indexOf("clear_queue") > commands.indexOf("steer"), commands.join(","));
+  // The next run starts without a wrap-up flag.
+  await manager.send("w", "quick");
+  const { reports: [next] } = await manager.wait(["w"], 10);
+  assert.equal(next.partial, undefined);
 });
 
 test("send steers a running worker", async (t) => {

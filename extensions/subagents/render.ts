@@ -11,6 +11,10 @@ export interface ReportView {
   header: string;
   state: "done" | "failed" | "cancelled";
   error?: string;
+  /** Files the run changed through edit/write, comma-separated. */
+  edited?: string;
+  /** Edited files that concurrent subagents also edited, with their names. */
+  overlap?: string;
   /** The body exactly as the model received it (possibly truncated with a path). */
   body: string;
 }
@@ -53,6 +57,8 @@ export function renderReports(details: ReportDetails, expanded: boolean, theme: 
   for (const report of details.reports) {
     out.push(theme.fg(report.state === "failed" ? "error" : report.state === "cancelled" ? "warning" : "accent", report.header));
     if (report.error) out.push(theme.fg("error", `error: ${expanded ? report.error : oneLine(report.error, PREVIEW_CHARS)}`));
+    if (report.edited) out.push(theme.fg("dim", `edited: ${expanded ? report.edited : oneLine(report.edited, PREVIEW_CHARS)}`));
+    if (report.overlap) out.push(theme.fg("warning", `overlap: ${report.overlap}`));
     if (expanded) { if (report.body) out.push(report.body); }
     else {
       const first = report.body.split("\n").find((line) => line.trim());

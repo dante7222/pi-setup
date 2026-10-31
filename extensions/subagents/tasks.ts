@@ -11,8 +11,13 @@ export type Role = keyof typeof ROLES;
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type Thinking = (typeof THINKING_LEVELS)[number];
 
-/** Roles that must not mutate files get the editing tools removed, not just a prompt hint. */
+/**
+ * Roles that must not mutate files run with a read-only tool allowlist and without
+ * skills or MCP, which also keeps their bootstrap prompt small. `bash` stays for git
+ * and search, so read-only is still partly enforced by the prompt.
+ */
 const READ_ONLY_ROLES: ReadonlySet<Role> = new Set(["reviewer", "explorer"]);
+const READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "bash"];
 
 export interface TaskInput {
   name: string;
@@ -67,9 +72,10 @@ export function validateTasks(inputs: readonly TaskInput[], defaults: Defaults, 
   });
 }
 
-export function systemPrompt(task: Task): string {
+/** Depends on the role only, so sibling workers of one role send an identical, cacheable prefix. */
+export function systemPrompt(role: Role): string {
   return [
-    `You are ${task.role === "explorer" ? "an" : "a"} ${task.role} subagent named ${task.name}. ${ROLES[task.role]}`,
+    `You are ${role === "explorer" ? "an" : "a"} ${role} subagent. ${ROLES[role]}`,
     "You have no access to the parent conversation; the task message is self-contained.",
     "Do not commit. You cannot ask questions: state assumptions or report blockers.",
     "You may receive follow-up messages later; answer each one with a fresh concise report.",
@@ -84,9 +90,10 @@ export function rpcArgs(task: Task, session: { id: string; dir: string }, prompt
   const args = ["--mode", "rpc", "--session-dir", session.dir, "--session-id", session.id, "--name", task.name];
   if (task.model) args.push("--model", task.model);
   if (task.thinking) args.push("--thinking", task.thinking);
-  // Workers never orchestrate; read-only roles lose editing tools.
-  const excluded = ["subagents", ...(READ_ONLY_ROLES.has(task.role) ? ["edit", "write"] : [])];
-  args.push("--exclude-tools", excluded.join(","));
+  // Workers never orchestrate. Extensions still load in read-only roles (e.g. bash
+  // timeouts); the allowlist only drops their tools.
+  if (READ_ONLY_ROLES.has(task.role)) args.push("--no-skills", "--no-mcp", "--tools", READ_ONLY_TOOLS.join(","));
+  else args.push("--exclude-tools", "subagents");
   // An extension rather than --append-system-prompt keeps APPEND_SYSTEM.md discovery.
   args.push("-e", promptExtension);
   return args;

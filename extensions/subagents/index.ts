@@ -4,14 +4,13 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { SubagentManager, type Report, type Worker } from "./manager.ts";
+import { SubagentManager, type Worker } from "./manager.ts";
 import { ROLES, THINKING_LEVELS, validateTasks, type Defaults, type Thinking } from "./tasks.ts";
-import { renderCallLine, renderReports, renderResultText, reportDetails, type ReportDetails, type ReportView } from "./render.ts";
+import { renderCallLine, renderReports, renderResultText, reportDetails, type ReportDetails } from "./render.ts";
+import { formatReports } from "./report.ts";
 import { renderWidget, shortModelName, widgetCounts, type WidgetRow } from "./widget.ts";
 
 const REPORT_TYPE = "subagent-report";
-const REPORT_CHARS = 3000;
-const ERROR_CHARS = 500;
 const DELIVERY_DEBOUNCE_MS = 1500;
 const DELIVERY_RETRY_MS = 2000;
 /** A manager stashed for /reload that no reloaded instance adopted by then is disposed. */
@@ -52,22 +51,6 @@ const parameters = Type.Object({
   all: Type.Optional(Type.Boolean({ description: "wait: until all targets finish" })),
   seconds: Type.Optional(Type.Number({ minimum: 0, maximum: 1800, description: "wait: max seconds (default 120)" })),
 });
-
-/** The parts of a report as the model sees them; the TUI renders the same parts from `details`. */
-function reportView(report: Report): ReportView {
-  const header = `[subagent ${report.name} ${report.state} ${report.seconds}s ${Math.round(report.tokens / 1000)}k tok]`;
-  // Cut at a line boundary when one is reasonably close, so the last line is not mangled.
-  const cut = report.text.lastIndexOf("\n", REPORT_CHARS);
-  const head = report.text.slice(0, cut > REPORT_CHARS * 0.8 ? cut : REPORT_CHARS);
-  const body = report.text.length > REPORT_CHARS ? `${head}\n[truncated; full report: ${report.path}]` : report.text;
-  const error = report.error && report.error.length > ERROR_CHARS ? `${report.error.slice(0, ERROR_CHARS)}...` : report.error;
-  return { header, state: report.state, ...(error ? { error } : {}), body };
-}
-
-export function formatReport(report: Report): string {
-  const view = reportView(report);
-  return [view.header, view.error ? `error: ${view.error}` : "", view.body].filter(Boolean).join("\n");
-}
 
 function describe(worker: Worker): string {
   const model = worker.task.model ? ` ${worker.task.model}${worker.task.thinking ? `:${worker.task.thinking}` : ""}` : "";
@@ -133,16 +116,15 @@ export default function subagents(pi: ExtensionAPI): void {
     const current = manager;
     if (!current?.outbox.length || !ctx) return;
     let idle = false;
-    try { idle = ctx.isIdle(); } catch { return; }
+    let cwd: string | undefined;
+    try { idle = ctx.isIdle(); cwd = ctx.cwd; } catch { return; }
     if (!idle) { later(DELIVERY_RETRY_MS); return; }
     // Wake once per batch: a run's reports wait until all its subagents finished.
     const reports = current.take((report) => current.isReady(report));
     if (!reports.length) return;
     // One message per batch: simultaneous completions wake the parent once.
-    pi.sendMessage(
-      { customType: REPORT_TYPE, content: reports.map(formatReport).join("\n\n"), display: true, details: { reports: reports.map(reportView) } satisfies ReportDetails },
-      { triggerTurn: wake },
-    );
+    const { text: content, views } = formatReports(reports, cwd);
+    pi.sendMessage({ customType: REPORT_TYPE, content, display: true, details: { reports: views } satisfies ReportDetails }, { triggerTurn: wake });
   };
 
   // Rendered from live manager state on each frame, so updates only need a re-render.
@@ -277,13 +259,15 @@ export default function subagents(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagents",
     label: "Subagents",
-    description: "Background Pi subagents. send steers a running subagent or continues a finished one with its history; stop aborts.",
+    description: "Background Pi subagents. send steers a running subagent or continues a finished one with its history; stop aborts. {report:name} in a task or message inserts that subagent's full latest report.",
     promptSnippet: "Delegate independent tasks to background Pi subagents",
     promptGuidelines: [
       "Use the subagents tool for independent work; give each task paths and acceptance criteria. Avoid overlapping file edits.",
       "Reports from one subagents run arrive together as one message; meanwhile continue or end your turn. Use wait only when blocked.",
     ],
     parameters,
+    // An orchestrating tool: declared to the model, not callable from codemode scripts.
+    exposure: "model-only",
     executionMode: "parallel",
     // Renderers draw only in the TUI; nothing here reaches the model.
     renderCall: (args, theme) => new Text(renderCallLine(args as Record<string, unknown>, theme), 0, 0),
@@ -318,8 +302,9 @@ export default function subagents(pi: ExtensionAPI): void {
           }
           case "wait": {
             const { reports, pending } = await workers.wait(params.names ?? [], params.seconds ?? 120, signal, params.all === true);
-            const content = [reports.map(formatReport).join("\n\n") || "No new reports.", pending.length ? `pending: ${pending.join(", ")}` : ""].filter(Boolean).join("\n\n");
-            return text(content, false, { reports: reports.map(reportView), pending });
+            const { text: body, views } = formatReports(reports, current.cwd);
+            const content = [body || "No new reports.", pending.length ? `pending: ${pending.join(", ")}` : ""].filter(Boolean).join("\n\n");
+            return text(content, false, { reports: views, pending });
           }
           case "stop": {
             const stopped = workers.stop(params.names ?? [...workers.workers.keys()]);

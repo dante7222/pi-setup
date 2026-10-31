@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import subagents, { formatReport, formatStarted } from "../extensions/subagents/index.ts";
+import subagents, { formatStarted } from "../extensions/subagents/index.ts";
+import { formatReport, formatReports, reportLimits } from "../extensions/subagents/report.ts";
 import { SubagentManager } from "../extensions/subagents/manager.ts";
 
 // Tests may themselves run inside a subagent, which sets this for its own process.
@@ -61,6 +62,8 @@ test("registers one compact tool, a command and a report renderer", () => {
   assert.equal(registered.tools.length, 1);
   const [tool] = registered.tools;
   assert.equal(tool.name, "subagents");
+  // An orchestrating tool: codemode scripts must not drive it (or hold a worker in wait).
+  assert.equal(tool.exposure, "model-only");
   // Keep the declaration small: the parent pays for it on every request.
   const size = JSON.stringify({ d: tool.description, p: tool.parameters, g: tool.promptGuidelines, s: tool.promptSnippet }).length;
   assert.ok(size < 2700, `tool declaration is ${size} bytes`);
@@ -241,20 +244,54 @@ test("a manager stashed for /reload that nobody adopts is disposed", async (t) =
   assert.throws(() => kept.spawn([]), /shut down/);
 });
 
-test("formatReport is compact and truncates long reports with a path", () => {
+test("formatReport is compact and cuts a long single-line report with a path", () => {
   assert.equal(formatReport(report("r", { seconds: 12, tokens: 15400, cost: 0.123, text: "all good" })), "[subagent r done 12s 15k tok]\nall good");
   const long = formatReport(report("r", { text: "x".repeat(5000) }));
   assert.ok(long.length < 3200);
-  assert.match(long, /\[truncated; full report: \/r\/r-1\.md\]$/);
+  assert.match(long, /x…\n\[truncated line 1 of 1; full report: \/r\/r-1\.md \(read offset=1 limit=1\)\]$/);
   assert.match(formatReport(report("r", { state: "failed", text: "", error: "boom" })), /failed.*\nerror: boom$/);
   assert.ok(formatReport(report("r", { state: "failed", text: "", error: "e".repeat(100_000) })).length < 600);
 });
 
-test("formatReport truncates at a nearby line boundary", () => {
-  const text = `${"a".repeat(2900)}\n${"b".repeat(500)}`;
-  const body = formatReport(report("r", { text })).split("\n");
-  assert.equal(body[1], "a".repeat(2900));
-  assert.match(body[2], /^\[truncated/);
+test("truncation keeps whole lines from the start and the end and names the omitted range", () => {
+  const lines = Array.from({ length: 100 }, (_, i) => `line ${String(i + 1).padStart(3, "0")} ${"x".repeat(41)}`);
+  const [header, ...body] = formatReport(report("r", { text: lines.join("\n") })).split("\n");
+  assert.match(header, /^\[subagent r done/);
+  const markerAt = body.findIndex((line) => line.startsWith("[truncated"));
+  const [, from, to, offset, limit] = /^\[truncated lines (\d+)-(\d+) of 100; full report: \/r\/r-1\.md \(read offset=(\d+) limit=(\d+)\)\]$/.exec(body[markerAt]).map(Number);
+  assert.deepEqual(body.slice(0, markerAt), lines.slice(0, from - 1), "head is the first lines");
+  assert.deepEqual(body.slice(markerAt + 1), lines.slice(to), "tail is the last lines, ending with the verdict");
+  assert.equal(offset, from);
+  assert.equal(limit, to - from + 1);
+  assert.ok(body.join("\n").length - body[markerAt].length <= 3000);
+});
+
+test("a first line longer than the head budget is cut, not dropped", () => {
+  const text = `${"S".repeat(2500)}\nmiddle\n${"m".repeat(2000)}\nVERDICT: ok`;
+  const body = formatReport(report("r", { text })).split("\n").slice(1);
+  assert.match(body[0], /^S+…$/);
+  assert.match(body[1], /^\[truncated lines 1-3 of 4; .*read offset=1 limit=3\)\]$/);
+  assert.equal(body.at(-1), "VERDICT: ok");
+});
+
+test("reports delivered together share one body budget", () => {
+  assert.deepEqual(reportLimits([5000, 5000, 5000, 5000]), [3000, 3000, 3000, 3000]);
+  assert.deepEqual(reportLimits(Array(8).fill(9000)), Array(8).fill(1500));
+  assert.deepEqual(reportLimits(Array(16).fill(9000)), Array(16).fill(800), "every report keeps a minimum");
+  // Short reports keep their text and leave their share to a long one.
+  assert.equal(reportLimits([...Array(7).fill(500), 9000])[7], 3000);
+  const wide = formatReports(Array.from({ length: 16 }, (_, i) => report(`r${i}`, { text: "y\n".repeat(4000) })));
+  assert.equal(wide.views.length, 16);
+  assert.ok(wide.text.length < 16 * 1000, `batch text is ${wide.text.length} chars`);
+});
+
+test("reports show edited files relative to the parent cwd, overlaps, and partial runs", () => {
+  const text = formatReport(report("r", { partial: true, files: ["/tmp/src/a.ts", "/elsewhere/b.ts"], overlaps: { "/tmp/src/a.ts": ["x", "y"] } }), 3000, "/tmp");
+  assert.equal(text, "[subagent r done partial 1s 1k tok]\nedited: src/a.ts, /elsewhere/b.ts\noverlap: src/a.ts (x, y)\nr ok");
+  const many = formatReport(report("r", { files: Array.from({ length: 15 }, (_, i) => `/tmp/f${i}.ts`) }), 3000, "/tmp");
+  assert.match(many, /^edited: f0\.ts, .*f11\.ts, \+3 more$/m);
+  // Reports from a manager adopted across /reload may lack the new fields.
+  assert.equal(formatReport(report("r")), "[subagent r done 1s 1k tok]\nr ok");
 });
 
 test("formatStarted groups names by state and shows resolved models compactly", () => {

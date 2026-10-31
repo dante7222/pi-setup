@@ -47,6 +47,16 @@ test("collapsed reports come from details, so body look-alike lines stay body te
   assert.equal(long.length, 2 + 160);
 });
 
+test("edited files and overlaps render under the header", () => {
+  const view = { reports: [{ header: "[subagent w done 5s 2k tok]", state: "done", edited: "src/a.ts, src/b.ts", overlap: "src/a.ts (x)", body: "done" }] };
+  assert.deepEqual(plain(renderReports(view, false, theme)).split("\n"), [
+    "[subagent w done 5s 2k tok]",
+    "edited: src/a.ts, src/b.ts",
+    "overlap: src/a.ts (x)",
+    "⎿ done",
+  ]);
+});
+
 test("results: wait reports use details; others collapse to their first line", () => {
   const options = { expanded: false, isPartial: false, isError: false };
   assert.match(plain(renderResultText("ignored", details, options, theme)), /⎿ First finding line/);

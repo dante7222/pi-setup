@@ -13,6 +13,8 @@
 //   "reject ..."         refuse the prompt with an error response
 //   "...slowclear..."    delay the clear_queue reply by 600ms (abort/settle race)
 //   "orphan ..."         spawn a same-group child ignoring SIGTERM, then exit 1
+//   "edit:<path>"        an edit tool call on <path> at run start (any number of them)
+//   "editfail:<path>"    an edit tool call on <path> that fails
 // Replies echo the prompt, steering, history and argv for assertions.
 import { spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
@@ -58,6 +60,11 @@ async function run(message) {
     process.exit(1);
   }
   const slow = /slow:(\d+)/.exec(message);
+  for (const [, kind, path] of message.matchAll(/\b(edit|editfail):(\S+)/g)) {
+    const toolCallId = `e${Math.random().toString(36).slice(2)}`;
+    out({ type: "tool_execution_start", toolName: "edit", toolCallId, args: { path, edits: [] } });
+    out({ type: "tool_execution_end", toolName: "edit", toolCallId, isError: kind === "editfail" });
+  }
   out({ type: "tool_execution_start", toolName: "bash", toolCallId: "t1", args: {} });
   // A partial answer before the slow part, so aborted runs have text to keep.
   if (slow) out({ type: "message_end", message: { ...assistant("partial progress", "toolUse"), content: [{ type: "text", text: "partial progress" }, { type: "toolCall", id: "t1" }] } });
