@@ -22,6 +22,13 @@ const GIT_BRANCH_ICON_NERD = "";
 const GIT_BRANCH_ICON_FALLBACK = "⎇";
 const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
+// Claude Code's spinner star (macOS glyph set): out and back, one frame per
+// 120 ms. Every glyph is one column wide, so the line never shifts.
+const STAR_GLYPHS = ["·", "✢", "✳", "✶", "✻", "✽"];
+export const STAR_FRAMES = [...STAR_GLYPHS, ...[...STAR_GLYPHS].reverse()];
+export const STAR_FRAME_MS = 120;
+const STAR_IDLE = "✻";
+
 const THINKING_COLORS: Record<string, ThemeColor> = {
   off: "thinkingOff",
   minimal: "thinkingMinimal",
@@ -136,7 +143,7 @@ function statusSegmentPriority(id: string): number {
   if (id === "tps" || id === "ttft") return 65;
   if (id === "thinking") return 55;
   if (id === "git") return 45;
-  if (id === "pi") return 20;
+  if (id === "star") return 20;
   return 0;
 }
 
@@ -261,9 +268,8 @@ function buildLeftSegments(
       const content = truncateToWidth(sanitizeStatusText(status), 28, "…");
       return content ? [{ id: `status:${key}`, content: `${content}${RESET_ALL}` }] : [];
     });
-  const segments: StatusSegment[] = [
-    { id: "pi", content: tone(theme, "pi", theme.bold("π")) },
-  ];
+  const star = state.starFrame === undefined ? STAR_IDLE : STAR_FRAMES[state.starFrame] ?? STAR_IDLE;
+  const segments: StatusSegment[] = [{ id: "star", content: tone(theme, "star", star) }];
   if (scrollIndicator) {
     segments.push({ id: "scroll", content: theme.fg("warning", scrollIndicator) });
   }

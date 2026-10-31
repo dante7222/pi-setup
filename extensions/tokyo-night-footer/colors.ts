@@ -13,7 +13,7 @@ const TOKYO_NIGHT_SESSION_ACCENTS = [
 ] as const;
 
 type StatusTone =
-  | "pi"
+  | "star"
   | "model"
   | "fast"
   | "path"
@@ -24,7 +24,8 @@ type StatusTone =
   | "separator";
 
 const TOKYO_NIGHT_TONES: Record<StatusTone, string> = {
-  pi: "#7dcfff",
+  // Claude Code's spinner colour ("claude") in the matching Tokyo Night theme.
+  star: "#bb9af7",
   model: "#bb9af7",
   fast: "#7dcfff",
   path: "#7dcfff",
@@ -36,7 +37,7 @@ const TOKYO_NIGHT_TONES: Record<StatusTone, string> = {
 };
 
 const SEMANTIC_TONES: Record<StatusTone, ThemeColor> = {
-  pi: "borderAccent",
+  star: "accent",
   model: "customMessageLabel",
   fast: "accent",
   path: "borderAccent",

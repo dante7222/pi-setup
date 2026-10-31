@@ -32,6 +32,8 @@ import {
   LEGACY_SESSION_NAME_STATUS_KEY,
   LEGACY_TPS_STATUS_KEY,
   PRIME_AGENT_WIDGET_KEY,
+  STAR_FRAME_MS,
+  STAR_FRAMES,
   updatePrimeAgentWidget,
 } from "./status-line.ts";
 import {
@@ -56,6 +58,7 @@ const MAX_TITLE_ATTEMPTS = 3;
 
 export default function (pi: ExtensionAPI): void {
   const state: StatusLineState = {
+    starFrame: undefined,
     latestTps: undefined,
     latestTtftMs: undefined,
     contextEstimate: undefined,
@@ -80,6 +83,12 @@ export default function (pi: ExtensionAPI): void {
     titleGenerationAttempts: 0,
   };
   let requestRender: (() => void) | undefined;
+  let starTimer: ReturnType<typeof setInterval> | undefined;
+  const stopStar = () => {
+    clearInterval(starTimer);
+    starTimer = undefined;
+    state.starFrame = undefined;
+  };
   let requestHeadersObserved = false;
   let requestClockLocked = false;
   const bashRefreshTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -167,6 +176,7 @@ export default function (pi: ExtensionAPI): void {
     disposeGitStatus(state.gitStatus);
     for (const timer of bashRefreshTimers) clearTimeout(timer);
     bashRefreshTimers.clear();
+    stopStar();
     state.latestTps = undefined;
     state.latestTtftMs = undefined;
     state.contextEstimate = undefined;
@@ -224,7 +234,19 @@ export default function (pi: ExtensionAPI): void {
       state.footerData = footerData;
       const unsubscribe = footerData.onBranchChange(branchChanged);
 
+      // The star spins all the time, like Claude Code's spinner. pi-tui redraws
+      // only the changed border line, and its own loader ticks at 80 ms.
+      stopStar();
+      state.starFrame = 0;
+      const timer = setInterval(() => {
+        state.starFrame = ((state.starFrame ?? 0) + 1) % STAR_FRAMES.length;
+        tui.requestRender();
+      }, STAR_FRAME_MS);
+      timer.unref();
+      starTimer = timer;
+
       return new EmptyFooter(() => {
+        if (starTimer === timer) stopStar();
         unsubscribe();
         if (state.footerData === footerData) state.footerData = undefined;
         if (requestRender === render) requestRender = undefined;
@@ -557,6 +579,7 @@ export default function (pi: ExtensionAPI): void {
     state.titleGenerationInFlight = false;
     for (const timer of bashRefreshTimers) clearTimeout(timer);
     bashRefreshTimers.clear();
+    stopStar();
     state.primeAgentContext?.ui.setWidget(PRIME_AGENT_WIDGET_KEY, undefined, {
       placement: "belowEditor",
     });

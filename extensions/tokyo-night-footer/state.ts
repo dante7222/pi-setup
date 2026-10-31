@@ -4,6 +4,8 @@ import type { GitStatusTracker } from "./git-status.ts";
 
 /** Footer state shared by the status line, editor and context tracker. */
 export interface StatusLineState {
+  /** Spinner star frame; undefined where nothing animates it (Prime Agent widget). */
+  starFrame: number | undefined;
   latestTps: number | undefined;
   latestTtftMs: number | undefined;
   contextEstimate: ContextTokenEstimate | undefined;
