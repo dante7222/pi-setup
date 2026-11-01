@@ -24,6 +24,7 @@ Included now:
 - **Web Access Toggle** extension (`extensions/web-access-toggle/index.ts`)
 - **Visual Explainer Toggle** extension (`extensions/visual-explainer-toggle/index.ts`)
 - **Subagents** extension (`extensions/subagents/index.ts`)
+- **Schedule** extension (`extensions/schedule/index.ts`)
 
 ## Bash timeout
 
@@ -131,13 +132,41 @@ Worker sessions and report files under `~/.pi/agent/subagents/` are not deleted 
 
 `test/live/subagents-smoke.mjs` exercises run, follow-up, steering and stopping against the installed Pi. `test/live/run-tasks.mjs` runs a JSON task list with the same manager outside a Pi session.
 
+## Schedule
+
+`/schedule` runs prompts later or on a schedule. It registers only the command: no tool, prompt snippet or system-prompt text, so it costs no context until a job fires.
+
+```
+/schedule in 20m check CI on this branch                 # session job
+/schedule bg daily 9:00 summarize yesterday's commits    # background job, cwd = current directory
+/schedule bg --timeout 10m --tools read,grep --no-catchup weekdays 18:00 ...
+/schedule                                                # selector: run now, pause/resume, delete, show runs, open last run session
+/schedule list | run|rm|pause|resume|log <id> | doctor
+```
+
+Timing is local time and comes first; everything after it is the prompt. The grammar reads common phrasings directly:
+
+- one-shot: `in 20m`, `in 20 minutes`, `in an hour`, `in 1 hour 30 minutes`, `at 5pm`, `5 am`, `noon`, `today 6pm`, `tomorrow at 9:30pm`, `friday 3pm` (the next Friday), `next sunday 9am`, `on 2026-12-01 10:00`
+- recurring: `everyday 5 am`, `every day at 5am`, `5am every day`, `weekdays 9:00`, `every weekday at 9am`, `weekends 11am`, `mondays 9am`, `every monday at 10:30`, `every 2 hours` (minimum 1m), `every hour`, `hourly`, `cron "*/15 9-17 * * 1-5"` (5 fields)
+
+A bare hour is ambiguous and not read by the grammar (`at 9` could be 9am or 9pm). Anything else (`on the first of every month at 9 …`, `at 5pm every other day …`, `mondays and thursdays at 9am …`, `tomorrow morning …`) goes to the current model in one separate request with low reasoning, outside the conversation: nothing is added to the session or its context. The model returns only the timing, in the grammar's canonical forms, plus the exact timing words it read; the grammar validates the timing, and the prompt is your own text minus those words, so the model cannot reword or extend the task. A confirmation dialog shows the schedule, its next runs with weekday names, and the prompt before anything is saved. Without a UI, unknown timing is an error. A parse that leaves timing words at the start of the prompt (`daily 9am except weekends`, `at 5pm next week`, `at 17:00 UTC`) is treated as unknown, so the grammar never silently drops part of a timing. The "Scheduled" notice repeats the prompt so a misread is visible. Prompts go through prompt-template and skill expansion like typed input.
+
+**Session jobs** belong to the Pi window and session that created them. A 15-second timer sends the prompt into the conversation as a user message, only while Pi is idle; a job that came due while busy or asleep fires once, then moves to its next slot (no catch-up). Jobs are saved as a custom session entry (never sent to the model), so they survive `/reload` and come back when the session is resumed; one-shots more than five minutes overdue when the session comes back are dropped with a notice. Pi writes a session file only after its first message, so a job scheduled in a fresh window is lost if Pi closes before then (the notice says so). A new session, a fork or a clone does not get them.
+
+**Background jobs** live in `~/.pi/agent/schedule/jobs.json` and run even when Pi is closed. One LaunchAgent (`~/Library/LaunchAgents/dev.ventris.pi-schedule.plist`, label `dev.ventris.pi-schedule`) starts `extensions/schedule/dispatch.ts` under plain node every 60 seconds and at login. Options go right after `bg`, before the timing (`--tools read`, `--tools=read`); an option after the timing is an error rather than prompt text. A due job runs as `pi -p --session-id <uuid> --name "schedule <id>: …"` in the job's directory, with the model and thinking level that were active when it was created, and is saved as a normal session in that directory's `/resume` list. When it finishes, a macOS notification shows the status and the start of the answer; `/schedule log <id>` lists recent runs with their `pi --session` commands. Runs time out after 30 minutes by default (whole process group). A run that would overlap the previous one is skipped and recorded, not queued; a run cut short by logout or shutdown is recorded as interrupted. If the Mac was off or asleep, only the latest missed slot of a recurring job runs once (within 7 days); a one-shot catches up only within an hour, otherwise it is recorded as missed. `--no-catchup` turns catch-up off. Resuming a paused recurring job does not catch up the slots it skipped; a resumed one-shot keeps its time.
+
+The LaunchAgent is installed with the first background job. Once none remain, it is removed by the next `/schedule` change, interactive Pi start or `/schedule doctor`. It pins absolute paths to the node and Pi CLI the creating Pi runs under, plus `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `PATH` and `PI_CODING_AGENT_DIR`. API keys, proxy settings and other environment variables are not copied, so background runs authenticate through `~/.pi/agent/auth.json` (`/login`); `/schedule bg` warns when the current provider's key comes from an environment variable. Each interactive Pi start re-installs a missing or broken agent (for example after an nvm upgrade removed the pinned node). `/schedule doctor` shows the launchd state and the end of `logs/dispatch.log` (ticks and run outcomes), and repairs the agent. Background runs are unattended: they use the normal tool set unless `--tools` restricts it, and load project extensions and skills only in trusted directories (saved with `/trust`, or all of them with `defaultProjectTrust: "always"`). macOS lists the agent under System Settings > Login Items; switching it off there stops background jobs.
+
+macOS setup notes: launchd does not wake a sleeping Mac, so a job due while it sleeps runs at wake (catch-up above). To run on time, keep the Mac awake on power: System Settings > Battery > Options > "Prevent automatic sleeping on power adapter when the display is off", or `sudo pmset -c sleep 0`. A closed lid without an external display still sleeps. Each run holds `caffeinate -i` until it ends, so idle sleep cannot cut it off. Notifications come from Script Editor (`osascript`), so allow it in System Settings > Notifications if none appear. Jobs in `~/Documents`, `~/Desktop` or `~/Downloads` may fail with "Operation not permitted" until the pinned node binary is granted access under Privacy & Security > Files and Folders (or Full Disk Access).
+
 ## Local development
 
 The active `pi` executable on `PATH` is the development-runtime source of truth. `npm test` and `npm run typecheck` first run the runtime synchronizer, which skips this project's `node_modules/.bin`, reads the exact `pi-ai`, `pi-coding-agent`, `pi-tui`, and TypeBox versions bundled with the active Pi installation and synchronizes the exact local development dependencies and lockfile. Without an external Pi executable, validation uses the committed local pins without network access. Published compatibility remains expressed through `"*"` peer ranges. After upgrading Pi, the next local validation updates `package.json` and `package-lock.json`; review and commit those generated changes. Set `PI_RUNTIME_BIN` to an explicit Pi executable when testing a non-default installation.
 
-Install this checkout globally by path:
+Install this checkout globally by path. Pi does not install dependencies for local packages, so run `npm install` first (the schedule extension needs `cron-parser`):
 
 ```bash
+npm install
 pi install "$PWD"
 ```
 
