@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Minimal stand-in for `pi --mode rpc`, modelled on Pi 1.3.0 semantics:
+// Minimal stand-in for `pi --mode rpc`, modelled on Pi 1.5.0 semantics:
 // - `prompt` replies after preflight; `prompt` with streamingBehavior queues while
 //   running and starts a run while idle; a bare prompt while running fails.
 // - `abort` is a no-op before agent_start and otherwise replies after settlement.
@@ -11,6 +11,10 @@
 //   "crash ..."          exit with code 3 mid-run, after writing to stderr
 //   "ignoreterm ..."     ignore SIGTERM (cleanup escalation)
 //   "reject ..."         refuse the prompt with an error response
+//   "...consume..."      report the prompt as handled by an extension, without a run
+//   "slowsteer:<ms>"     delay steering before queueing (async input-handler race)
+//   "...rejectsteer..."  reject the steering request without queueing it
+//   "...rejectclear..."  reject clear_queue without clearing it
 //   "...slowclear..."    delay the clear_queue reply by 600ms (abort/settle race)
 //   "orphan ..."         spawn a same-group child ignoring SIGTERM, then exit 1
 //   "edit:<path>"        an edit tool call on <path> at run start (any number of them)
@@ -88,6 +92,7 @@ let preflighting = false;
 async function prompt(command, reply) {
   // Like Pi while compacting: refuse any prompt with an error response.
   if (command.message.startsWith("reject")) { out({ id: command.id, type: "response", command: "prompt", success: false, error: "Cannot submit a prompt while compaction is in progress." }); return; }
+  if (command.message.includes("consume")) { reply({ disposition: "handled" }); return; }
   // Pi is already busy during preflight: a bare prompt is rejected, a steer is queued.
   if (running || preflighting) {
     if (!command.streamingBehavior) { out({ id: command.id, type: "response", command: "prompt", success: false, error: "Agent is already processing." }); return; }
@@ -101,6 +106,18 @@ async function prompt(command, reply) {
   void run(command.message);
 }
 
+async function steer(command, reply) {
+  // Pi awaits input handlers before queueing; later commands can overtake this one.
+  const slow = /slowsteer:(\d+)/.exec(lastPrompt);
+  if (slow) await delay(Number(slow[1]));
+  if (lastPrompt.includes("rejectsteer")) {
+    out({ id: command.id, type: "response", command: "steer", success: false, error: "Steering rejected." });
+    return;
+  }
+  steering.push(command.message);
+  reply({ disposition: "queued" });
+}
+
 const decoder = new StringDecoder("utf8");
 let buffer = "";
 process.stdin.on("data", (chunk) => {
@@ -111,12 +128,19 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.slice(index + 1);
     const command = JSON.parse(line);
     record({ command });
-    const reply = (data) => out({ id: command.id, type: "response", command: command.type, success: true, ...(data ? { data } : {}) });
+    const reply = (data) => {
+      record({ replied: command.type });
+      out({ id: command.id, type: "response", command: command.type, success: true, ...(data ? { data } : {}) });
+    };
     switch (command.type) {
       case "extension_ui_response": dialogResolve?.(); break;
       case "prompt": void prompt(command, reply); break;
-      case "steer": steering.push(command.message); reply({ disposition: "queued" }); break;
+      case "steer": void steer(command, reply); break;
       case "clear_queue": {
+        if (lastPrompt.includes("rejectclear")) {
+          out({ id: command.id, type: "response", command: "clear_queue", success: false, error: "Queue clearing rejected." });
+          break;
+        }
         const cleared = { steering, followUp: [] };
         steering = [];
         if (lastPrompt.includes("slowclear")) setTimeout(() => reply(cleared), 600);

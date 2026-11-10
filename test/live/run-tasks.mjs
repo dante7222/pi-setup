@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { text } from "node:stream/consumers";
 import { fileURLToPath } from "node:url";
-import { formatReport } from "../../extensions/subagents/index.ts";
+import { formatReport } from "../../extensions/subagents/report.ts";
 import { SubagentManager } from "../../extensions/subagents/manager.ts";
 import { validateTasks } from "../../extensions/subagents/tasks.ts";
 

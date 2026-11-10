@@ -1,4 +1,6 @@
-import { resolve } from "node:path";
+import { statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
 export const ROLES = {
   worker: "Complete the assigned task. Report changes, validation and remaining risks.",
@@ -36,10 +38,14 @@ export interface Task {
   model?: string;
   thinking?: Thinking;
   cwd: string;
+  /** The parent's trust decision for `cwd`, when the worker runs in the parent's project. */
+  trusted?: boolean;
 }
 
 export interface Defaults {
   cwd: string;
+  /** Whether the parent trusts the project at `cwd`. */
+  trusted?: boolean;
   /** Parent model as `provider/id`. */
   model?: string;
   thinking?: Thinking;
@@ -47,7 +53,13 @@ export interface Defaults {
   resolveModel(pattern: string): string;
 }
 
-export const NAME_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
+export const NAME = "[a-z][a-z0-9-]{0,31}";
+const NAME_PATTERN = new RegExp(`^${NAME}$`);
+
+/** `~` and `~/x` as the home directory, like Pi's tools. */
+export function expandHome(path: string): string {
+  return path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+}
 
 export function validateTasks(inputs: readonly TaskInput[], defaults: Defaults, taken: ReadonlySet<string>): Task[] {
   const names = new Set<string>();
@@ -68,7 +80,12 @@ export function validateTasks(inputs: readonly TaskInput[], defaults: Defaults, 
     // An explicit model drops inherited thinking: levels are not portable across models.
     const model = modelPattern ? defaults.resolveModel(modelPattern) : defaults.model;
     const thinking = (input.thinking as Thinking | undefined) ?? suffixThinking ?? (modelPattern ? undefined : defaults.thinking);
-    return { name: input.name, task: input.task, role, model, thinking, cwd: resolve(defaults.cwd, input.cwd ?? ".") };
+    const cwd = resolve(defaults.cwd, expandHome(input.cwd?.trim() || "."));
+    // A missing cwd would surface as a spawn ENOENT that names the node binary.
+    if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`cwd for "${input.name}" is not a directory: ${cwd}`);
+    // A headless worker cannot ask, so an undecided project would load without its .pi resources
+    // even when the parent trusts it for this session. Elsewhere Pi decides on its own.
+    return { name: input.name, task: input.task, role, model, thinking, cwd, ...(cwd === resolve(defaults.cwd) && defaults.trusted !== undefined ? { trusted: defaults.trusted } : {}) };
   });
 }
 
@@ -90,6 +107,7 @@ export function rpcArgs(task: Task, session: { id: string; dir: string }, prompt
   const args = ["--mode", "rpc", "--session-dir", session.dir, "--session-id", session.id, "--name", task.name];
   if (task.model) args.push("--model", task.model);
   if (task.thinking) args.push("--thinking", task.thinking);
+  if (task.trusted !== undefined) args.push(task.trusted ? "--approve" : "--no-approve");
   // Workers never orchestrate. Extensions still load in read-only roles (e.g. bash
   // timeouts); the allowlist only drops their tools.
   if (READ_ONLY_ROLES.has(task.role)) args.push("--no-skills", "--no-mcp", "--tools", READ_ONLY_TOOLS.join(","));

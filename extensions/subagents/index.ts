@@ -1,11 +1,10 @@
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { SubagentManager, type Worker } from "./manager.ts";
-import { ROLES, THINKING_LEVELS, validateTasks, type Defaults, type Thinking } from "./tasks.ts";
+import { ROLES, THINKING_LEVELS, validateTasks, type Defaults } from "./tasks.ts";
 import { renderCallLine, renderReports, renderResultText, reportDetails, type ReportDetails } from "./render.ts";
 import { formatReports } from "./report.ts";
 import { renderWidget, shortModelName, widgetCounts, type WidgetRow } from "./widget.ts";
@@ -17,6 +16,8 @@ const DELIVERY_RETRY_MS = 2000;
 const ADOPT_DEADLINE_MS = 60_000;
 /** Finished subagents stay in the widget this long. */
 const LINGER_MS = 5000;
+/** Bound for the blocking wait of one-shot modes; every run ends at its own deadline well before. */
+const ONE_SHOT_WAIT_S = 24 * 3600;
 const promptExtension = fileURLToPath(new URL("./worker-prompt.ts", import.meta.url));
 
 // Managers outlive an extension reload: /reload must not kill running subagents.
@@ -35,16 +36,27 @@ const detached = globals[MANAGERS_KEY] ??= new Map();
 // `/subagents auto` lasts for the Pi process, including across /reload.
 const settings = globals[SETTINGS_KEY] ??= { autoWake: true };
 
+/** Match Pi's loader shim: plain provider-friendly enums with TypeBox inference, also outside Pi. */
+function StringEnum<T extends readonly string[]>(values: T, options?: { description?: string; default?: T[number] }) {
+  return Type.Unsafe<T[number]>({
+    type: "string",
+    enum: values,
+    ...(options?.description && { description: options.description }),
+    ...(options?.default && { default: options.default }),
+  });
+}
+
 const parameters = Type.Object({
   action: StringEnum(["run", "send", "wait", "stop", "list"] as const),
   tasks: Type.Optional(Type.Array(Type.Object({
     name: Type.String({ description: "Unique lowercase slug, e.g. review-auth" }),
-    task: Type.String({ description: "Self-contained instructions; the subagent has no parent history" }),
+    task: Type.String({ description: "Self-contained (no parent history): paths, change, acceptance criteria" }),
     role: Type.Optional(StringEnum(Object.keys(ROLES) as (keyof typeof ROLES)[], { description: "reviewer/explorer: read-only" })),
     model: Type.Optional(Type.String({ description: "provider/id, unique id, optional :thinking; omit to inherit" })),
     thinking: Type.Optional(StringEnum(THINKING_LEVELS)),
     cwd: Type.Optional(Type.String()),
   }), { minItems: 1, maxItems: 16 })),
+  context: Type.Optional(Type.String({ description: "run: background for all tasks" })),
   name: Type.Optional(Type.String({ description: "send: target subagent" })),
   message: Type.Optional(Type.String({ description: "send: message text" })),
   names: Type.Optional(Type.Array(Type.String(), { description: "wait/stop: targets; omit for all" })),
@@ -263,8 +275,8 @@ export default function subagents(pi: ExtensionAPI): void {
     description: "Background Pi subagents. send steers a running subagent or continues a finished one with its history; stop aborts. {report:name} in a task or message inserts that subagent's full latest report.",
     promptSnippet: "Delegate independent tasks to background Pi subagents",
     promptGuidelines: [
-      "Use the subagents tool for independent work; give each task paths and acceptance criteria. Avoid overlapping file edits.",
-      "Reports from one subagents run arrive together as one message; meanwhile continue or end your turn. Use wait only when blocked.",
+      "Use the subagents tool for independent work. Avoid overlapping file edits.",
+      "Reports from one subagents run arrive together as one message; meanwhile continue or end your turn. Use wait only when blocked. Never guess a result; verify reported edits in the diff.",
     ],
     parameters,
     // An orchestrating tool: declared to the model, not callable from codemode scripts.
@@ -280,18 +292,31 @@ export default function subagents(pi: ExtensionAPI): void {
       ctx = current;
       try {
         const workers = ensure(current);
+        // Print and JSON modes exit once the prompt settles, which would kill background
+        // subagents before any report: there run and send return the reports themselves.
+        const oneShot = current.mode === "print" || current.mode === "json";
+        const waited = async (names: readonly string[], seconds: number, all: boolean) => {
+          const { reports, pending } = await workers.wait(names, seconds, signal, all);
+          const { text: body, views } = formatReports(reports, current.cwd);
+          const content = [body || "No new reports.", pending.length ? `pending: ${pending.join(", ")}` : ""].filter(Boolean).join("\n\n");
+          return text(content, false, { reports: views, pending });
+        };
         switch (params.action) {
           case "run": {
             if (!params.tasks?.length) throw new Error("run requires tasks.");
             const defaults: Defaults = {
               cwd: current.cwd,
+              trusted: current.isProjectTrusted(),
               model: current.model ? `${current.model.provider}/${current.model.id}` : undefined,
-              thinking: pi.getThinkingLevel() as Thinking,
+              thinking: pi.getThinkingLevel(),
               resolveModel: modelResolver(current),
             };
-            const created = workers.spawn(validateTasks(params.tasks, defaults, workers.busyNames()));
+            // In the message, not the system prompt: workers of one role keep an identical cacheable prefix.
+            const context = params.context?.trim();
+            const tasks = validateTasks(params.tasks, defaults, workers.busyNames());
+            const created = workers.spawn(context ? tasks.map((task) => ({ ...task, task: `${context}\n\n${task.task}` })) : tasks);
             for (const worker of created) runOwned.add(worker.task.name);
-            return text(formatStarted(created));
+            return oneShot ? await waited(created.map((worker) => worker.task.name), ONE_SHOT_WAIT_S, true) : text(formatStarted(created));
           }
           case "send": {
             if (!params.name || !params.message?.trim()) throw new Error("send requires name and message.");
@@ -299,14 +324,10 @@ export default function subagents(pi: ExtensionAPI): void {
             // Owned before awaiting: Esc during a slow steer reply must still stop it.
             runOwned.add(params.name);
             const outcome = await workers.send(params.name, params.message, signal);
-            return text(`${params.name}: ${outcome}`);
+            return oneShot ? await waited([params.name], ONE_SHOT_WAIT_S, true) : text(`${params.name}: ${outcome}`);
           }
-          case "wait": {
-            const { reports, pending } = await workers.wait(params.names ?? [], params.seconds ?? 120, signal, params.all === true);
-            const { text: body, views } = formatReports(reports, current.cwd);
-            const content = [body || "No new reports.", pending.length ? `pending: ${pending.join(", ")}` : ""].filter(Boolean).join("\n\n");
-            return text(content, false, { reports: views, pending });
-          }
+          case "wait":
+            return await waited(params.names ?? [], params.seconds ?? 120, params.all === true);
           case "stop": {
             const stopped = workers.stop(params.names ?? [...workers.workers.keys()]);
             return text(stopped.length ? `stopping: ${stopped.join(", ")}` : "Nothing to stop.");
@@ -337,7 +358,8 @@ export default function subagents(pi: ExtensionAPI): void {
         return;
       }
       if (command) { current.ui.notify("Usage: /subagents [stop [name|all] | auto on|off]", "warning"); return; }
-      const lines = [...(manager?.workers.values() ?? [])].map(describe);
+      // Cost is shown here only: the user sees it, and the model does not pay for it in every report.
+      const lines = [...(manager?.workers.values() ?? [])].map((worker) => `${describe(worker)} $${worker.total.cost.toFixed(2)}`);
       current.ui.notify(`${lines.join("\n") || "No subagents."}\nauto-wake: ${settings.autoWake ? "on" : "off"}`, "info");
     },
   });

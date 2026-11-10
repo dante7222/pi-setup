@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import subagents, { formatStarted } from "../extensions/subagents/index.ts";
 import { formatReport, formatReports, reportLimits } from "../extensions/subagents/report.ts";
 import { SubagentManager } from "../extensions/subagents/manager.ts";
+import workerPrompt from "../extensions/subagents/worker-prompt.ts";
 
 // Tests may themselves run inside a subagent, which sets this for its own process.
 delete process.env.PI_SUBAGENT;
@@ -21,11 +23,12 @@ function fakePi() {
   return { pi, registered };
 }
 
-function fakeCtx({ models = [], sessionId = "test-session", idle = true } = {}) {
+function fakeCtx({ models = [], sessionId = "test-session", idle = true, mode = "rpc" } = {}) {
   const state = { idle };
   return {
     state,
-    cwd: "/tmp", hasUI: false, mode: "print",
+    cwd: "/tmp", hasUI: false, mode,
+    isProjectTrusted: () => true,
     model: { provider: "p", id: "parent" },
     sessionManager: { getSessionId: () => sessionId },
     modelRegistry: { getAll: () => models, getAvailable: () => models },
@@ -66,10 +69,135 @@ test("registers one compact tool, a command and a report renderer", () => {
   assert.equal(tool.exposure, "model-only");
   // Keep the declaration small: the parent pays for it on every request.
   const size = JSON.stringify({ d: tool.description, p: tool.parameters, g: tool.promptGuidelines, s: tool.promptSnippet }).length;
-  assert.ok(size < 2700, `tool declaration is ${size} bytes`);
+  assert.ok(size < 1900, `tool declaration is ${size} bytes`);
   assert.deepEqual(registered.commands.map((c) => c.name), ["subagents"]);
   assert.deepEqual(registered.renderers, ["subagent-report"]);
   for (const event of ["session_start", "session_shutdown", "before_agent_start", "agent_settled"]) assert.ok(registered.handlers[event], event);
+});
+
+test("keeps provider-friendly enum schemas and optional task fields", () => {
+  const { tool } = loaded();
+  // Inspect exactly what is serialized for providers, not TypeBox's hidden metadata.
+  const schema = JSON.parse(JSON.stringify(tool.parameters));
+  assert.deepEqual(schema.required, ["action"]);
+  assert.deepEqual(schema.properties.action, { type: "string", enum: ["run", "send", "wait", "stop", "list"] });
+  const task = schema.properties.tasks.items;
+  assert.deepEqual(task.required, ["name", "task"]);
+  assert.deepEqual(task.properties.role, {
+    type: "string", enum: ["worker", "reviewer", "explorer", "tester"], description: "reviewer/explorer: read-only",
+  });
+  assert.deepEqual(task.properties.thinking, { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] });
+  assert.equal(schema.properties.context.type, "string");
+});
+
+/** A session whose manager is a process-free fake, injected through reload adoption. */
+function withFakeManager(t, sessionId, manager, options) {
+  globalThis[Symbol.for("ventris.pi-subagents.managers")].set(sessionId, { manager: { outbox: [], take: () => [], isReady: () => true, stop: () => [], workers: new Map(), setHooks() {}, dispose: async () => {}, busyNames: () => new Set(), ...manager }, interrupted: false, runOwned: new Set() });
+  const { pi, registered } = fakePi();
+  subagents(pi);
+  const ctx = fakeCtx({ sessionId, ...options });
+  registered.handlers.session_start({ type: "session_start", reason: "reload" }, ctx);
+  t.after(() => registered.handlers.session_shutdown({ type: "session_shutdown", reason: "quit" }));
+  return { ctx, registered, tool: registered.tools[0] };
+}
+
+test("run puts the shared context ahead of every task and passes the parent's trust on", async (t) => {
+  let spawned;
+  const { tool, ctx } = withFakeManager(t, "context", { spawn: (tasks) => { spawned = tasks; return tasks.map((task) => ({ task, state: "running" })); } });
+  const result = await tool.execute("id", { action: "run", context: " Repo uses pnpm. ", tasks: [{ name: "a", task: "Fix A" }, { name: "b", task: "Fix B", cwd: "/" }] }, undefined, undefined, ctx);
+  assert.equal(result.content[0].text, "started: a (p/parent:high), b (p/parent:high)");
+  assert.deepEqual(spawned.map((task) => task.task), ["Repo uses pnpm.\n\nFix A", "Repo uses pnpm.\n\nFix B"]);
+  assert.deepEqual(spawned.map((task) => task.trusted), [true, undefined]);
+  const empty = await tool.execute("id", { action: "run", context: "Shared", tasks: [{ name: "c", task: "  " }] }, undefined, undefined, ctx);
+  assert.match(empty.content[0].text, /Task for "c" is empty/, "context does not stand in for a task");
+});
+
+test("print and JSON modes return the reports from run and send, since nothing can arrive later", async (t) => {
+  for (const mode of ["print", "json"]) {
+    const waits = [];
+    const { tool, ctx } = withFakeManager(t, `one-shot-${mode}`, {
+      spawn: (tasks) => tasks.map((task) => ({ task, state: "running" })),
+      get: () => ({}),
+      send: async () => "started",
+      wait: async (names, seconds, _signal, all) => { waits.push({ names, seconds, all }); return { reports: names.map((name) => report(name)), pending: [] }; },
+    }, { mode });
+    const ran = await tool.execute("id", { action: "run", tasks: [{ name: "a", task: "x" }, { name: "b", task: "y" }] }, undefined, undefined, ctx);
+    assert.match(ran.content[0].text, /^\[subagent a done[\s\S]*\[subagent b done/);
+    assert.equal(ran.details.reports.length, 2);
+    const sent = await tool.execute("id", { action: "send", name: "a", message: "more" }, undefined, undefined, ctx);
+    assert.match(sent.content[0].text, /^\[subagent a done/);
+    assert.deepEqual(waits.map((wait) => [wait.names, wait.all]), [[["a", "b"], true], [["a"], true]]);
+    assert.ok(waits.every((wait) => wait.seconds * 1000 < 2 ** 31), "the wait timer must not overflow");
+  }
+});
+
+test("/subagents shows cost to the user; the model-facing list does not", async (t) => {
+  const worker = { task: { name: "a", role: "worker" }, state: "idle", total: { tokens: 12_000, cost: 0.456 } };
+  const { tool, ctx, registered } = withFakeManager(t, "cost", { workers: new Map([["a", worker]]) });
+  assert.equal((await tool.execute("id", { action: "list" }, undefined, undefined, ctx)).content[0].text, "a worker idle 12k");
+  const notices = [];
+  await registered.commands[0].command.handler("", { ...ctx, ui: { notify: (message) => notices.push(message) } });
+  assert.equal(notices[0], "a worker idle 12k $0.46\nauto-wake: on");
+});
+
+test("the worker extension asks once for a missing final report and stops idle cache warming", () => {
+  const { pi, registered } = fakePi();
+  process.env.PI_SUBAGENT = "1";
+  process.env.PI_SUBAGENT_PROMPT = "You are a worker subagent.";
+  try { workerPrompt(pi); } finally { delete process.env.PI_SUBAGENT; delete process.env.PI_SUBAGENT_PROMPT; }
+  const { before_agent_start: start, agent_before_settle: settle, cache_warming_decision: warming } = registered.handlers;
+  const assistant = (content, stopReason = "stop") => ({ role: "assistant", content, stopReason });
+  const boundary = (last, outcome = "completed") => ({ type: "agent_before_settle", entries: [{ type: "custom", customType: "other" }], continue: false, outcome, context: { contextMessages: [{ role: "user", content: "task" }, last, { role: "toolResult" }] } });
+  const begin = () => { const event = { systemPromptOptions: { sections: {} } }; start(event); return event; };
+  assert.equal(begin().systemPromptOptions.sections.subagent, "You are a worker subagent.");
+  assert.equal(settle(boundary(assistant([{ type: "text", text: "Done: all good." }]))), undefined, "a final text needs no reminder");
+  assert.equal(settle(boundary(assistant([], "error"), "error")), undefined, "a provider error is not retried here");
+  assert.equal(settle(boundary(assistant([], "aborted"), "aborted")), undefined);
+  const asked = settle(boundary(assistant([{ type: "toolCall", id: "t" }], "toolUse")));
+  assert.equal(asked.continue, true);
+  assert.deepEqual(asked.entries.map((entry) => entry.customType), ["other", "subagent-report-reminder"]);
+  assert.equal(asked.entries[1].display, false);
+  assert.equal(settle(boundary(assistant([{ type: "text", text: " " }]))), undefined, "only once per run");
+  begin();
+  assert.equal(settle(boundary(assistant([{ type: "text", text: "cut off" }], "length"))).continue, true, "a new run may be reminded again");
+  assert.deepEqual(warming({}, { isIdle: () => true }), { action: "stop" });
+  assert.equal(warming({}, { isIdle: () => false }), undefined, "during a run Pi decides");
+});
+
+test("Pi validates action, role and thinking enums without requiring optional fields", () => {
+  const { tool } = loaded();
+  const validate = (args) => validateToolArguments(tool, { type: "toolCall", id: "schema", name: tool.name, arguments: args });
+  for (const action of ["run", "send", "wait", "stop", "list"]) assert.deepEqual(validate({ action }), { action });
+  const task = { name: "schema", task: "Check schema" };
+  assert.deepEqual(validate({ action: "run", tasks: [task] }), { action: "run", tasks: [task] });
+  for (const role of ["worker", "reviewer", "explorer", "tester"]) {
+    assert.equal(validate({ action: "run", tasks: [{ ...task, role }] }).tasks[0].role, role);
+  }
+  for (const thinking of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+    assert.equal(validate({ action: "run", tasks: [{ ...task, thinking }] }).tasks[0].thinking, thinking);
+  }
+  assert.deepEqual(validate({ action: "run", tasks: [{ ...task, role: null, thinking: null }] }), { action: "run", tasks: [task] });
+  assert.throws(() => validate({}), /action:/);
+  assert.throws(() => validate({ action: "launch" }), /action:/);
+  assert.throws(() => validate({ action: "run", tasks: [{ ...task, role: "admin" }] }), /tasks\.0\.role:/);
+  assert.throws(() => validate({ action: "run", tasks: [{ ...task, thinking: "extreme" }] }), /tasks\.0\.thinking:/);
+});
+
+test("Pi coerces arguments without mutating the call and enforces task/wait limits", () => {
+  const { tool } = loaded();
+  const validate = (args) => validateToolArguments(tool, { type: "toolCall", id: "schema", name: tool.name, arguments: args });
+  const input = { action: "wait", seconds: "12", all: "true", names: "schema" };
+  assert.deepEqual(validate(input), { action: "wait", seconds: 12, all: true, names: ["schema"] });
+  assert.deepEqual(input, { action: "wait", seconds: "12", all: "true", names: "schema" });
+  assert.deepEqual(validate({ action: "wait", seconds: null }), { action: "wait" });
+  for (const seconds of [0, 1800]) assert.equal(validate({ action: "wait", seconds }).seconds, seconds);
+  for (const seconds of [-1, 1801, "not-a-number"]) assert.throws(() => validate({ action: "wait", seconds }), /seconds:/);
+  const task = { name: "schema", task: "Check schema" };
+  assert.deepEqual(validate({ action: "run", tasks: task }).tasks, [task]);
+  assert.equal(validate({ action: "run", tasks: Array(16).fill(task) }).tasks.length, 16);
+  for (const tasks of [[], Array(17).fill(task)]) assert.throws(() => validate({ action: "run", tasks }), /tasks:/);
+  assert.throws(() => validate({ action: "run", tasks: [{ task: "Check schema" }] }), /tasks\.0\.name:/);
+  assert.throws(() => validate({ action: "run", tasks: [{ name: "schema" }] }), /tasks\.0\.task:/);
 });
 
 test("does nothing inside a worker process", () => {
@@ -251,6 +379,8 @@ test("formatReport is compact and cuts a long single-line report with a path", (
   assert.match(long, /x…\n\[truncated line 1 of 1; full report: \/r\/r-1\.md \(read offset=1 limit=1\)\]$/);
   assert.match(formatReport(report("r", { state: "failed", text: "", error: "boom" })), /failed.*\nerror: boom$/);
   assert.ok(formatReport(report("r", { state: "failed", text: "", error: "e".repeat(100_000) })).length < 600);
+  // A long error keeps its start and its end: a stderr tail names the cause last.
+  assert.match(formatReport(report("r", { state: "failed", text: "", error: `Worker exited (1): ${"noise ".repeat(200)}Error: ENOSPC` })), /\nerror: Worker exited \(1\): noise .* \.\.\. .*noise Error: ENOSPC$/);
 });
 
 test("truncation keeps whole lines from the start and the end and names the omitted range", () => {

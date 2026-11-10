@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -20,7 +20,8 @@ async function setup(t, limits = {}) {
     promptExtension: "/prompt.ts",
     invocation: { command: process.execPath, prefix: [fake] },
     hooks: { changed() {}, report(report) { reports.push(report); } },
-    limits,
+    // A short shutdown grace keeps the tests of stuck processes fast.
+    limits: { closeGraceMs: 400, ...limits },
   });
   t.after(async () => { await manager.dispose(); await rm(dir, { recursive: true, force: true }); });
   const lines = async () => (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
@@ -72,6 +73,20 @@ test("rpcArgs gives read-only roles a small read-only loadout and keeps workers 
   assert.deepEqual(workerArgs.slice(workerArgs.indexOf("--exclude-tools"), workerArgs.indexOf("--exclude-tools") + 2), ["--exclude-tools", "subagents"]);
   assert.ok(!workerArgs.includes("--tools") && !workerArgs.includes("--no-skills"));
   assert.ok(args.includes("--session-id") && args.includes("--thinking"));
+});
+
+test("validateTasks expands ~, rejects a missing cwd, and passes the parent's trust only to workers in its project", () => {
+  const [home] = validateTasks([{ name: "h", task: "x", cwd: "~" }], defaults, new Set());
+  assert.equal(home.cwd, homedir());
+  assert.throws(() => validateTasks([{ name: "m", task: "x", cwd: "no-such-dir" }], defaults, new Set()), /cwd for "m" is not a directory: \/tmp\/no-such-dir/);
+  const [same, other] = validateTasks([{ name: "a", task: "x" }, { name: "b", task: "x", cwd: "~" }], { ...defaults, trusted: true }, new Set());
+  assert.equal(same.trusted, true);
+  assert.equal(other.trusted, undefined, "another directory is Pi's own decision");
+  const args = (task) => rpcArgs(task, { id: "s1", dir: "/d" }, "/p.ts");
+  assert.ok(args(same).includes("--approve") && !args(same).includes("--no-approve"));
+  assert.ok(args({ ...same, trusted: false }).includes("--no-approve"));
+  assert.ok(!args(other).some((arg) => arg.includes("approve")));
+  assert.ok(!args(home).some((arg) => arg.includes("approve")), "no decision without a parent context");
 });
 
 test("the worker system prompt depends on the role only", () => {
@@ -142,6 +157,86 @@ test("{report:name} inserts a finished subagent's full report into tasks and mes
   const { reports: [sent] } = await manager.wait(["b"], 10);
   assert.match(sent.text, /reply to: compare <report from="a">\nreply to: redo/);
   await assert.rejects(manager.send("b", "{report:ghost}"), /"ghost" has no finished report/);
+  // A backslash keeps the placeholder as text, e.g. in a task about this feature.
+  manager.spawn(tasks("c explain \\{report:nope} and \\{report:a}"));
+  const { reports: [c] } = await manager.wait(["c"], 10);
+  assert.match(c.text, /^reply to: explain \{report:nope\} and \{report:a\} \|/);
+});
+
+test("a task or message that starts with a slash is sent as text, not as a Pi command", async (t) => {
+  const { manager, lines } = await setup(t);
+  manager.spawn(tasks("s /skill:deploy slow:400 now"));
+  await delay(200);
+  assert.equal(await manager.send("s", "/compact please"), "steered");
+  const { reports: [report] } = await manager.wait(["s"], 10, undefined, true);
+  assert.equal(report.state, "done");
+  const prompts = (await lines()).filter((line) => line.command?.type === "prompt").map((line) => line.command.message);
+  assert.deepEqual(prompts, [" /skill:deploy slow:400 now", " /compact please"]);
+});
+
+test("a message consumed by a worker extension is an error, not a steer", async (t) => {
+  const { manager } = await setup(t);
+  manager.spawn(tasks("w slow:600 first"));
+  await delay(200);
+  await assert.rejects(manager.send("w", "consume this"), /did not reach the subagent/);
+  const { reports: [report] } = await manager.wait(["w"], 10, undefined, true);
+  assert.equal(report.state, "done");
+});
+
+test("a run that reaches its turn limit is steered to report, and ended when it keeps going", async (t) => {
+  const { manager } = await setup(t, { maxTurns: 1, wrapUpTurns: 5 });
+  manager.spawn(tasks("w slow:600 work"));
+  const { reports: [asked] } = await manager.wait(["w"], 10);
+  assert.equal(asked.state, "done");
+  assert.equal(asked.partial, true);
+  assert.match(asked.text, /history: slow:600 work \/ Your turn limit is almost reached/);
+  await manager.get("w").wrapUpCleanup;
+  manager.limits.wrapUpTurns = 0;
+  manager.spawn(tasks("x slow:5000 loop"));
+  const { reports: [ended] } = await manager.wait(["x"], 10);
+  assert.equal(ended.state, "failed");
+  assert.match(ended.error, /Stopped after 1 turns/);
+  assert.equal(ended.text, "partial progress");
+  assert.equal(manager.get("x").rpc?.alive, true, "an aborted run keeps its process and session");
+});
+
+test("only maxIdle finished workers keep a process, and stop frees the rest", async (t) => {
+  const { manager, lines } = await setup(t, { maxIdle: 1 });
+  manager.spawn(tasks("a slow:100 x", "b slow:300 x", "c slow:600 x"));
+  await collect(manager, 3);
+  const live = () => [...manager.workers.values()].filter((worker) => worker.rpc).map((worker) => worker.task.name);
+  assert.deepEqual(live(), ["c"], "the most recently finished keeps its process");
+  assert.deepEqual(manager.stop(["a", "b", "c"]), [], "nothing was running");
+  assert.deepEqual(live(), []);
+  // A closed worker is still continued from its session.
+  assert.equal(await manager.send("a", "again"), "started");
+  const { reports: [again] } = await manager.wait(["a"], 10, undefined, true);
+  assert.equal(again.state, "done");
+  const sessionOf = (argv) => argv[argv.indexOf("--session-id") + 1];
+  const spawned = (await lines()).filter((line) => line.argv).map((line) => sessionOf(line.argv));
+  assert.equal(spawned.length, 4);
+  assert.equal(spawned[3], manager.get("a").sessionId);
+});
+
+test("a closing process takes no request and is replaced, after it exited, for the next run", async (t) => {
+  const { manager, lines } = await setup(t);
+  manager.spawn(tasks("w first"));
+  await manager.wait(["w"], 10);
+  const worker = manager.get("w");
+  const rpc = worker.rpc;
+  // Closed but still attached, as when a stop closes a child whose settlement was already buffered.
+  const closing = rpc.close();
+  assert.equal(rpc.alive, false);
+  const started = Date.now();
+  await assert.rejects(rpc.request({ type: "get_state" }), /not running/);
+  assert.ok(Date.now() - started < 200, "rejected at once instead of timing out");
+  assert.equal(await manager.send("w", "again"), "started");
+  assert.equal(worker.rpc, undefined, "the next run waits for the old process");
+  const { reports: [report] } = await manager.wait(["w"], 10, undefined, true);
+  assert.equal(report.state, "done", report.error);
+  assert.match(report.text, /reply to: again/);
+  await closing;
+  assert.equal((await lines()).filter((line) => line.argv).length, 2);
 });
 
 test("a run near its deadline is steered to report, marked partial, and its queue cleared", async (t) => {
@@ -151,12 +246,195 @@ test("a run near its deadline is steered to report, marked partial, and its queu
   assert.equal(report.state, "done");
   assert.equal(report.partial, true);
   assert.match(report.text, /history: slow:2000 work \/ Your time limit is almost reached/);
+  // Reporting is immediate; the reuse barrier can still be clearing the queue.
+  await manager.get("w").wrapUpCleanup;
   const commands = (await lines()).filter((line) => line.command).map((line) => line.command.type);
   assert.ok(commands.indexOf("clear_queue") > commands.indexOf("steer"), commands.join(","));
   // The next run starts without a wrap-up flag.
   await manager.send("w", "quick");
   const { reports: [next] } = await manager.wait(["w"], 10);
   assert.equal(next.partial, undefined);
+});
+
+test("a continuation waits for delayed wrap-up steering and the queue-clear acknowledgement", async (t) => {
+  const { manager, lines } = await setup(t, { runTimeoutMs: 3000, wrapUpMs: 2500 });
+  manager.spawn(tasks("w slowsteer:800 slowclear slow:700 first"));
+  const { reports: [first] } = await manager.wait(["w"], 10);
+  assert.equal(first.state, "done");
+  assert.equal(first.partial, true);
+  await manager.send("w", "second");
+  const { reports: [second] } = await manager.wait(["w"], 10, undefined, true);
+  assert.equal(second.state, "done");
+  assert.doesNotMatch(second.text, /Your time limit is almost reached/);
+  const events = await lines();
+  const steered = events.findIndex((event) => event.replied === "steer");
+  const clearing = events.findIndex((event) => event.command?.type === "clear_queue");
+  const cleared = events.findIndex((event) => event.replied === "clear_queue");
+  const continued = events.findIndex((event) => event.command?.type === "prompt" && event.command.message === "second");
+  assert.ok(steered >= 0 && clearing > steered, "clear_queue must follow the steering acknowledgement");
+  assert.ok(cleared >= 0 && continued > cleared, "the continuation must follow the clear_queue acknowledgement");
+});
+
+test("messages sent after wrap-up queue locally until cleanup finishes", async (t) => {
+  const { manager, lines } = await setup(t, { runTimeoutMs: 3000, wrapUpMs: 0 });
+  manager.spawn(tasks("w slowsteer:800 slowclear slow:300 first"));
+  const worker = manager.get("w");
+  await worker.rpc.request({ type: "get_state" });
+  manager.wrapUp(worker);
+  assert.equal(await manager.send("w", "second"), "queued");
+  const all = await collect(manager, 2);
+  assert.deepEqual(all.map((report) => report.state), ["done", "done"]);
+  assert.equal(all[0].partial, true);
+  assert.equal(all[1].partial, undefined);
+  assert.doesNotMatch(all[1].text, /Your time limit is almost reached/);
+  const events = await lines();
+  const cleared = events.findIndex((event) => event.replied === "clear_queue");
+  const continued = events.findIndex((event) => event.command?.message === "second");
+  assert.ok(cleared >= 0 && continued > cleared);
+  assert.equal(events[continued].command.type, "prompt");
+});
+
+test("failed wrap-up steering or clearing discards the uncertain child before continuation", async (t) => {
+  for (const [name, trigger, timeoutCommand] of [
+    ["steer rejection", "rejectsteer", undefined],
+    ["steer timeout", "slowsteer:500", "steer"],
+    ["clear rejection", "rejectclear", undefined],
+    ["clear timeout", "slowclear", "clear_queue"],
+  ]) {
+    await t.test(name, async (t) => {
+      const { manager, lines } = await setup(t, { runTimeoutMs: 3000, wrapUpMs: 0 });
+      manager.spawn(tasks(`w slow:200 ${trigger} first`));
+      const worker = manager.get("w");
+      const rpc = worker.rpc;
+      await rpc.request({ type: "get_state" });
+      const request = rpc.request.bind(rpc);
+      rpc.request = (command, timeout) => request(command, command.type === timeoutCommand ? 50 : timeout);
+      manager.wrapUp(worker);
+      const { reports: [first] } = await manager.wait(["w"], 10);
+      assert.equal(first.state, "done", "cleanup must preserve the completed report");
+      await manager.send("w", "second");
+      const { reports: [second] } = await manager.wait(["w"], 10, undefined, true);
+      assert.equal(second.state, "done");
+      assert.doesNotMatch(second.text, /Your time limit is almost reached/);
+      assert.notEqual(worker.rpc, rpc);
+      assert.equal(rpc.alive, false, "the old process must close before session revival");
+      assert.equal((await lines()).filter((event) => event.argv).length, 2);
+    });
+  }
+});
+
+test("stopping a continuation blocked on wrap-up cleanup never submits its prompt", async (t) => {
+  const { manager, lines } = await setup(t, { maxRunning: 1, runTimeoutMs: 3000, wrapUpMs: 0 });
+  manager.spawn(tasks("w slowsteer:800 slow:200 first"));
+  const worker = manager.get("w");
+  await worker.rpc.request({ type: "get_state" });
+  manager.wrapUp(worker);
+  await manager.wait(["w"], 10);
+  await manager.send("w", "must not run");
+  manager.spawn(tasks("other quick"));
+  assert.equal(worker.state, "running", "cleanup retains the running-slot reservation");
+  assert.equal(manager.get("other").state, "queued", "cleanup cannot exceed maxRunning");
+  manager.stop(["w"]);
+  const all = await collect(manager, 2);
+  assert.deepEqual(all.map((report) => report.state), ["cancelled", "done"]);
+  assert.equal(worker.runs, 2);
+  assert.equal((await lines()).some((event) => event.command?.message === "must not run"), false);
+});
+
+test("stopping during successful cleanup cannot expose a closing child to a follow-up", async (t) => {
+  const { manager, lines } = await setup(t, { runTimeoutMs: 5000, wrapUpMs: 0 });
+  manager.spawn(tasks("w ignoreterm slow:200 slowclear first"));
+  const worker = manager.get("w");
+  const rpc = worker.rpc;
+  await rpc.request({ type: "get_state" });
+  manager.wrapUp(worker);
+  await manager.wait(["w"], 10);
+  await manager.send("w", "must not run");
+  manager.stop(["w"]);
+  const { reports: [cancelled] } = await manager.wait(["w"], 10);
+  assert.equal(cancelled.state, "cancelled");
+  await manager.send("w", "resume");
+  const { reports: [resumed] } = await manager.wait(["w"], 10, undefined, true);
+  assert.equal(resumed.state, "done");
+  assert.notEqual(worker.rpc, rpc);
+  assert.equal(rpc.alive, false);
+  const events = await lines();
+  assert.ok(events.some((event) => event.replied === "clear_queue"), "cleanup acknowledges before the old child exits");
+  assert.ok(events.some((event) => event.ignored === "SIGTERM"));
+  assert.equal(events.some((event) => event.command?.message === "must not run"), false);
+});
+
+test("replacing a worker during wrap-up cleanup leaves its successor untouched", async (t) => {
+  const { manager, lines } = await setup(t, { runTimeoutMs: 3000, wrapUpMs: 0 });
+  manager.spawn(tasks("w slowsteer:800 slow:200 first"));
+  const old = manager.get("w");
+  await old.rpc.request({ type: "get_state" });
+  manager.wrapUp(old);
+  await manager.wait(["w"], 10);
+  const cleanup = old.wrapUpCleanup;
+  assert.ok(cleanup);
+  const [replacement] = manager.spawn(tasks("w replacement"));
+  const { reports: [report] } = await manager.wait(["w"], 10);
+  await cleanup;
+  assert.equal(report.state, "done");
+  assert.equal(manager.get("w"), replacement);
+  assert.equal(replacement.rpc.alive, true);
+  assert.equal(replacement.runs, 1);
+  assert.equal((await lines()).filter((event) => event.argv).length, 2);
+  assert.deepEqual(manager.take(), [], "old cleanup must not produce another report");
+});
+
+test("disposing during wrap-up cleanup cannot revive a waiting continuation", async (t) => {
+  const { manager, lines } = await setup(t, { runTimeoutMs: 3000, wrapUpMs: 0 });
+  manager.spawn(tasks("w slowsteer:800 slow:200 first"));
+  const worker = manager.get("w");
+  await worker.rpc.request({ type: "get_state" });
+  manager.wrapUp(worker);
+  await manager.wait(["w"], 10);
+  const cleanup = worker.wrapUpCleanup;
+  await manager.send("w", "must not run");
+  await manager.dispose();
+  await cleanup;
+  assert.equal(worker.rpc, undefined);
+  assert.equal(worker.state, "stopped");
+  assert.equal((await lines()).some((event) => event.command?.message === "must not run"), false);
+  assert.deepEqual(await manager.wait([], 0), { reports: [], pending: [] });
+});
+
+test("idle shutdown is rearmed after wrap-up cleanup", async (t) => {
+  const { manager } = await setup(t, { runTimeoutMs: 3000, wrapUpMs: 0, idleMs: 20 });
+  manager.spawn(tasks("w slowsteer:400 slow:200 first"));
+  const worker = manager.get("w");
+  const rpc = worker.rpc;
+  await rpc.request({ type: "get_state" });
+  manager.wrapUp(worker);
+  await manager.wait(["w"], 10);
+  assert.ok(worker.wrapUpCleanup, "idle shutdown waits for cleanup");
+  await worker.wrapUpCleanup;
+  await rpc.exited;
+  assert.equal(worker.rpc, undefined);
+  assert.equal(worker.state, "idle");
+});
+
+test("wrap-up defers to an older ordinary steer and cannot contaminate the run it starts", async (t) => {
+  const { manager, lines } = await setup(t, { wrapUpMs: 0 });
+  manager.spawn(tasks("w first"));
+  await manager.wait(["w"], 10);
+  const worker = manager.get("w");
+  // Simulate a missed settlement, as in the ordinary steer-racing-settlement test.
+  worker.state = "running";
+  worker.runActive = true;
+  const sending = manager.send("w", "preflight:500 slow:300 second");
+  manager.wrapUp(worker);
+  assert.equal(worker.wrappedUp, false);
+  worker.state = "idle";
+  worker.runActive = false;
+  await sending;
+  const { reports: [second] } = await manager.wait(["w"], 10, undefined, true);
+  assert.equal(second.state, "done");
+  assert.equal(second.partial, undefined);
+  assert.doesNotMatch(second.text, /Your time limit is almost reached/);
+  assert.equal((await lines()).some((event) => event.command?.type === "steer"), false);
 });
 
 test("a launch that fails synchronously fails the run at once and keeps the queue moving", async (t) => {
@@ -270,7 +548,9 @@ test("stop during startup prevents the run instead of acknowledging a no-op abor
   // Wait past the point where the fake would have finished the run.
   await delay(800);
   const events = await lines();
-  assert.ok(!events.some((line) => line.command?.type === "abort"), "no abort is sent before agent_start");
+  // Closing a process sends its own abort, without an id; the manager requests none.
+  assert.ok(!events.some((line) => line.command?.type === "abort" && line.command.id), "no abort is requested before agent_start");
+  assert.ok(events.some((line) => line.command?.type === "abort" && !line.command.id), "close aborts ahead of stdin EOF");
   assert.equal(manager.get("s").rpc, undefined);
 });
 

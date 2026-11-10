@@ -13,6 +13,7 @@ export interface Invocation { command: string; prefix: string[] }
 export class RpcTimeoutError extends Error {}
 
 const STDERR_LIMIT = 4096;
+const CLOSE_GRACE_MS = 5000;
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
 
 // Every live worker process, across extension reloads. A single process-exit hook
@@ -50,11 +51,15 @@ export class RpcProcess {
   private stderr = "";
   private exitInfo: ExitInfo | undefined;
   private closing: Promise<void> | undefined;
+  private readonly graceMs: number;
   readonly exited: Promise<ExitInfo>;
 
-  constructor(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; invocation?: Invocation }, onEvent: (event: RpcEvent) => void) {
+  /** `graceMs`: how long `close` waits after stdin EOF before SIGTERM, and again before SIGKILL. */
+  constructor(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; invocation?: Invocation; graceMs?: number }, onEvent: (event: RpcEvent) => void) {
     const { command, prefix } = options.invocation ?? piInvocation();
-    // detached: a dedicated process group lets termination reach tool descendants.
+    this.graceMs = options.graceMs ?? CLOSE_GRACE_MS;
+    // detached: a dedicated process group lets termination reach the worker's descendants.
+    // Pi puts each bash call in a group of its own and stops those itself.
     this.child = spawn(command, [...prefix, ...args], { cwd: options.cwd, env: options.env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
     const live = liveProcesses();
     live.add(this);
@@ -71,7 +76,9 @@ export class RpcProcess {
       // the wait: a detached descendant may hold the pipes open indefinitely.
       this.child.once("close", (code, signal) => finish(code, signal));
       this.child.once("exit", (code, signal) => { setTimeout(() => finish(code, signal), 500).unref(); });
-      this.child.once("error", (error) => { this.appendStderr(`${error.message}\n`); finish(null, null); });
+      // 'error' also reports a failed kill; only a failed spawn (no pid) ends the process.
+      // Kept for the process lifetime: an 'error' without a listener would crash the parent.
+      this.child.on("error", (error) => { this.appendStderr(`${error.message}\n`); if (!this.child.pid) finish(null, null); });
     });
     // Strict LF framing: readline would also split on U+2028/U+2029 inside JSON strings.
     const decoder = new StringDecoder("utf8");
@@ -89,7 +96,8 @@ export class RpcProcess {
     this.child.stdin.on("error", () => {});
   }
 
-  get alive(): boolean { return !this.exitInfo; }
+  /** Takes requests: neither exited nor closing. A request to a closing process would wait out its timeout. */
+  get alive(): boolean { return !this.exitInfo && !this.closing && this.child.exitCode === null && this.child.signalCode === null; }
 
   private appendStderr(text: string): void {
     this.stderr = (this.stderr + text).slice(-STDERR_LIMIT);
@@ -119,7 +127,7 @@ export class RpcProcess {
   }
 
   private write(value: unknown): void {
-    if (this.alive && this.child.stdin.writable) this.child.stdin.write(`${JSON.stringify(value)}\n`);
+    if (this.child.stdin.writable) this.child.stdin.write(`${JSON.stringify(value)}\n`);
   }
 
   request<T = unknown>(command: Record<string, unknown> & { type: string }, timeoutMs = 30_000): Promise<T> {
@@ -136,7 +144,7 @@ export class RpcProcess {
   private signal(signal: NodeJS.Signals): void {
     if (!this.child.pid) return;
     try { process.kill(-this.child.pid, signal); } catch {
-      if (this.alive) try { this.child.kill(signal); } catch { /* already gone */ }
+      if (!this.exitInfo) try { this.child.kill(signal); } catch { /* already gone */ }
     }
   }
 
@@ -147,24 +155,32 @@ export class RpcProcess {
   }
 
   /**
-   * Graceful stdin EOF, then TERM and KILL for the whole process group until it is
+   * Abort and stdin EOF, then TERM and KILL for the whole process group until it is
    * empty, independent of when the leader exits. Idempotent.
    */
-  close(graceMs = 2000): Promise<void> {
+  close(): Promise<void> {
     return this.closing ??= (async () => {
       // Referenced timers: callers await this, and once the leader exited nothing else
-      // keeps the event loop alive. The whole sequence is bounded to a few seconds.
+      // keeps the event loop alive. The whole sequence is bounded by twice the grace.
       const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
       const settle = async (ms: number) => {
         const deadline = Date.now() + ms;
         while (this.groupAlive() && Date.now() < deadline) await sleep(50);
         return !this.groupAlive();
       };
+      // Abort ahead of EOF. On EOF, Pi 1.5.0 removes its signal handlers and aborts a run
+      // only after its shutdown handlers; a SIGTERM in between kills it before it stops the
+      // run's bash process groups, which are detached and outlive it.
+      this.write({ type: "abort" });
       this.child.stdin.end();
-      await Promise.race([this.exited, sleep(graceMs)]);
+      // Pi's shutdown also finishes pending writes such as a refreshed OAuth token, and a
+      // cut-off write breaks that login everywhere. Give it the full grace.
+      await Promise.race([this.exited, sleep(this.graceMs)]);
       if (this.groupAlive()) {
+        // Ends a stuck Pi 1.5.0 at once. Later versions ignore a single signal during
+        // shutdown (and stop their bash groups on it), hence the same grace before SIGKILL.
         this.signal("SIGTERM");
-        if (!await settle(1500)) {
+        if (!await settle(this.graceMs)) {
           this.signal("SIGKILL");
           await settle(1000);
         }

@@ -1,8 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { RpcProcess, RpcTimeoutError, type Invocation, type RpcEvent } from "./rpc.ts";
-import { rpcArgs, systemPrompt, type Task } from "./tasks.ts";
+import { expandHome, NAME, rpcArgs, systemPrompt, type Task } from "./tasks.ts";
 
 export type WorkerState = "queued" | "running" | "idle" | "failed" | "stopped";
 
@@ -41,9 +40,20 @@ export interface Limits {
   abortGraceMs: number;
   /** `send` stops waiting for a steer reply after this and reports "sent". */
   steerReplyMs: number;
+  /** Finished workers that keep their process for a fast `send`; beyond it the longest-idle process is closed. */
+  maxIdle: number;
+  /** Assistant turns per run after which the worker is steered to stop and report; 0 disables. */
+  maxTurns: number;
+  /** Turns a run may take after that steer before it is ended. */
+  wrapUpTurns: number;
+  /** A closing process gets this long to exit after stdin EOF before SIGTERM, and as long again before SIGKILL. */
+  closeGraceMs: number;
 }
 
-export const DEFAULT_LIMITS: Limits = { maxRunning: 6, runTimeoutMs: 30 * 60_000, wrapUpMs: 5 * 60_000, idleMs: 10 * 60_000, abortGraceMs: 10_000, steerReplyMs: 15_000 };
+export const DEFAULT_LIMITS: Limits = {
+  maxRunning: 6, runTimeoutMs: 30 * 60_000, wrapUpMs: 5 * 60_000, idleMs: 10 * 60_000, abortGraceMs: 10_000, steerReplyMs: 15_000,
+  maxIdle: 4, maxTurns: 150, wrapUpTurns: 10, closeGraceMs: 5000,
+};
 
 interface Usage { tokens: number; cost: number }
 
@@ -52,6 +62,8 @@ export class Worker {
   readonly sessionId: string;
   state: WorkerState = "queued";
   rpc: RpcProcess | undefined;
+  /** Processes of this worker that are still shutting down; a new one waits, so two never share the session. */
+  closing: Promise<void> | undefined;
   /** Message for the next run; also collects messages sent while a run is ending. */
   pendingPrompt: string;
   /** The child emitted agent_start for the current run (abort is effective only then). */
@@ -67,6 +79,8 @@ export class Worker {
   /** Tokens in the current context, from the latest response or compaction; survives runs. */
   contextTokens: number | undefined;
   runStarted = 0;
+  /** Assistant messages of the current run. */
+  turns = 0;
   run: Usage = { tokens: 0, cost: 0 };
   total: Usage = { tokens: 0, cost: 0 };
   lastAssistant: Record<string, unknown> | undefined;
@@ -76,8 +90,12 @@ export class Worker {
   readonly edited = new Set<string>();
   /** edit/write calls in flight by tool call id; a path counts once its call succeeded. */
   readonly pendingEdits = new Map<string, string>();
-  /** The current run was steered to wrap up before its deadline. */
+  /** The current run was steered to wrap up before its deadline or turn limit. */
   wrappedUp = false;
+  /** Acknowledgement that the wrap-up steer was processed, not merely written to stdin. */
+  wrapUpRequest: Promise<unknown> | undefined;
+  /** The previous run's wrap-up steer and queue clear must finish before another prompt. */
+  wrapUpCleanup: Promise<void> | undefined;
   report: Report | undefined;
   /** When the latest run ended; the widget shows finished workers briefly. */
   finishedAt: number | undefined;
@@ -113,14 +131,17 @@ function clearTimers(worker: Worker): void {
   worker.timer = worker.escalation = worker.wrapTimer = undefined;
 }
 
-const WRAP_UP_MESSAGE = "Your time limit is almost reached. Stop starting new work and reply now with your final report: what is done, what remains, and any risks.";
-/** `{report:name}` in a task or message; the name follows NAME_PATTERN. */
-const REPORT_REF = /\{report:([a-z][a-z0-9-]{0,31})\}/g;
+/** `{report:name}` in a task or message; a leading backslash keeps it as text. */
+const REPORT_REF = new RegExp(`(\\\\?)\\{report:(${NAME})\\}`, "g");
 
 /** Pi's edit/write path resolution: an optional leading @, ~ for home, otherwise relative to cwd. */
 function editedPath(path: string, cwd: string): string {
-  const bare = path.startsWith("@") ? path.slice(1) : path;
-  return resolve(cwd, bare === "~" ? homedir() : bare.startsWith("~/") ? join(homedir(), bare.slice(2)) : bare);
+  return resolve(cwd, expandHome(path.startsWith("@") ? path.slice(1) : path));
+}
+
+/** Pi runs a prompt that starts with "/" as a command, skill or template; a leading space keeps it a message. */
+function plain(message: string): string {
+  return message.startsWith("/") ? ` ${message}` : message;
 }
 
 function assistantText(message: Record<string, unknown> | undefined): string {
@@ -218,9 +239,10 @@ export class SubagentManager {
    * between subagents without the parent reading and restating them.
    */
   expand(text: string): string {
-    return text.replace(REPORT_REF, (_match, name: string) => {
+    return text.replace(REPORT_REF, (match, escaped: string, name: string) => {
+      if (escaped) return match.slice(1);
       const report = this.workers.get(name)?.report;
-      if (!report) throw new Error(`{report:${name}}: "${name}" has no finished report.`);
+      if (!report) throw new Error(`{report:${name}}: "${name}" has no finished report. For the literal text write \\{report:${name}}.`);
       return `<report from="${name}">\n${report.text}\n</report>`;
     });
   }
@@ -243,8 +265,8 @@ export class SubagentManager {
     const text = this.expand(message);
     const append = () => { worker.pendingPrompt = [worker.pendingPrompt, text].filter(Boolean).join("\n\n"); };
     // A queued worker, a run still starting (a second prompt could start a parallel
-    // run inside Pi's preflight), or a run being stopped takes the message next.
-    if (worker.state === "queued" || (worker.state === "running" && (!worker.runActive || worker.endReason || !worker.rpc?.alive))) {
+    // run inside Pi's preflight), or a run already wrapping up/stopping takes the message next.
+    if (worker.state === "queued" || (worker.state === "running" && (!worker.runActive || worker.wrappedUp || worker.endReason || !worker.rpc?.alive))) {
       append();
       return "queued";
     }
@@ -268,17 +290,18 @@ export class SubagentManager {
         // its preflight, which may compact first; a short deadline would misreport that.
         let data: { disposition?: string } | undefined;
         try {
-          data = await rpc.request<{ disposition?: string }>({ type: "prompt", message: text, streamingBehavior: "steer" }, this.limits.runTimeoutMs);
+          data = await rpc.request<{ disposition?: string }>({ type: "prompt", message: plain(text), streamingBehavior: "steer" }, this.limits.runTimeoutMs);
         } catch (error) {
           // An error response (e.g. compaction in progress) means nothing started. A child that
           // did not answer may still start the run, unseen and past any stop: discard it, and
           // end a tracked run here because the exit handler ignores a detached process.
           if (error instanceof RpcTimeoutError && worker.rpc === rpc) {
             if (worker.state === "running") this.failRun(worker, rpc, error.message);
-            else { worker.rpc = undefined; void rpc.close(500); }
+            else this.release(worker);
           }
           throw error;
         }
+        if (data?.disposition === "handled") throw new Error("A worker extension consumed the message; it did not reach the subagent.");
         started = data?.disposition === "started";
         // The child settled before this arrived, so the prompt started a new run. Track it
         // now: its agent_start may come in a later stdout chunk, and until then the worker
@@ -336,7 +359,7 @@ export class SubagentManager {
         worker.state = "stopped";
         // A worker that never ran keeps its task, so a later `send` adds to it instead of replacing it.
         if (worker.runs > 0) worker.pendingPrompt = "";
-        this.queue.splice(this.queue.indexOf(worker), 1);
+        this.dequeue(worker);
         // A queued continuation may hold an idle process; restore its idle shutdown.
         this.armIdle(worker);
         stopped.push(name);
@@ -350,6 +373,9 @@ export class SubagentManager {
         worker.cancelNextStart = reason;
         worker.pendingPrompt = "";
         stopped.push(name);
+      } else {
+        // Nothing to cancel: free the idle process. `send` revives the session.
+        this.release(worker);
       }
     }
     if (stopped.length) { this.wake(); this.hooks.changed(); }
@@ -410,7 +436,7 @@ export class SubagentManager {
       if (worker.state === "queued" || worker.state === "running") worker.state = "stopped";
       const rpc = worker.rpc;
       worker.rpc = undefined;
-      if (rpc) closing.push(rpc.close(1000));
+      if (rpc) closing.push(rpc.close());
     }
     this.queue.length = 0;
     this.wake();
@@ -440,21 +466,34 @@ export class SubagentManager {
   }
 
   private schedule(): void {
-    while (!this.disposed && this.queue.length && this.running < this.limits.maxRunning) this.startRun(this.queue.shift()!);
+    while (!this.disposed && this.queue.length && this.running < this.limits.maxRunning) void this.startRun(this.queue.shift()!);
   }
 
   /** Close the worker's process after the idle period; `send` revives it from its session. */
   private armIdle(worker: Worker): void {
     const rpc = worker.rpc;
-    if (!rpc) return;
+    if (!rpc || worker.wrapUpCleanup) return;
     clearTimeout(worker.timer);
     worker.timer = timer(() => {
       // A steer in flight may be starting a run inside a slow preflight; it re-arms when answered.
       if (worker.rpc !== rpc || worker.state === "running" || worker.state === "queued" || worker.steersInFlight) return;
-      worker.rpc = undefined;
-      void rpc.close();
+      this.release(worker);
       this.hooks.changed();
     }, this.limits.idleMs);
+    // A wide run must not leave a process per subagent behind for the whole idle period.
+    const idle = [...this.workers.values()]
+      .filter((other) => other.rpc?.alive && other.state !== "running" && other.state !== "queued" && !other.steersInFlight && !other.wrapUpCleanup)
+      .sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0));
+    for (const other of idle.slice(0, Math.max(0, idle.length - this.limits.maxIdle))) this.release(other);
+  }
+
+  /** Detach the worker's process and close it. Its next run waits for the exit (`closing`). */
+  private release(worker: Worker): void {
+    const rpc = worker.rpc;
+    if (!rpc) return;
+    worker.rpc = undefined;
+    const closing: Promise<void> = Promise.all([worker.closing, rpc.close()]).then(() => { if (worker.closing === closing) worker.closing = undefined; });
+    worker.closing = closing;
   }
 
   /** Reset per-run tracking; shared by requested runs and unsolicited ones. */
@@ -463,6 +502,7 @@ export class SubagentManager {
     worker.state = "running";
     worker.runs++;
     worker.runStarted = Date.now();
+    worker.turns = 0;
     worker.run = { tokens: 0, cost: 0 };
     worker.lastAssistant = undefined;
     worker.lastText = "";
@@ -471,25 +511,73 @@ export class SubagentManager {
     worker.edited.clear();
     worker.pendingEdits.clear();
     worker.wrappedUp = false;
+    worker.wrapUpRequest = undefined;
     worker.timer = timer(() => this.end(worker, { state: "failed", error: `Timed out after ${Math.round(this.limits.runTimeoutMs / 1000)}s.` }), this.limits.runTimeoutMs);
     const wrapAt = this.limits.runTimeoutMs - this.limits.wrapUpMs;
     if (this.limits.wrapUpMs > 0 && wrapAt > 0) worker.wrapTimer = timer(() => this.wrapUp(worker), wrapAt);
   }
 
-  /** Ask a run nearing its deadline for its report, so the timeout does not discard the work. */
-  private wrapUp(worker: Worker): void {
+  /** Ask a run nearing its deadline or turn limit for its report, so the limit does not discard the work. */
+  private wrapUp(worker: Worker, limit: "time" | "turn" = "time"): void {
     const rpc = worker.rpc;
-    // Only a started run takes a steer; a run that is ending needs none.
-    if (worker.state !== "running" || !worker.runActive || worker.endReason || !rpc?.alive) return;
+    // Only a started run takes a steer; a run that is ending or already asked needs none.
+    if (worker.state !== "running" || !worker.runActive || worker.wrappedUp || worker.endReason || !rpc?.alive) return;
+    // An ordinary steer can start another run across settlement. Let it reconcile
+    // first; after wrap-up is issued, send() queues messages locally instead.
+    if (worker.steersInFlight) {
+      const run = worker.runs;
+      worker.wrapTimer = timer(() => { if (worker.runs === run) this.wrapUp(worker, limit); }, 100);
+      return;
+    }
     worker.wrappedUp = true;
-    void rpc.request({ type: "steer", message: WRAP_UP_MESSAGE }, 5000).catch(() => {});
+    worker.wrapUpRequest = rpc.request({ type: "steer", message: `Your ${limit} limit is almost reached. Stop starting new work and reply now with your final report: what is done, what remains, and any risks.` }, 5000);
+    // Keep rejection observable to cleanup even if the run has not settled yet.
+    void worker.wrapUpRequest.catch(() => {});
   }
 
-  private startRun(worker: Worker): void {
+  /** Clear only after Pi processed the steer; command handlers are concurrent. */
+  private async clearWrapUp(worker: Worker, rpc: RpcProcess, request: Promise<unknown>): Promise<void> {
+    try {
+      await request;
+      if (worker.rpc === rpc) await rpc.request({ type: "clear_queue" }, 2000);
+    } catch {
+      // A failed or unanswered request leaves the child's queues uncertain. Close
+      // this process before a continuation can revive the session in a fresh one.
+      if (worker.rpc === rpc) this.release(worker);
+      await rpc.close();
+    }
+  }
+
+  private async startRun(worker: Worker): Promise<void> {
     this.beginRun(worker);
     worker.runActive = false;
+    const run = worker.runs;
+    const cleanup = worker.wrapUpCleanup;
     const message = worker.pendingPrompt;
     worker.pendingPrompt = "";
+    const current = () => !this.disposed && this.workers.get(worker.task.name) === worker && worker.runs === run && worker.state === "running";
+    // Reserve the running slot while waiting, so the concurrency limit still holds.
+    if (cleanup) await cleanup;
+    if (!current()) return;
+    // Cleanup may detach the child before its exit callback can finish this run,
+    // or acknowledge while stop's close is still in progress. Never expose that
+    // closing process to another continuation when publishing cancellation.
+    if (worker.endReason) {
+      const reason = worker.endReason;
+      const rpc = worker.rpc;
+      worker.rpc = undefined;
+      if (rpc) await rpc.close();
+      if (current()) this.finish(worker, reason);
+      return;
+    }
+    // A process that is shutting down takes no prompt (e.g. a settlement that was already
+    // buffered when a stop closed it), and its successor must not open the session beside it.
+    if (worker.rpc && !worker.rpc.alive) this.release(worker);
+    if (worker.closing) {
+      await worker.closing;
+      // A stop during the wait found no process and ended the run.
+      if (!current()) return;
+    }
     if (!worker.rpc?.alive) {
       try { worker.rpc = this.launch(worker); }
       catch (error) {
@@ -504,7 +592,7 @@ export class SubagentManager {
     const rpc = worker.rpc;
     // Pi replies after preflight, which includes extension loading on a fresh process and
     // may compact a revived session; the run timeout already bounds the whole run.
-    rpc.request<{ disposition?: string }>({ type: "prompt", message }, this.limits.runTimeoutMs).then((data) => {
+    rpc.request<{ disposition?: string }>({ type: "prompt", message: plain(message) }, this.limits.runTimeoutMs).then((data) => {
       if (data?.disposition === "handled") this.failRun(worker, rpc, "Prompt was handled without starting a run.");
       else if (data?.disposition === "queued") this.failRun(worker, rpc, "Worker was unexpectedly busy.");
     }, (error: unknown) => {
@@ -516,8 +604,7 @@ export class SubagentManager {
   /** End a run that cannot settle normally; the process is discarded so nothing runs unseen. */
   private failRun(worker: Worker, rpc: RpcProcess, error: string): void {
     if (worker.rpc !== rpc || worker.state !== "running") return;
-    worker.rpc = undefined;
-    void rpc.close(500);
+    this.release(worker);
     this.finish(worker, { state: "failed", error });
   }
 
@@ -532,10 +619,10 @@ export class SubagentManager {
     const rpc = worker.rpc;
     // Without a process nothing can settle the run; end it here.
     if (!rpc) { this.finish(worker, reason); return; }
-    if (!worker.runActive) { void rpc.close(500); return; }
+    if (!worker.runActive) { void rpc.close(); return; }
     clearTimeout(worker.escalation);
     // Cleared in finish(): only settlement proves the run ended.
-    worker.escalation = timer(() => { if (worker.rpc === rpc) void rpc.close(500); }, this.limits.abortGraceMs);
+    worker.escalation = timer(() => { if (worker.rpc === rpc) void rpc.close(); }, this.limits.abortGraceMs);
     // Clear first: abort alone lets queued steering continue the run. The run may
     // settle meanwhile and a queued follow-up start; never abort that next run.
     const run = worker.runs;
@@ -551,10 +638,10 @@ export class SubagentManager {
     // These describe the parent session to its shell tools; a worker has its own.
     for (const key of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) delete env[key];
     const args = rpcArgs(worker.task, { id: worker.sessionId, dir: this.dir }, this.promptExtension);
-    const rpc = new RpcProcess(args, { cwd: worker.task.cwd, env, invocation: this.invocation }, (event) => this.event(worker, rpc, event));
+    const rpc = new RpcProcess(args, { cwd: worker.task.cwd, env, invocation: this.invocation, graceMs: this.limits.closeGraceMs }, (event) => this.event(worker, rpc, event));
     void rpc.exited.then((exit) => {
       // Descendants can outlive the leader, e.g. after a crash; sweep the group.
-      void rpc.close(0);
+      void rpc.close();
       if (worker.rpc !== rpc) return;
       worker.rpc = undefined;
       if (worker.state === "running") {
@@ -604,6 +691,13 @@ export class SubagentManager {
         const cost = typeof usage?.cost?.total === "number" ? usage.cost.total : 0;
         worker.run.tokens += tokens; worker.run.cost += cost;
         worker.total.tokens += tokens; worker.total.cost += cost;
+        // A looping worker is asked for its report long before the deadline, then ended.
+        worker.turns++;
+        if (this.limits.maxTurns > 0 && worker.state === "running") {
+          if (worker.turns >= this.limits.maxTurns + this.limits.wrapUpTurns) this.end(worker, { state: "failed", error: `Stopped after ${worker.turns} turns.` });
+          // With a steer in flight this waits for the next turn instead of wrapUp's timer, which belongs to the deadline.
+          else if (worker.turns >= this.limits.maxTurns && !worker.steersInFlight) this.wrapUp(worker, "turn");
+        }
         break;
       }
       case "compaction_end": {
@@ -658,9 +752,19 @@ export class SubagentManager {
       path, sessionId: worker.sessionId, batch: worker.batch, seconds: Math.round((Date.now() - worker.runStarted) / 1000), tokens: worker.run.tokens, cost: worker.run.cost,
       files, ...(Object.keys(overlaps).length ? { overlaps } : {}), ...(worker.wrappedUp ? { partial: true } : {}),
     };
-    // A wrap-up steer that reached the child after it settled would open its next run.
-    // Sent before any follow-up prompt below, and the child handles stdin in order.
-    if (worker.wrappedUp && worker.rpc?.alive) void worker.rpc.request({ type: "clear_queue" }, 2000).catch(() => {});
+    const rpc = worker.rpc;
+    if (worker.wrapUpRequest && rpc?.alive) {
+      const cleanup = this.clearWrapUp(worker, rpc, worker.wrapUpRequest);
+      worker.wrapUpCleanup = cleanup;
+      void cleanup.then(() => {
+        if (worker.wrapUpCleanup !== cleanup) return;
+        worker.wrapUpCleanup = undefined;
+        if (this.disposed || this.workers.get(worker.task.name) !== worker) return;
+        if (worker.state !== "running" && worker.state !== "queued") this.armIdle(worker);
+        this.wake();
+        this.hooks.changed();
+      });
+    }
     worker.report = report;
     worker.finishedAt = Date.now();
     worker.tool = undefined;

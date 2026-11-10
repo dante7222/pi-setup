@@ -12,6 +12,8 @@ export const MIN_REPORT_CHARS = 800;
 /** Body budget shared by reports delivered together, so a wide run cannot flood the parent. */
 export const BATCH_CHARS = 12_000;
 const ERROR_CHARS = 500;
+/** Part of a truncated error kept from its start; the rest comes from its end, where a stderr tail names the cause. */
+const ERROR_HEAD_CHARS = 150;
 const MAX_FILES = 12;
 /** Share of a truncated body kept from the start; the rest comes from the end, where verdicts and risks usually are. */
 const HEAD_SHARE = 0.6;
@@ -67,7 +69,7 @@ function displayPath(path: string, cwd: string | undefined): string {
 /** The parts of a report as the model sees them; the TUI renders the same parts from `details`. */
 export function reportView(report: Report, limit = REPORT_CHARS, cwd?: string): ReportView {
   const header = `[subagent ${report.name} ${report.state}${report.partial ? " partial" : ""} ${report.seconds}s ${Math.round(report.tokens / 1000)}k tok]`;
-  const error = report.error && report.error.length > ERROR_CHARS ? `${report.error.slice(0, ERROR_CHARS)}...` : report.error;
+  const error = report.error && report.error.length > ERROR_CHARS ? `${report.error.slice(0, ERROR_HEAD_CHARS)} ... ${report.error.slice(ERROR_HEAD_CHARS + 5 - ERROR_CHARS)}` : report.error;
   const files = report.files ?? [];
   const edited = files.slice(0, MAX_FILES).map((file) => displayPath(file, cwd)).join(", ") + (files.length > MAX_FILES ? `, +${files.length - MAX_FILES} more` : "");
   const overlap = Object.entries(report.overlaps ?? {}).map(([file, names]) => `${displayPath(file, cwd)} (${names.join(", ")})`).join(", ");
